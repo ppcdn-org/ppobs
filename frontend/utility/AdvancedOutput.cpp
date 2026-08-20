@@ -138,7 +138,7 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 					      config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 					      config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 					      video_output_get_width(obs_get_video()),
-					      video_output_get_height(obs_get_video()));
+					      video_output_get_height(obs_get_video()), main->Config());
 	}
 
 	const char *rate_control =
@@ -256,7 +256,7 @@ void AdvancedOutput::UpdateStreamSettings()
 
 	obs_encoder_update(videoStreaming, settings);
 	if (whipSimulcastEncoders != nullptr) {
-		whipSimulcastEncoders->Update(settings, obs_data_get_int(settings, "bitrate"));
+		whipSimulcastEncoders->Update(settings, obs_data_get_int(settings, "bitrate"), main->Config());
 	}
 }
 
@@ -541,6 +541,8 @@ void AdvancedOutput::SetupOutputs()
 	obs_encoder_set_video(videoStreaming, obs_get_video());
 	if (videoRecording)
 		obs_encoder_set_video(videoRecording, obs_get_video());
+	if (whipSimulcastEncoders != nullptr)
+		whipSimulcastEncoders->SetVideo();
 	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
 		obs_encoder_set_audio(streamTrack[i], obs_get_audio());
 		obs_encoder_set_audio(recordTrack[i], obs_get_audio());
@@ -693,6 +695,8 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	bool reconnect = config_get_bool(main->Config(), "Output", "Reconnect");
 	int retryDelay = config_get_int(main->Config(), "Output", "RetryDelay");
 	int maxRetries = config_get_int(main->Config(), "Output", "MaxRetries");
+	int whipDisconnectGraceSec = config_get_int(main->Config(), "Output", "WhipDisconnectGraceSec");
+	int whipReconnectBackoffSec = config_get_int(main->Config(), "Output", "WhipReconnectBackoffSec");
 	bool useDelay = config_get_bool(main->Config(), "Output", "DelayEnable");
 	int delaySec = config_get_int(main->Config(), "Output", "DelaySec");
 	bool preserveDelay = config_get_bool(main->Config(), "Output", "DelayPreserve");
@@ -711,11 +715,14 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	}
 
 	bool is_rtmp = false;
+	bool is_whip = false;
 	obs_service_t *service_obj = main->GetService();
 	const char *protocol = obs_service_get_protocol(service_obj);
 	if (protocol) {
 		if (astrcmpi_n(protocol, RTMP_PROTOCOL, strlen(RTMP_PROTOCOL)) == 0)
 			is_rtmp = true;
+		else if (astrcmpi(protocol, "WHIP") == 0)
+			is_whip = true;
 	}
 
 	OBSDataAutoRelease settings = obs_data_create();
@@ -726,6 +733,8 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	obs_data_set_bool(settings, "low_latency_mode_enabled", enableLowLatencyMode);
 #endif
 	obs_data_set_bool(settings, "dyn_bitrate", enableDynBitrate);
+	obs_data_set_int(settings, "whip_disconnect_grace_sec", whipDisconnectGraceSec);
+	obs_data_set_int(settings, "whip_reconnect_backoff_sec", whipReconnectBackoffSec);
 
 	auto streamOutput = StreamingOutput(); // shadowing is sort of bad, but also convenient
 
@@ -736,10 +745,26 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 
 	obs_output_set_delay(streamOutput, useDelay ? delaySec : 0, preserveDelay ? OBS_OUTPUT_DELAY_PRESERVE : 0);
 
-	obs_output_set_reconnect_settings(streamOutput, maxRetries, retryDelay);
+	// WHIPOutput applies its configured linear backoff immediately before
+	// signaling a reconnect. Do not overwrite that per-attempt delay with
+	// the generic exponential RetryDelay on the next StartStreaming call.
+	obs_output_set_reconnect_settings(streamOutput, maxRetries, is_whip ? 0 : retryDelay);
 	if (is_rtmp) {
 		SetupVodTrack(service);
 	}
+
+	// Video encoder initialization below (obs_output_start ->
+	// obs_output_initialize_encoders) synchronously opens GPU-backed encoder
+	// sessions (e.g. QSV texture-sharing encoders sharing a single D3D11
+	// device across the main encoder and all WHIP simulcast layers). If a
+	// video settings change (resolution, simulcast layer count, etc.) was
+	// just applied, the graphics thread may still have pending work from
+	// that change queued up. obs_queue_task with wait=true blocks until an
+	// empty task has run on the graphics thread, so encoder creation always
+	// starts from a settled GPU/graphics state instead of racing it.
+	obs_queue_task(
+		OBS_TASK_GRAPHICS, [](void *) {}, nullptr, true);
+
 	if (obs_output_start(streamOutput)) {
 		if (multitrackVideo && multitrackVideoActive)
 			multitrackVideo->StartedStreaming();

@@ -39,8 +39,6 @@ static uint16_t MAX_VIDEO_FRAGMENT_SIZE = 1200;
  * only reports once ICE has actually given up) is still handled
  * immediately, with no grace period.
  */
-static const int WHIP_DISCONNECT_GRACE_SEC = 10;
-
 const int signaling_media_id_length = 16;
 const char signaling_media_id_valid_char[] = "0123456789"
 					     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -107,6 +105,12 @@ bool WHIPOutput::Start()
 {
 	std::lock_guard<std::mutex> l(start_stop_mutex);
 	const uint64_t generation = active_generation.fetch_add(1) + 1;
+
+	// A fresh (non-reconnect) Start() means the user explicitly asked
+	// for a new stream - don't carry over backoff state from whatever
+	// reconnect attempts preceded it.
+	if (!obs_output_reconnecting(output))
+		reconnect_attempt = 0;
 
 	for (uint32_t idx = 0; idx < MAX_OUTPUT_VIDEO_ENCODERS; idx++) {
 		auto encoder = obs_output_get_video_encoder2(output, idx);
@@ -347,6 +351,18 @@ void WHIPOutput::ConfigureVideoTrack(std::string media_stream_id, std::string cn
 
 bool WHIPOutput::Init()
 {
+	OBSDataAutoRelease output_settings = obs_output_get_settings(output);
+	disconnect_grace_sec = (int)obs_data_get_int(output_settings, "whip_disconnect_grace_sec");
+	reconnect_backoff_sec = (int)obs_data_get_int(output_settings, "whip_reconnect_backoff_sec");
+	if (!obs_data_has_user_value(output_settings, "whip_disconnect_grace_sec"))
+		disconnect_grace_sec = 10;
+	if (!obs_data_has_user_value(output_settings, "whip_reconnect_backoff_sec"))
+		reconnect_backoff_sec = 3;
+	if (disconnect_grace_sec < 0)
+		disconnect_grace_sec = 0;
+	if (reconnect_backoff_sec < 0)
+		reconnect_backoff_sec = 0;
+
 	obs_service_t *service = obs_output_get_service(output);
 	if (!service) return false;
 	obs_data_t *service_settings = obs_service_get_settings(service);
@@ -447,18 +463,26 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 			do_log(LOG_INFO, "PeerConnection state is now: Connected");
 			connect_time_ms = (int)((os_gettime_ns() - start_time_ns) / 1000000.0);
 			do_log(LOG_INFO, "Connect time: %dms", connect_time_ms.load());
+			reconnect_attempt = 0;
 			CancelDisconnectGraceTimer();
 			break;
 		case rtc::PeerConnection::State::Disconnected:
 			do_log(LOG_INFO,
 			       "PeerConnection state is now: Disconnected - waiting up to %ds for it to recover before tearing down",
-			       WHIP_DISCONNECT_GRACE_SEC);
+			       disconnect_grace_sec);
 			StartDisconnectGraceTimer(generation);
 			break;
 		case rtc::PeerConnection::State::Failed:
 			do_log(LOG_INFO, "PeerConnection state is now: Failed");
+			PrepareReconnect();
 			Stop(false);
-			obs_output_signal_stop(output, OBS_OUTPUT_ERROR);
+			// OBS_OUTPUT_DISCONNECTED (not OBS_OUTPUT_ERROR) so libobs's
+			// own can_reconnect() treats this as a normal, reconnectable
+			// network drop and silently retries via output_reconnect()
+			// instead of immediately popping the "connection failed"
+			// dialog in front of the user for something WHIP is already
+			// about to recover from on its own.
+			obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
 			break;
 		case rtc::PeerConnection::State::Closed:
 			do_log(LOG_INFO, "PeerConnection state is now: Closed");
@@ -523,8 +547,28 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 	curl_slist_free_all(headerList);
 	curl_easy_cleanup(c);
 
-	if (res != CURLE_OK || http_code != 201) {
-		do_log(LOG_ERROR, "WHIP request failed: %d, HTTP %ld", res, http_code);
+	if (res != CURLE_OK) {
+		do_log(LOG_ERROR, "WHIP request failed: curl error %d", res);
+		if (IsActiveGeneration(generation))
+			obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+		return false;
+	}
+	if (http_code != 201) {
+		do_log(LOG_ERROR, "WHIP request failed: HTTP %ld", http_code);
+		if (IsActiveGeneration(generation)) {
+			// 401/403/404 mean the server rejected this specific stream
+			// (bad key/path/permissions) rather than a transient network
+			// problem - retrying via libobs's reconnect timer would just
+			// get the identical rejection every time. Signal
+			// OBS_OUTPUT_INVALID_STREAM (not reconnectable, see
+			// can_reconnect() in libobs/obs-output.c) so the user gets a
+			// clear "invalid stream key/path" error and streaming
+			// actually stops, instead of retrying forever with no
+			// visible error (as OBS_OUTPUT_DISCONNECTED would do). Other
+			// codes (5xx, etc.) keep the existing reconnectable behavior.
+			bool permanent = http_code == 401 || http_code == 403 || http_code == 404;
+			obs_output_signal_stop(output, permanent ? OBS_OUTPUT_INVALID_STREAM : OBS_OUTPUT_DISCONNECTED);
+		}
 		return false;
 	}
 
@@ -533,7 +577,12 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 		if (h.size() > 10 && _strnicmp(h.c_str(), "location:", 9) == 0)
 			locationHdr = trim_string(h.substr(9));
 	}
-	if (locationHdr.empty()) { do_log(LOG_ERROR, "WHIP response Location header is empty"); return false; }
+	if (locationHdr.empty()) {
+		do_log(LOG_ERROR, "WHIP response Location header is empty");
+		if (IsActiveGeneration(generation))
+			obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+		return false;
+	}
 	resourceURL = locationHdr;
 
 	for (const auto &h : headers) {
@@ -721,7 +770,8 @@ void WHIPOutput::CheckUplinkQos()
 }
 
 // -------------------------------------------------------------------
-// Disconnected grace period (see WHIP_DISCONNECT_GRACE_SEC above)
+// Disconnected grace period (configured through OBS Advanced settings; see
+// disconnect_grace_sec)
 // -------------------------------------------------------------------
 void WHIPOutput::StartDisconnectGraceTimer(uint64_t generation)
 {
@@ -737,7 +787,7 @@ void WHIPOutput::StartDisconnectGraceTimer(uint64_t generation)
 
 	disconnect_grace_thread = std::thread([this, generation]() {
 		std::unique_lock<std::mutex> lk(disconnect_grace_mutex);
-		bool cancelled = disconnect_grace_cv.wait_for(lk, std::chrono::seconds(WHIP_DISCONNECT_GRACE_SEC),
+		bool cancelled = disconnect_grace_cv.wait_for(lk, std::chrono::seconds(disconnect_grace_sec),
 							      [this]() { return disconnect_grace_cancel; });
 		lk.unlock();
 
@@ -748,10 +798,19 @@ void WHIPOutput::StartDisconnectGraceTimer(uint64_t generation)
 
 		do_log(LOG_INFO,
 		       "PeerConnection stayed Disconnected for %ds without recovering, tearing down and reconnecting",
-		       WHIP_DISCONNECT_GRACE_SEC);
+		       disconnect_grace_sec);
+		PrepareReconnect();
 		Stop(false);
 		obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
 	});
+}
+
+void WHIPOutput::PrepareReconnect()
+{
+	const int attempt = reconnect_attempt.fetch_add(1);
+	const int delay_sec = reconnect_backoff_sec * attempt;
+	obs_output_set_reconnect_delay(output, delay_sec * 1000);
+	do_log(LOG_INFO, "WHIP reconnect attempt %d: waiting %ds before next session", attempt + 1, delay_sec);
 }
 
 void WHIPOutput::CancelDisconnectGraceTimer()

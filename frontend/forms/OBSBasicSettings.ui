@@ -2162,7 +2162,7 @@
                         <number>1</number>
                        </property>
                        <property name="maximum">
-                        <number>4</number>
+                        <number>5</number>
                        </property>
                        <property name="value">
                         <number>1</number>
@@ -2172,6 +2172,28 @@
                     </layout>
                    </item>
                   </layout>
+                 </item>
+                 <item>
+                  <!-- Per-layer resolution/bitrate rows are built at
+                       runtime by OBSBasicSettings::RebuildWHIPSimulcastLayerRows()
+                       (see OBSBasicSettings_Stream.cpp), one row per layer
+                       beyond the first - this container just holds them. -->
+                  <widget class="QWidget" name="whipSimulcastLayersContainer" native="true">
+                   <layout class="QVBoxLayout" name="whipSimulcastLayersContainerLayout">
+                    <property name="leftMargin">
+                     <number>0</number>
+                    </property>
+                    <property name="topMargin">
+                     <number>0</number>
+                    </property>
+                    <property name="rightMargin">
+                     <number>0</number>
+                    </property>
+                    <property name="bottomMargin">
+                     <number>0</number>
+                    </property>
+                   </layout>
+                  </widget>
                  </item>
                 </layout>
                </widget>
@@ -2269,19 +2291,6 @@
                      </widget>
                     </item>
                     <item row="3" column="0">
-                     <widget class="QLabel" name="ppcenterStreamLabel">
-                      <property name="text">
-                       <string>Basic.Settings.Stream.PPCenter.Stream</string>
-                      </property>
-                      <property name="buddy">
-                       <cstring>ppcenterStream</cstring>
-                      </property>
-                     </widget>
-                    </item>
-                    <item row="3" column="1">
-                     <widget class="QLineEdit" name="ppcenterStream"/>
-                    </item>
-                    <item row="4" column="0">
                      <widget class="QLabel" name="ppcenterRegionLabel">
                       <property name="text">
                        <string>Basic.Settings.Stream.PPCenter.Region</string>
@@ -2291,21 +2300,21 @@
                       </property>
                      </widget>
                     </item>
-                    <item row="4" column="1">
+                    <item row="3" column="1">
                      <widget class="QLineEdit" name="ppcenterRegion">
                       <property name="placeholderText">
                        <string>auto</string>
                       </property>
                      </widget>
                     </item>
-                    <item row="5" column="0">
+                    <item row="4" column="0">
                      <widget class="QLabel" name="ppcenterNodeIdLabel">
                       <property name="text">
                        <string>Basic.Settings.Stream.PPCenter.NodeId</string>
                       </property>
                      </widget>
                     </item>
-                    <item row="5" column="1">
+                    <item row="4" column="1">
                      <widget class="QLineEdit" name="ppcenterNodeId">
                       <property name="readOnly">
                        <bool>true</bool>
@@ -2395,6 +2404,33 @@
                    </property>
                   </widget>
                  </item>
+                </layout>
+               </widget>
+              </item>
+              <item>
+               <widget class="QGroupBox" name="scheduleGroupBox">
+                <property name="title">
+                 <string>Basic.Settings.Schedule.GroupTitle</string>
+                </property>
+                <property name="checkable">
+                 <bool>true</bool>
+                </property>
+                <property name="checked">
+                 <bool>false</bool>
+                </property>
+                <layout class="QVBoxLayout" name="scheduleGroupBoxLayout">
+                 <property name="leftMargin">
+                  <number>9</number>
+                 </property>
+                 <property name="topMargin">
+                  <number>2</number>
+                 </property>
+                 <property name="rightMargin">
+                  <number>9</number>
+                 </property>
+                 <property name="bottomMargin">
+                  <number>9</number>
+                 </property>
                 </layout>
                </widget>
               </item>
@@ -8666,6 +8702,52 @@
                      </property>
                      <property name="buddy">
                       <cstring>reconnectRetryDelay</cstring>
+                     </property>
+                    </widget>
+                   </item>
+                   <item row="2" column="0">
+                    <widget class="QLabel" name="labelWhipDisconnectGraceSec">
+                     <property name="text">
+                      <string>Basic.Settings.Output.WhipDisconnectGraceSec</string>
+                     </property>
+                     <property name="buddy">
+                      <cstring>whipDisconnectGraceSec</cstring>
+                     </property>
+                    </widget>
+                   </item>
+                   <item row="2" column="1">
+                    <widget class="QSpinBox" name="whipDisconnectGraceSec">
+                     <property name="suffix">
+                      <string> s</string>
+                     </property>
+                     <property name="minimum">
+                      <number>0</number>
+                     </property>
+                     <property name="maximum">
+                      <number>120</number>
+                     </property>
+                    </widget>
+                   </item>
+                   <item row="3" column="0">
+                    <widget class="QLabel" name="labelWhipReconnectBackoffSec">
+                     <property name="text">
+                      <string>Basic.Settings.Output.WhipReconnectBackoffSec</string>
+                     </property>
+                     <property name="buddy">
+                      <cstring>whipReconnectBackoffSec</cstring>
+                     </property>
+                    </widget>
+                   </item>
+                   <item row="3" column="1">
+                    <widget class="QSpinBox" name="whipReconnectBackoffSec">
+                     <property name="suffix">
+                      <string> s</string>
+                     </property>
+                     <property name="minimum">
+                      <number>0</number>
+                     </property>
+                     <property name="maximum">
+                      <number>60</number>
                      </property>
                     </widget>
                    </item>

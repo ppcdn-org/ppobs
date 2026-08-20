@@ -44,6 +44,7 @@
 #include <QCompleter>
 #include <QStandardItemModel>
 
+#include <algorithm>
 #include <sstream>
 
 #include "moc_OBSBasicSettings.cpp"
@@ -106,6 +107,31 @@ static bool ConvertResText(const char *res, uint32_t &cx, uint32_t &cy)
 	}
 
 	return true;
+}
+
+// The resolution WHIP Simulcast layers following the main output should
+// currently be sized against. Prefers whatever is *typed* into the Video
+// page's Output (Scaled) Resolution field over the actually-applied
+// video_output_get_width/height(obs_get_video()) - the latter only changes
+// once Apply/OK on the Video page runs main->ResetVideo(), while a user
+// switching straight from Video to Stream (or just watching the Stream
+// page as they type into Video) reasonably expects the simulcast preview
+// to track what they just typed, not what's still active from before this
+// dialog was opened. Falls back to the applied resolution when the field
+// doesn't parse (e.g. mid-edit, or the Video page was never touched this
+// session).
+void OBSBasicSettings::GetWHIPSimulcastMainResolution(uint32_t &width, uint32_t &height)
+{
+	uint32_t cx = 0, cy = 0;
+	if (ui->outputResolution && ConvertResText(QT_TO_UTF8(ui->outputResolution->currentText()), cx, cy) && cx &&
+	    cy) {
+		width = cx;
+		height = cy;
+		return;
+	}
+
+	width = video_output_get_width(obs_get_video());
+	height = video_output_get_height(obs_get_video());
 }
 
 static inline bool WidgetChanged(QWidget *widget)
@@ -544,6 +570,8 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->reconnectEnable,      CHECK_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->reconnectRetryDelay,  SCROLL_CHANGED, ADV_CHANGED);
 	HookWidget(ui->reconnectMaxRetries,  SCROLL_CHANGED, ADV_CHANGED);
+	HookWidget(ui->whipDisconnectGraceSec,  SCROLL_CHANGED, ADV_CHANGED);
+	HookWidget(ui->whipReconnectBackoffSec, SCROLL_CHANGED, ADV_CHANGED);
 	HookWidget(ui->processPriority,      COMBO_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->confirmOnExit,        CHECK_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->bindToIP,             COMBO_CHANGED,  ADV_CHANGED);
@@ -826,6 +854,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 
 	InitStreamPage();
 	InitAppearancePage();
+	InitSchedulePage();
 	LoadSettings(false);
 
 	ui->advOutTrack1->setAccessibleName(QTStr("Basic.Settings.Output.Adv.Audio.Track1"));
@@ -1163,7 +1192,37 @@ void OBSBasicSettings::LoadLanguageList()
 
 	ui->language->clear();
 
-	for (const auto &locale : GetLocaleNames()) {
+	// English, Simplified Chinese, and Traditional Chinese are pinned to
+	// the top (in that order); everything else follows alphabetically by
+	// display name, same as the old model()->sort(0) did for the whole
+	// list.
+	auto locales = GetLocaleNames();
+	auto pinnedRank = [](const std::string &tag) -> int {
+		if (tag == "en-US")
+			return 0;
+		if (tag == "zh-CN")
+			return 1;
+		if (tag == "zh-TW")
+			return 2;
+		return -1;
+	};
+	std::stable_sort(locales.begin(), locales.end(),
+			  [&](const std::pair<std::string, std::string> &a,
+			      const std::pair<std::string, std::string> &b) {
+				  int rankA = pinnedRank(a.first);
+				  int rankB = pinnedRank(b.first);
+				  if (rankA != -1 || rankB != -1) {
+					  if (rankA == -1)
+						  return false;
+					  if (rankB == -1)
+						  return true;
+					  return rankA < rankB;
+				  }
+				  return QString::localeAwareCompare(QT_UTF8(a.second.c_str()),
+								      QT_UTF8(b.second.c_str())) < 0;
+			  });
+
+	for (const auto &locale : locales) {
 		int idx = ui->language->count();
 
 		ui->language->addItem(QT_UTF8(locale.second.c_str()), QT_UTF8(locale.first.c_str()));
@@ -1171,8 +1230,6 @@ void OBSBasicSettings::LoadLanguageList()
 		if (locale.first == currentLang)
 			ui->language->setCurrentIndex(idx);
 	}
-
-	ui->language->model()->sort(0);
 }
 
 #if defined(_WIN32) || defined(ENABLE_SPARKLE_UPDATER)
@@ -2531,6 +2588,8 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	bool reconnect = config_get_bool(main->Config(), "Output", "Reconnect");
 	int retryDelay = config_get_int(main->Config(), "Output", "RetryDelay");
 	int maxRetries = config_get_int(main->Config(), "Output", "MaxRetries");
+	int whipDisconnectGraceSec = config_get_int(main->Config(), "Output", "WhipDisconnectGraceSec");
+	int whipReconnectBackoffSec = config_get_int(main->Config(), "Output", "WhipReconnectBackoffSec");
 	const char *filename = config_get_string(main->Config(), "Output", "FilenameFormatting");
 	bool overwriteIfExists = config_get_bool(main->Config(), "Output", "OverwriteIfExists");
 	const char *bindIP = config_get_string(main->Config(), "Output", "BindIP");
@@ -2566,6 +2625,8 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	ui->reconnectEnable->setChecked(reconnect);
 	ui->reconnectRetryDelay->setValue(retryDelay);
 	ui->reconnectMaxRetries->setValue(maxRetries);
+	ui->whipDisconnectGraceSec->setValue(whipDisconnectGraceSec);
+	ui->whipReconnectBackoffSec->setValue(whipReconnectBackoffSec);
 
 	ui->streamDelaySec->setValue(delaySec);
 	ui->streamDelayPreserve->setChecked(preserveDelay);
@@ -2927,6 +2988,8 @@ void OBSBasicSettings::LoadSettings(bool changedOnly)
 		LoadAppearanceSettings();
 	if (!changedOnly || advancedChanged)
 		LoadAdvancedSettings();
+	if (!changedOnly || scheduleChanged)
+		LoadScheduleSettings();
 }
 
 void OBSBasicSettings::SaveGeneralSettings()
@@ -3212,6 +3275,8 @@ void OBSBasicSettings::SaveAdvancedSettings()
 	SaveCheckBox(ui->reconnectEnable, "Output", "Reconnect");
 	SaveSpinBox(ui->reconnectRetryDelay, "Output", "RetryDelay");
 	SaveSpinBox(ui->reconnectMaxRetries, "Output", "MaxRetries");
+	SaveSpinBox(ui->whipDisconnectGraceSec, "Output", "WhipDisconnectGraceSec");
+	SaveSpinBox(ui->whipReconnectBackoffSec, "Output", "WhipReconnectBackoffSec");
 	SaveComboData(ui->bindToIP, "Output", "BindIP");
 	SaveComboData(ui->ipFamily, "Output", "IPFamily");
 	SaveCheckBox(ui->autoRemux, "Video", "AutoRemux");
@@ -3641,8 +3706,28 @@ void OBSBasicSettings::SaveSettings()
 		SaveAdvancedSettings();
 	if (appearanceChanged)
 		SaveAppearanceSettings();
-	if (videoChanged || advancedChanged)
+	if (scheduleChanged)
+		SaveScheduleSettings();
+	if (videoChanged || advancedChanged) {
 		main->ResetVideo();
+
+		// WHIP Simulcast layer rows that are still following the main
+		// output prefill their width/height/bitrate from the main
+		// output's *current* resolution/bitrate (see
+		// RefreshWHIPSimulcastFollowingLayers) - refresh them now that
+		// ResetVideo() above may have just changed what "current"
+		// means, so the Stream tab doesn't keep showing numbers from
+		// before this Apply/OK until the dialog is closed and
+		// reopened. This is *not* a full RebuildWHIPSimulcastLayerRows -
+		// SaveStream1Settings() already ran above, so config matches
+		// these widgets already, but rebuilding would still be the
+		// wrong tool here (see RefreshWHIPSimulcastFollowingLayers's
+		// comment). Guarded by loading so this doesn't itself flip
+		// stream1Changed and re-enable Apply right after a save.
+		loading = true;
+		RefreshWHIPSimulcastFollowingLayers();
+		loading = false;
+	}
 
 	config_save_safe(main->Config(), "tmp", nullptr);
 	config_save_safe(App()->GetUserConfig(), "tmp", nullptr);
@@ -3668,6 +3753,8 @@ void OBSBasicSettings::SaveSettings()
 			AddChangedVal(changed, "appearance");
 		if (advancedChanged)
 			AddChangedVal(changed, "advanced");
+		if (scheduleChanged)
+			AddChangedVal(changed, "schedule");
 
 		blog(LOG_INFO, "Settings changed (%s)", changed.c_str());
 		blog(LOG_INFO, MINOR_SEPARATOR);
@@ -3755,6 +3842,12 @@ bool OBSBasicSettings::QueryAllowedToClose()
 		return false;
 	}
 
+	if (!ValidateScheduleSlots()) {
+		OBSMessageBox::warning(this, QTStr("Basic.Settings.Schedule.OverlapWarning.Title"),
+				       QTStr("Basic.Settings.Schedule.OverlapWarning"));
+		return false;
+	}
+
 	return true;
 }
 
@@ -3788,6 +3881,30 @@ void OBSBasicSettings::on_listWidget_itemSelectionChanged()
 
 	if (loading || row == pageIndex)
 		return;
+
+	if (row == Pages::STREAM) {
+		// WHIP Simulcast layer rows following the main output prefill
+		// from GetWHIPSimulcastMainResolution(), which prefers
+		// whatever's currently typed into the Video page's Output
+		// Resolution field - refresh them on entry so switching over
+		// from Video (with or without having applied it yet) shows
+		// the layers sized against what's on screen right now,
+		// instead of whatever was current the last time this page
+		// was built.
+		//
+		// This must be RefreshWHIPSimulcastFollowingLayers(), not a
+		// full RebuildWHIPSimulcastLayerRows() - a rebuild tears down
+		// and recreates every row from *saved config*, which silently
+		// discards any not-yet-applied edit sitting in these widgets
+		// (e.g. the user just checked Follow Main, or typed a custom
+		// width, then switched pages and back before clicking Apply).
+		// Guarded by loading so this doesn't itself flip
+		// stream1Changed and light up Apply just from looking at the
+		// page.
+		loading = true;
+		RefreshWHIPSimulcastFollowingLayers();
+		loading = false;
+	}
 
 	if (!hotkeysLoaded && row == Pages::HOTKEYS) {
 		setCursor(Qt::BusyCursor);

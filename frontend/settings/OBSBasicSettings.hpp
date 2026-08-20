@@ -23,6 +23,9 @@
 #include <utility/FFmpegShared.hpp>
 
 #include <QPointer>
+#include <QTimeEdit>
+
+#include <array>
 
 #define VOLUME_METER_DECAY_FAST 23.53
 #define VOLUME_METER_DECAY_MEDIUM 11.76
@@ -67,6 +70,7 @@ private:
 	bool a11yChanged = false;
 	bool appearanceChanged = false;
 	bool advancedChanged = false;
+	bool scheduleChanged = false;
 	int pageIndex = 0;
 	bool loading = true;
 	bool forceAuthReload = false;
@@ -144,7 +148,7 @@ private:
 	inline bool Changed() const
 	{
 		return generalChanged || appearanceChanged || outputsChanged || stream1Changed || audioChanged ||
-		       videoChanged || advancedChanged || hotkeysChanged || a11yChanged;
+		       videoChanged || advancedChanged || hotkeysChanged || a11yChanged || scheduleChanged;
 	}
 
 	inline void EnableApplyButton(bool en) { ui->buttonBox->button(QDialogButtonBox::Apply)->setEnabled(en); }
@@ -160,6 +164,7 @@ private:
 		a11yChanged = false;
 		advancedChanged = false;
 		appearanceChanged = false;
+		scheduleChanged = false;
 		EnableApplyButton(false);
 	}
 
@@ -192,6 +197,7 @@ private:
 	void LoadA11ySettings(bool presetChange = false);
 	void LoadAppearanceSettings(bool reload = false);
 	void LoadAdvancedSettings();
+	void LoadScheduleSettings();
 	void LoadSettings(bool changedOnly);
 
 	OBSPropertiesView *CreateEncoderPropertyView(const char *encoder, const char *path, bool changed = false);
@@ -214,6 +220,35 @@ private:
 	int prevLangIndex;
 	bool prevBrowserAccel;
 
+	/* WHIP Simulcast per-layer resolution/bitrate settings (Settings >
+	 * Stream, below the "Total Layers" spinbox - see
+	 * WHIPSimulcastEncoders.hpp for how these are consumed). One row of
+	 * (follow-main checkbox, width, height, bitrate) widgets per layer
+	 * beyond the first (layer 0 is always the main Stream encoder's own
+	 * output - see RebuildWHIPSimulcastLayerRows), rebuilt whenever
+	 * whipSimulcastTotalLayers changes.
+	 *
+	 * followMain, when checked (the default), keeps width/height
+	 * disabled and live-recalculated from the main output's current
+	 * resolution any time this row is (re)built, rather than the old
+	 * behavior of freezing whatever resolution was on screen the first
+	 * time the row was saved - see RebuildWHIPSimulcastLayerRows and
+	 * WHIPSimulcastLayer::followMain in WHIPSimulcastEncoders.hpp.
+	 */
+	struct WHIPSimulcastLayerRow {
+		QWidget *rowWidget;
+		QCheckBox *followMain;
+		QSpinBox *width;
+		QSpinBox *height;
+		QSpinBox *bitrate;
+	};
+	std::vector<WHIPSimulcastLayerRow> whipSimulcastLayerRows;
+	void RebuildWHIPSimulcastLayerRows();
+	void WHIPSimulcastLayerFollowMainToggled(size_t layerIdx, bool checked);
+	void RefreshWHIPSimulcastLayerDefault(size_t layerIdx);
+	void RefreshWHIPSimulcastFollowingLayers();
+	void GetWHIPSimulcastMainResolution(uint32_t &width, uint32_t &height);
+
 	void ServiceChanged(bool resetFields = false);
 	QString FindProtocol();
 	void UpdateServerList();
@@ -229,6 +264,29 @@ private:
 	void enableAppearanceDensityControls(bool enable);
 
 	bool IsCustomServer();
+
+	/* schedule (embedded in the stream page; ui->scheduleGroupBox is
+	 * defined in the .ui file itself, next to the "Advanced Options"
+	 * groupbox). Model is a free-form list of time slots (each with its
+	 * own start/end time and a per-weekday repeat mask), rather than one
+	 * fixed slot per day - see OBSBasic::CheckSchedule() for how these
+	 * are evaluated against the wall clock. */
+	struct ScheduleSlotRow {
+		QWidget *rowWidget;
+		QTimeEdit *start;
+		QTimeEdit *end;
+		std::array<QCheckBox *, 7> days; // index = Qt::DayOfWeek - 1 (Monday..Sunday)
+		QPushButton *removeButton;
+	};
+	std::vector<ScheduleSlotRow> scheduleSlots;
+	QPointer<QLabel> scheduleOverlapWarning;
+	void InitSchedulePage();
+	void AddScheduleSlotRow(int startMinutes, int endMinutes, const std::array<bool, 7> &days);
+	void RemoveScheduleSlotRow(size_t idx);
+	// Returns true (and updates scheduleOverlapWarning / row highlighting)
+	// if no two slots share a day and overlap in time; false blocks
+	// SaveScheduleSettings() from being reachable (see QueryAllowedToClose).
+	bool ValidateScheduleSlots();
 
 private slots:
 	void UpdateMultitrackVideo();
@@ -296,6 +354,7 @@ private:
 	void SaveA11ySettings();
 	void SaveAppearanceSettings();
 	void SaveAdvancedSettings();
+	void SaveScheduleSettings();
 	void SaveSettings();
 
 	void SearchHotkeys(const QString &text, obs_key_combination_t filterCombo);
@@ -412,6 +471,7 @@ private slots:
 	void AppearanceChanged();
 	void AdvancedChanged();
 	void AdvancedChangedRestart();
+	void ScheduleChanged();
 
 	void UpdateStreamDelayEstimate();
 

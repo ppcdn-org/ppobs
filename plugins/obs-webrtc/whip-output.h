@@ -57,6 +57,7 @@ private:
 	void Send(void *data, uintptr_t size, uint64_t duration, std::shared_ptr<rtc::Track> track,
 		  std::shared_ptr<rtc::RtcpSrReporter> rtcp_sr_reporter);
 	bool IsActiveGeneration(uint64_t generation) const;
+	void PrepareReconnect();
 	void StartDisconnectGraceTimer(uint64_t generation);
 	void CancelDisconnectGraceTimer();
 
@@ -125,9 +126,19 @@ private:
 	bool StartP2PSignal();
 	void CheckUplinkQos();
 
+	// Reconnect timing, configurable from Settings > Output > Advanced
+	// (see AdvancedOutput::StartStreaming for how these reach
+	// obs_output_get_settings()). reconnect_attempt drives a linear
+	// backoff in PrepareReconnect(): attempt N waits
+	// reconnect_backoff_sec * N seconds before the next WHIP session,
+	// resetting to 0 on a successful connect or a fresh (non-reconnect)
+	// Start().
+	std::atomic<int> reconnect_attempt{0};
+	int disconnect_grace_sec = 10;
+	int reconnect_backoff_sec = 3;
+
 	// Grace period before a PeerConnection "Disconnected" state is
-	// treated as a real failure (see WHIP_DISCONNECT_GRACE_SEC in
-	// whip-output.cpp for why this exists).
+	// treated as a real failure (see disconnect_grace_sec above).
 	std::thread disconnect_grace_thread;
 	std::mutex disconnect_grace_mutex;
 	std::condition_variable disconnect_grace_cv;

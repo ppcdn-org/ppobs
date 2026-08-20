@@ -82,7 +82,7 @@ void SimpleOutput::LoadStreamingPreset_Lossy(const char *encoderId)
 					      config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 					      config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 					      video_output_get_width(obs_get_video()),
-					      video_output_get_height(obs_get_video()));
+					      video_output_get_height(obs_get_video()), main->Config());
 	}
 }
 
@@ -370,7 +370,7 @@ void SimpleOutput::Update()
 	obs_encoder_update(audioArchive, audioSettings);
 
 	if (whipSimulcastEncoders != nullptr) {
-		whipSimulcastEncoders->Update(videoSettings, videoBitrate);
+		whipSimulcastEncoders->Update(videoSettings, videoBitrate, main->Config());
 	}
 }
 
@@ -566,6 +566,8 @@ inline void SimpleOutput::SetupOutputs()
 {
 	SimpleOutput::Update();
 	obs_encoder_set_video(videoStreaming, obs_get_video());
+	if (whipSimulcastEncoders != nullptr)
+		whipSimulcastEncoders->SetVideo();
 	obs_encoder_set_audio(audioStreaming, obs_get_audio());
 	obs_encoder_set_audio(audioArchive, obs_get_audio());
 	int tracks = config_get_int(main->Config(), "SimpleOutput", "RecTracks");
@@ -728,6 +730,14 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 
 	if (!multitrackVideo || !multitrackVideoActive)
 		SetupVodTrack(service);
+
+	// See AdvancedOutput::StartStreaming for why this is here: encoder
+	// initialization below can synchronously open GPU-backed encoder
+	// sessions (e.g. QSV texture-sharing encoders), and we want that to
+	// start from a settled graphics state rather than racing a just-applied
+	// video settings change.
+	obs_queue_task(
+		OBS_TASK_GRAPHICS, [](void *) {}, nullptr, true);
 
 	if (obs_output_start(streamOutput)) {
 		if (multitrackVideo && multitrackVideoActive)
