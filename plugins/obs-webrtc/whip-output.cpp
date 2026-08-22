@@ -364,11 +364,16 @@ bool WHIPOutput::Init()
 		reconnect_backoff_sec = 0;
 
 	obs_service_t *service = obs_output_get_service(output);
-	if (!service) return false;
-	obs_data_t *service_settings = obs_service_get_settings(service);
-	endpoint_url = obs_data_get_string(service_settings, "whip_url");
-	bearer_token = obs_data_get_string(service_settings, "whip_token");
-	if (endpoint_url.empty()) return false;
+	if (!service) {
+		obs_output_signal_stop(output, OBS_OUTPUT_ERROR);
+		return false;
+	}
+	endpoint_url = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
+	bearer_token = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_BEARER_TOKEN);
+	if (endpoint_url.empty()) {
+		obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
+		return false;
+	}
 	return true;
 }
 
@@ -378,7 +383,10 @@ bool WHIPOutput::Setup(uint64_t generation)
 	if (!IsActiveGeneration(generation)) return false;
 
 	obs_service_t *service = obs_output_get_service(output);
-	if (!service) return false;
+	if (!service) {
+		obs_output_signal_stop(output, OBS_OUTPUT_ERROR);
+		return false;
+	}
 	obs_data_t *service_settings = obs_service_get_settings(service);
 	const bool ppcenter_enabled = obs_data_get_bool(service_settings, "ppcenter_enabled");
 	if (ppcenter_enabled) {
@@ -391,6 +399,8 @@ bool WHIPOutput::Setup(uint64_t generation)
 		std::string error;
 		if (!ppcenter_resolve_publish(request, resp, error)) {
 			do_log(LOG_ERROR, "ppcenter resolve publish failed: %s", error.c_str());
+			if (IsActiveGeneration(generation))
+				obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
 			return false;
 		}
 		endpoint_url = resp.whip_url;
