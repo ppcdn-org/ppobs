@@ -89,11 +89,9 @@ static inline std::string generate_user_agent()
 	// Build the user-agent string
 	std::stringstream ua;
 	// User agent header prefix
-	ua << "User-Agent: Mozilla/5.0 ";
-	// OBS version info
-	ua << "(OBS-Studio/" << obs_get_version_string() << "; ";
+	ua << "User-Agent: obs-studio/" << obs_get_version_string() << " ";
 	// Operating system version info
-	ua << OS_NAME << "; " << obs_get_locale() << ")";
+	ua << "(" << OS_NAME << "; " << obs_get_locale() << ")";
 
 	return ua.str();
 }

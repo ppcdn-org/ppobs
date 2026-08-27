@@ -9,6 +9,8 @@
 
 #include <obs.hpp>
 #include <util/dstr.h>
+
+#include <algorithm>
 #include <util/ntp-clock.h>
 
 #include <curl/curl.h>
@@ -87,6 +89,11 @@ WHIPOutput::WHIPOutput(obs_data_t *, obs_output_t *output)
 	  start_time_ns(0),
 	  last_audio_timestamp(0)
 {
+	// Declared at output creation so the frontend can connect before
+	// streaming starts; emitted per scored sample from the quality
+	// scorer's decode thread (see quality-score.cpp).
+	signal_handler_add(obs_output_get_signal_handler(output),
+			   "void quality_score(ptr output, float score, float psnr)");
 }
 
 WHIPOutput::~WHIPOutput()
@@ -99,6 +106,125 @@ WHIPOutput::~WHIPOutput()
 	std::lock_guard<std::mutex> l(start_stop_mutex);
 	if (start_stop_thread.joinable())
 		start_stop_thread.join();
+}
+
+/*
+ * Applies the encoder ROI configured on the WHIP service (if any) to
+ * every simulcast layer encoder. The rectangle is specified at the
+ * output (mix) resolution and scaled per layer, expanded outward so
+ * integer rounding never shrinks the covered region. Two regions are
+ * pushed per encoder: the quality-priority rectangle first, then a
+ * full-frame background region - earlier regions win where they
+ * overlap (see obs_encoder_add_roi docs), so the rectangle keeps its
+ * priority and everything outside it gets the (negative) background
+ * priority.
+ */
+void WHIPOutput::ApplyRoi()
+{
+	obs_service_t *service = obs_output_get_service(output);
+	if (!service)
+		return;
+
+	OBSDataAutoRelease settings = obs_service_get_settings(service);
+
+	// obs_context_data_init() never merges a service type's get_defaults()
+	// into the actual runtime settings object (that only happens for the
+	// scratch object obs_get_service_properties()/obs_service_defaults()
+	// build to seed a properties dialog's displayed defaults), so
+	// obs_data_get_double() below would silently return the library's
+	// built-in 0.0 fallback instead of the intended default from
+	// WHIPService::Defaults() whenever a user has never touched the
+	// Manual ROI QP fields (Settings > Stream), making every ROI region a
+	// zero-priority (i.e. no-op) no matter what the detector found.
+	// Setting the same defaults again here, directly on this settings
+	// object, makes the per-key fallback in obs_data_get_double() below
+	// actually apply. Must stay in sync with WHIPService::Defaults() and
+	// OBSBasicSettings::LoadStream1Settings()'s QP<->priority conversion
+	// (6/-8 QP, i.e. +6/-8 out of 51 priority). Same gap applies to
+	// the enable switches below, on a service that's never been through
+	// the Settings dialog.
+	obs_data_set_default_double(settings, "roi_priority", 6.0 / 51.0);
+	obs_data_set_default_double(settings, "roi_bg_priority", -8.0 / 51.0);
+	obs_data_set_default_bool(settings, "roi_enabled", false);
+	obs_data_set_default_bool(settings, "detect_roi", true);
+
+	const bool enabled = obs_data_get_bool(settings, "roi_enabled");
+
+	// Master switch from Settings > Stream > Advanced Options. The
+	// manually-configured rectangle ("roi_enabled", debug aid) takes
+	// precedence over the detector when both are on.
+	const bool detect_roi = obs_data_get_bool(settings, "detect_roi");
+
+	video_t *video = obs_output_video(output);
+	const struct video_output_info *voi = video ? video_output_get_info(video) : nullptr;
+	const int64_t base_width = voi ? voi->width : 0;
+	const int64_t base_height = voi ? voi->height : 0;
+
+	const int64_t left = obs_data_get_int(settings, "roi_left");
+	const int64_t top = obs_data_get_int(settings, "roi_top");
+	const int64_t right = obs_data_get_int(settings, "roi_right");
+	const int64_t bottom = obs_data_get_int(settings, "roi_bottom");
+	const float priority = std::clamp((float)obs_data_get_double(settings, "roi_priority"), 0.0f, 1.0f);
+	const float bg_priority = std::clamp((float)obs_data_get_double(settings, "roi_bg_priority"), -1.0f, 0.0f);
+
+	const bool rect_valid = base_width > 0 && base_height > 0 && right > left && bottom > top;
+
+	for (uint32_t idx = 0; idx < MAX_OUTPUT_VIDEO_ENCODERS; idx++) {
+		obs_encoder_t *encoder = obs_output_get_video_encoder2(output, idx);
+		if (encoder == nullptr)
+			break;
+
+		// Encoders persist across output restarts, so regions from a
+		// previous session must be cleared even when ROI is disabled.
+		obs_encoder_clear_roi(encoder);
+		if (!enabled || !rect_valid)
+			continue;
+
+		const int64_t enc_width = obs_encoder_get_width(encoder);
+		const int64_t enc_height = obs_encoder_get_height(encoder);
+		if (enc_width <= 0 || enc_height <= 0)
+			continue;
+
+		struct obs_encoder_roi region = {};
+		region.left = (uint32_t)std::clamp<int64_t>(left * enc_width / base_width, 0, enc_width);
+		region.top = (uint32_t)std::clamp<int64_t>(top * enc_height / base_height, 0, enc_height);
+		region.right = (uint32_t)std::clamp<int64_t>((right * enc_width + base_width - 1) / base_width, 0,
+							     enc_width);
+		region.bottom = (uint32_t)std::clamp<int64_t>((bottom * enc_height + base_height - 1) / base_height, 0,
+							      enc_height);
+		region.priority = priority;
+
+		bool ok = obs_encoder_add_roi(encoder, &region);
+
+		if (ok && bg_priority < 0.0f) {
+			struct obs_encoder_roi background = {};
+			background.right = (uint32_t)enc_width;
+			background.bottom = (uint32_t)enc_height;
+			background.priority = bg_priority;
+			ok = obs_encoder_add_roi(encoder, &background);
+		}
+
+		if (ok) {
+			do_log(LOG_INFO,
+			       "ROI applied to layer %u (%ux%u): rect %u,%u-%u,%u priority %.2f, "
+			       "background priority %.2f",
+			       idx, (uint32_t)enc_width, (uint32_t)enc_height, region.left, region.top, region.right,
+			       region.bottom, priority, bg_priority);
+		} else {
+			do_log(LOG_WARNING,
+			       "Failed to apply ROI to layer %u (%ux%u) - scaled region smaller than "
+			       "16x16 or encoder lacks ROI support",
+			       idx, (uint32_t)enc_width, (uint32_t)enc_height);
+		}
+	}
+
+	if (detect_roi && !enabled) {
+		do_log(LOG_INFO, "Ball/person detection ROI enabled - starting motion detector");
+		motion_roi.Start(output, priority, bg_priority);
+	} else {
+		motion_roi.Stop();
+		do_log(LOG_INFO, "Ball/person detection ROI is %s", detect_roi ? "superseded by manual ROI" : "disabled");
+	}
 }
 
 bool WHIPOutput::Start()
@@ -126,6 +252,15 @@ bool WHIPOutput::Start()
 	if (!obs_output_initialize_encoders(output, 0))
 		return false;
 
+	ApplyRoi();
+
+	{
+		obs_service_t *service = obs_output_get_service(output);
+		OBSDataAutoRelease service_settings = service ? obs_service_get_settings(service) : nullptr;
+		if (service_settings && obs_data_get_bool(service_settings, "quality_score"))
+			quality_scorer.Start(output);
+	}
+
 	if (start_stop_thread.joinable())
 		start_stop_thread.join();
 	start_stop_thread = std::thread(&WHIPOutput::StartThread, this, generation);
@@ -138,6 +273,9 @@ void WHIPOutput::Stop(bool signal)
 	// the grace timer below giving up), any pending Disconnected grace
 	// timer is now moot.
 	CancelDisconnectGraceTimer();
+
+	motion_roi.Stop();
+	quality_scorer.Stop();
 
 #ifdef WHIP_DEGRADE_ACTIVE
 	WsDegradeClient::Instance().UnregisterOutput();
@@ -214,6 +352,8 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 			       (void *)packet->encoder, videoLayerStates.size());
 			return;
 		}
+		quality_scorer.OnPacket(packet);
+
 		rtp_config->sequenceNumber = videoLayerState->sequenceNumber;
 		rtp_config->ssrc = videoLayerState->ssrc;
 		rtp_config->rid = videoLayerState->rid;

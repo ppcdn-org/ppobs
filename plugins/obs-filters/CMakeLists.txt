@@ -8,6 +8,7 @@ target_sources(
   PRIVATE
     async-delay-filter.c
     chroma-key-filter.c
+    clarity-filter.c
     color-correction-filter.c
     color-grade-filter.c
     color-key-filter.c
@@ -27,6 +28,8 @@ target_sources(
     scale-filter.c
     scroll-filter.c
     sharpness-filter.c
+    temporal-denoise-filter.c
+    beauty-filter.c
 )
 
 target_link_libraries(obs-filters PRIVATE OBS::libobs $<$<PLATFORM_ID:Windows>:OBS::w32-pthreads>)

@@ -10,13 +10,16 @@ find_package(LibDataChannel 0.20 REQUIRED)
 find_package(CURL REQUIRED)
 find_package(Websocketpp 0.8 REQUIRED)
 find_package(Asio 1.12.1 REQUIRED)
+# avcodec/swscale: quality-score.cpp decodes the stream's own top layer
+# back and compares it against the program feed.
+find_package(FFmpeg REQUIRED avcodec avutil swscale)
 
 add_library(obs-webrtc MODULE)
 add_library(OBS::webrtc ALIAS obs-webrtc)
 
 target_sources(
   obs-webrtc
-  PRIVATE obs-webrtc.cpp ppcenter-client.cpp ppcenter-client.h ppcenter-signal-message.cpp ppcenter-signal-message.h ppcenter-signal-outgoing.cpp ppcenter-signal-outgoing.h ppcenter-websocket-frame.cpp ppcenter-websocket-frame.h ppcenter-websocket-utils.cpp ppcenter-websocket-utils.h ppcenter-signal.cpp ppcenter-signal.h uplink-qos-policy.cpp uplink-qos-policy.h whip-output.cpp whip-output.h whip-service.cpp whip-service.h whip-utils.h ppcenter-node-proto.cpp ppcenter-node-proto.h ppcenter-node-channel.cpp ppcenter-node-channel.h degrade-client.cpp degrade-client.h
+  PRIVATE obs-webrtc.cpp ppcenter-client.cpp ppcenter-client.h ppcenter-signal-message.cpp ppcenter-signal-message.h ppcenter-signal-outgoing.cpp ppcenter-signal-outgoing.h ppcenter-websocket-frame.cpp ppcenter-websocket-frame.h ppcenter-websocket-utils.cpp ppcenter-websocket-utils.h ppcenter-signal.cpp ppcenter-signal.h uplink-qos-policy.cpp uplink-qos-policy.h whip-output.cpp whip-output.h whip-service.cpp whip-service.h whip-utils.h ppcenter-node-proto.cpp ppcenter-node-proto.h ppcenter-node-channel.cpp ppcenter-node-channel.h degrade-client.cpp degrade-client.h motion-roi.cpp motion-roi.h quality-score.cpp quality-score.h
 )
 
 target_compile_definitions(
@@ -27,7 +30,14 @@ target_compile_definitions(
 
 target_link_libraries(
   obs-webrtc
-  PRIVATE OBS::libobs LibDataChannel::LibDataChannel CURL::libcurl Websocketpp::Websocketpp Asio::Asio
+  PRIVATE OBS::libobs
+          LibDataChannel::LibDataChannel
+          CURL::libcurl
+          Websocketpp::Websocketpp
+          Asio::Asio
+          FFmpeg::avcodec
+          FFmpeg::avutil
+          FFmpeg::swscale
 )
 
 set_target_properties_obs(obs-webrtc PROPERTIES FOLDER plugins PREFIX "")
