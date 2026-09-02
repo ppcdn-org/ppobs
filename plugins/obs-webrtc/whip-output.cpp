@@ -317,6 +317,8 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 	// the transport out from under a send() that libdatachannel's RTC
 	// worker thread is still in the middle of delivering.
 	std::shared_lock<std::shared_mutex> lk(tracks_mutex);
+	if (!running.load() || teardown_in_progress.load())
+		return;
 	std::shared_ptr<rtc::Track> local_audio_track = audio_track;
 	std::shared_ptr<rtc::Track> local_video_track = video_track;
 	std::shared_ptr<rtc::DataChannel> local_timestamp_channel = timestamp_channel;
@@ -673,6 +675,22 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 			break;
 		case rtc::PeerConnection::State::Closed:
 			do_log(LOG_INFO, "PeerConnection state is now: Closed");
+			// A remote close can leave application-side tracks looking open
+			// while libdatachannel is destroying their transport. Invalidate
+			// them immediately so encoder threads cannot enter send() during
+			// that teardown window. Explicit StopThread() handles its own
+			// close under teardown_in_progress.
+			if (teardown_in_progress.load())
+				break;
+			running = false;
+			{
+				std::unique_lock<std::shared_mutex> lk(tracks_mutex);
+				audio_track = nullptr;
+				video_track = nullptr;
+				timestamp_channel = nullptr;
+				audio_sr_reporter = nullptr;
+				video_sr_reporter = nullptr;
+			}
 			break;
 		}
 	});
@@ -924,6 +942,7 @@ void WHIPOutput::StartThread(uint64_t generation)
 	if (!Setup(generation)) return;
 	std::string resourceURL;
 	if (!Connect(generation, resourceURL)) {
+		teardown_in_progress = true;
 		std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 		if (peer_connection)
 			peer_connection->close();
@@ -931,6 +950,9 @@ void WHIPOutput::StartThread(uint64_t generation)
 		audio_track = nullptr;
 		video_track = nullptr;
 		timestamp_channel = nullptr;
+		audio_sr_reporter = nullptr;
+		video_sr_reporter = nullptr;
+		teardown_in_progress = false;
 		return;
 	}
 	if (!IsActiveGeneration(generation)) {
@@ -939,6 +961,7 @@ void WHIPOutput::StartThread(uint64_t generation)
 		// releasing the resource server-side, otherwise it and its RTC
 		// worker thread leak for the rest of the process's lifetime.
 		{
+			teardown_in_progress = true;
 			std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 			if (peer_connection && peer_connection->state() != rtc::PeerConnection::State::Closed)
 				peer_connection->close();
@@ -946,6 +969,9 @@ void WHIPOutput::StartThread(uint64_t generation)
 			audio_track = nullptr;
 			video_track = nullptr;
 			timestamp_channel = nullptr;
+			audio_sr_reporter = nullptr;
+			video_sr_reporter = nullptr;
+			teardown_in_progress = false;
 		}
 		SendDelete(resourceURL, generation, "obsolete");
 		return;
@@ -1035,6 +1061,7 @@ void WHIPOutput::StopThread(bool signal, uint64_t generation, std::string resour
 	if (nodeChannel) { nodeChannel->Stop(); nodeChannel.reset(); }
 	if (p2pSignal) { p2pSignal.reset(); }
 	{
+		teardown_in_progress = true;
 		std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 		if (audio_track && audio_track->isOpen()) audio_track->close();
 		if (video_track && video_track->isOpen()) video_track->close();
@@ -1044,6 +1071,9 @@ void WHIPOutput::StopThread(bool signal, uint64_t generation, std::string resour
 		audio_track = nullptr;
 		video_track = nullptr;
 		timestamp_channel = nullptr;
+		audio_sr_reporter = nullptr;
+		video_sr_reporter = nullptr;
+		teardown_in_progress = false;
 	}
 	if (signal) { SendDelete(resourceURL, generation, "stopping"); obs_output_signal_stop(output, OBS_OUTPUT_SUCCESS); }
 }
