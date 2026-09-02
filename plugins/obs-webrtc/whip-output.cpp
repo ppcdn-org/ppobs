@@ -238,6 +238,18 @@ bool WHIPOutput::Start()
 	if (!obs_output_reconnecting(output))
 		reconnect_attempt = 0;
 
+	if (!obs_output_can_begin_data_capture(output, 0))
+		return false;
+	if (!obs_output_initialize_encoders(output, 0))
+		return false;
+
+	// Join the previous session's StopThread before touching
+	// videoLayerStates: StopThread() clears the map as its last act, so
+	// populating it first would race a still-running teardown and leave
+	// Data() dropping every video packet as "stale" for the whole session.
+	if (start_stop_thread.joinable())
+		start_stop_thread.join();
+
 	for (uint32_t idx = 0; idx < MAX_OUTPUT_VIDEO_ENCODERS; idx++) {
 		auto encoder = obs_output_get_video_encoder2(output, idx);
 		if (encoder == nullptr) break;
@@ -246,11 +258,6 @@ bool WHIPOutput::Start()
 		v->rid = std::to_string(idx);
 		videoLayerStates[encoder] = v;
 	}
-
-	if (!obs_output_can_begin_data_capture(output, 0))
-		return false;
-	if (!obs_output_initialize_encoders(output, 0))
-		return false;
 
 	ApplyRoi();
 
@@ -261,8 +268,6 @@ bool WHIPOutput::Start()
 			quality_scorer.Start(output);
 	}
 
-	if (start_stop_thread.joinable())
-		start_stop_thread.join();
 	start_stop_thread = std::thread(&WHIPOutput::StartThread, this, generation);
 	return true;
 }
@@ -271,8 +276,9 @@ void WHIPOutput::Stop(bool signal)
 {
 	// Whatever the reason we're stopping (user request, Failed state, or
 	// the grace timer below giving up), any pending Disconnected grace
-	// timer is now moot.
+	// timer and the liveness watchdog are now moot.
 	CancelDisconnectGraceTimer();
+	StopWatchdog();
 
 	motion_roi.Stop();
 	quality_scorer.Stop();
@@ -503,6 +509,20 @@ bool WHIPOutput::Init()
 	if (reconnect_backoff_sec < 0)
 		reconnect_backoff_sec = 0;
 
+	watchdog_interval_sec = (int)obs_data_get_int(output_settings, "whip_watchdog_interval_sec");
+	watchdog_stall_sec = (int)obs_data_get_int(output_settings, "whip_watchdog_stall_sec");
+	if (!obs_data_has_user_value(output_settings, "whip_watchdog_interval_sec"))
+		watchdog_interval_sec = 10;
+	if (!obs_data_has_user_value(output_settings, "whip_watchdog_stall_sec"))
+		watchdog_stall_sec = 30;
+	if (watchdog_interval_sec < 0)
+		watchdog_interval_sec = 0;
+	// A stall threshold below the poll interval would fire on the very
+	// first tick; keep it at least one interval so a single slow poll
+	// can never be mistaken for a stalled stream.
+	if (watchdog_stall_sec > 0 && watchdog_stall_sec < watchdog_interval_sec)
+		watchdog_stall_sec = watchdog_interval_sec;
+
 	obs_service_t *service = obs_output_get_service(output);
 	if (!service) {
 		obs_output_signal_stop(output, OBS_OUTPUT_ERROR);
@@ -539,8 +559,17 @@ bool WHIPOutput::Setup(uint64_t generation)
 		std::string error;
 		if (!ppcenter_resolve_publish(request, resp, error)) {
 			do_log(LOG_ERROR, "ppcenter resolve publish failed: %s", error.c_str());
-			if (IsActiveGeneration(generation))
+			if (IsActiveGeneration(generation)) {
+				// obs_output_signal_stop(..., OBS_OUTPUT_DISCONNECTED) makes
+				// libobs auto-reconnect (see AdvancedOutput::StartStreaming,
+				// which zeroes the generic retry delay for WHIP so this
+				// class's own linear backoff is what paces retries) - without
+				// priming that backoff first, libobs reuses whatever
+				// reconnect_retry_cur_msec last was (0 on the very first
+				// attempt), so every retry fires back-to-back with no delay.
+				PrepareReconnect();
 				obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+			}
 			return false;
 		}
 		endpoint_url = resp.whip_url;
@@ -586,6 +615,14 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 	rtc::Configuration rtcConfig;
 	std::vector<rtc::IceServer> iceServers;
 	iceServers.emplace_back("stun:stun.l.google.com:19302");
+
+#if RTC_VERSION_MAJOR == 0 && RTC_VERSION_MINOR > 20 || RTC_VERSION_MAJOR > 0
+	// Defer ICE gathering until after the WHIP exchange: the STUN/TURN
+	// servers the server advertises in its Link response headers aren't
+	// known until then, and gathering that starts at construction time
+	// would finish before they could ever be applied.
+	rtcConfig.disableAutoGathering = true;
+#endif
 
 	std::string media_stream_id;
 	media_stream_id.reserve(signaling_media_id_length);
@@ -673,6 +710,7 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 	CURL *c = curl_easy_init();
 	std::string body;
 	std::vector<std::string> headers;
+	char error_buffer[CURL_ERROR_SIZE] = {};
 	curl_easy_setopt(c, CURLOPT_URL, endpoint_url.c_str());
 	curl_easy_setopt(c, CURLOPT_POST, 1L);
 	curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)sdp.length());
@@ -682,6 +720,11 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 	curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
 	curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_write_headers);
 	curl_easy_setopt(c, CURLOPT_HEADERDATA, &headers);
+	// Follow redirects, keeping the Authorization header across hops, so a
+	// WHIP endpoint sitting behind a redirecting load balancer still works.
+	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(c, CURLOPT_UNRESTRICTED_AUTH, 1L);
+	curl_easy_setopt(c, CURLOPT_ERRORBUFFER, error_buffer);
 
 	struct curl_slist *headerList = nullptr;
 	std::string contentType = "application/sdp";
@@ -691,20 +734,32 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 	headerList = curl_slist_append(headerList, ("User-Agent: " + user_agent).c_str());
 	curl_easy_setopt(c, CURLOPT_HTTPHEADER, headerList);
 
-	CURLcode res = curl_easy_perform(c);
-	long http_code = 0;
-	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
-	curl_slist_free_all(headerList);
-	curl_easy_cleanup(c);
+	auto cleanupCurl = [&]() {
+		curl_slist_free_all(headerList);
+		curl_easy_cleanup(c);
+	};
+	auto displayError = [&](const char *what, const char *errorMessage) {
+		struct dstr error_message;
+		dstr_init_copy(&error_message, obs_module_text(errorMessage));
+		dstr_replace(&error_message, "%1", what);
+		obs_output_set_last_error(output, error_message.array);
+		dstr_free(&error_message);
+	};
 
+	CURLcode res = curl_easy_perform(c);
 	if (res != CURLE_OK) {
-		do_log(LOG_ERROR, "WHIP request failed: curl error %d", res);
+		do_log(LOG_ERROR, "WHIP request failed: %s", error_buffer[0] ? error_buffer : curl_easy_strerror(res));
+		cleanupCurl();
 		if (IsActiveGeneration(generation))
 			obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
 		return false;
 	}
+
+	long http_code = 0;
+	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
 	if (http_code != 201) {
 		do_log(LOG_ERROR, "WHIP request failed: HTTP %ld", http_code);
+		cleanupCurl();
 		if (IsActiveGeneration(generation)) {
 			// 401/403/404 mean the server rejected this specific stream
 			// (bad key/path/permissions) rather than a transient network
@@ -722,27 +777,128 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 		return false;
 	}
 
-	std::string locationHdr;
-	for (const auto &h : headers) {
-		if (h.size() > 10 && _strnicmp(h.c_str(), "location:", 9) == 0)
-			locationHdr = trim_string(h.substr(9));
-	}
-	if (locationHdr.empty()) {
-		do_log(LOG_ERROR, "WHIP response Location header is empty");
+	if (body.empty()) {
+		do_log(LOG_ERROR, "WHIP request failed: no SDP answer returned from the endpoint");
+		cleanupCurl();
 		if (IsActiveGeneration(generation))
 			obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
 		return false;
 	}
-	resourceURL = locationHdr;
 
+	// Expect one Location header per hop when redirects were followed; the
+	// last one is the resource created by the endpoint we actually reached.
+	long redirect_count = 0;
+	curl_easy_getinfo(c, CURLINFO_REDIRECT_COUNT, &redirect_count);
+	std::string lastLocation;
+	size_t locationCount = 0;
 	for (const auto &h : headers) {
-		if (h.size() > 6 && _strnicmp(h.c_str(), "link:", 5) == 0)
-			ParseLinkHeader(trim_string(h.substr(5)), iceServers);
+		auto value = value_for_header("location", h);
+		if (value.empty()) continue;
+		locationCount++;
+		lastLocation = value;
+	}
+	if (locationCount < static_cast<size_t>(redirect_count) + 1) {
+		do_log(LOG_ERROR, "WHIP server did not provide a resource URL via the Location header");
+		cleanupCurl();
+		if (IsActiveGeneration(generation))
+			obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+		return false;
 	}
 
-	peer_connection->setRemoteDescription(rtc::Description(sdp, "answer"));
+	// STUN/TURN servers the server wants us to use, one or more per Link
+	// header, comma-separated within a header.
+	for (const auto &h : headers) {
+		auto value = value_for_header("link", h);
+		if (value.empty()) continue;
+		for (auto end = value.find(","); end != std::string::npos; end = value.find(",")) {
+			ParseLinkHeader(value.substr(0, end), iceServers);
+			value = value.substr(end + 1);
+		}
+		ParseLinkHeader(value, iceServers);
+	}
+
+	// A Location that isn't absolute is resolved against the effective
+	// (post-redirect) URL, per RFC 9725.
+	CURLU *url_builder = curl_url();
+	if (lastLocation.find("http") != 0) {
+		char *effective_url = nullptr;
+		curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &effective_url);
+		if (!effective_url) {
+			do_log(LOG_ERROR, "Failed to build WHIP resource URL");
+			curl_url_cleanup(url_builder);
+			cleanupCurl();
+			if (IsActiveGeneration(generation))
+				obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+			return false;
+		}
+		curl_url_set(url_builder, CURLUPART_URL, effective_url, 0);
+		curl_url_set(url_builder, CURLUPART_PATH, lastLocation.c_str(), 0);
+		curl_url_set(url_builder, CURLUPART_QUERY, "", 0);
+	} else {
+		curl_url_set(url_builder, CURLUPART_URL, lastLocation.c_str(), 0);
+	}
+
+	char *builtUrl = nullptr;
+	CURLUcode urc = curl_url_get(url_builder, CURLUPART_URL, &builtUrl, CURLU_NO_DEFAULT_PORT);
+	if (urc) {
+		do_log(LOG_ERROR, "WHIP server provided an invalid resource URL via the Location header");
+		curl_url_cleanup(url_builder);
+		cleanupCurl();
+		if (IsActiveGeneration(generation))
+			obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+		return false;
+	}
+	resourceURL = builtUrl;
+	curl_free(builtUrl);
+	curl_url_cleanup(url_builder);
+	cleanupCurl();
+	do_log(LOG_DEBUG, "[WHIP generation=%llu] WHIP Resource URL is: %s",
+	       static_cast<unsigned long long>(generation), resourceURL.c_str());
+
+	// The remote answer is the response body - NOT the offer we posted.
+	auto answerSdp = body;
+	answerSdp.erase(0, answerSdp.find("v=0"));
+
+	// When sending simulcast, verify the server actually accepted every
+	// layer we offered rather than silently publishing fewer.
+	if (videoLayerStates.size() != 1) {
+		auto layersAccepted = simulcast_layers_in_answer(answerSdp);
+		if (videoLayerStates.size() != layersAccepted) {
+			do_log(LOG_ERROR, "WHIP server only accepted %zu of %zu simulcast layers", layersAccepted,
+			       videoLayerStates.size());
+			displayError(std::to_string(layersAccepted).c_str(), "Error.SimulcastLayersRejected");
+			SendDelete(resourceURL, generation, "simulcast-rejected");
+			if (IsActiveGeneration(generation))
+				obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+			return false;
+		}
+	}
+
+	try {
+		peer_connection->setRemoteDescription(rtc::Description(answerSdp, "answer"));
+	} catch (const std::invalid_argument &err) {
+		do_log(LOG_ERROR, "WHIP server responded with invalid SDP: %s", err.what());
+		displayError(err.what(), "Error.InvalidSDP");
+		SendDelete(resourceURL, generation, "invalid-sdp");
+		if (IsActiveGeneration(generation))
+			obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+		return false;
+	} catch (const std::exception &err) {
+		do_log(LOG_ERROR, "Failed to set remote description: %s", err.what());
+		displayError(err.what(), "Error.NoRemoteDescription");
+		SendDelete(resourceURL, generation, "no-remote-description");
+		if (IsActiveGeneration(generation))
+			obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+		return false;
+	}
+
 	if (!IsActiveGeneration(generation)) {
+		// Superseded mid-exchange: release the resource the server just
+		// created for us, then drop the local PeerConnection.
+		SendDelete(resourceURL, generation, "stale-after-answer");
 		std::unique_lock<std::shared_mutex> lk(tracks_mutex);
+		if (peer_connection && peer_connection->state() != rtc::PeerConnection::State::Closed)
+			peer_connection->close();
 		peer_connection = nullptr;
 		audio_track = nullptr;
 		video_track = nullptr;
@@ -754,6 +910,12 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 		std::lock_guard<std::mutex> rl(resource_mutex);
 		resource_url = resourceURL;
 	}
+
+#if RTC_VERSION_MAJOR == 0 && RTC_VERSION_MINOR > 20 || RTC_VERSION_MAJOR > 0
+	// Auto-gathering was disabled above; start it now that the server's
+	// advertised STUN/TURN servers are actually part of the config.
+	peer_connection->gatherLocalCandidates(iceServers);
+#endif
 	return true;
 }
 
@@ -771,7 +933,23 @@ void WHIPOutput::StartThread(uint64_t generation)
 		timestamp_channel = nullptr;
 		return;
 	}
-	if (!IsActiveGeneration(generation)) { SendDelete(resourceURL, generation, "obsolete"); return; }
+	if (!IsActiveGeneration(generation)) {
+		// Connect() succeeded but a newer Start() already superseded us.
+		// Tear the (fully live) PeerConnection down locally before
+		// releasing the resource server-side, otherwise it and its RTC
+		// worker thread leak for the rest of the process's lifetime.
+		{
+			std::unique_lock<std::shared_mutex> lk(tracks_mutex);
+			if (peer_connection && peer_connection->state() != rtc::PeerConnection::State::Closed)
+				peer_connection->close();
+			peer_connection = nullptr;
+			audio_track = nullptr;
+			video_track = nullptr;
+			timestamp_channel = nullptr;
+		}
+		SendDelete(resourceURL, generation, "obsolete");
+		return;
+	}
 	do_log(LOG_INFO, "WHIPOutput: Started");
 	StartP2PSignal();
 
@@ -792,6 +970,10 @@ void WHIPOutput::StartThread(uint64_t generation)
 	obs_output_begin_data_capture(output, 0);
 	running = true;
 
+	// Started only after data capture begins: before this point a flat
+	// byte counter is normal, and the connect path has its own timeouts.
+	StartWatchdog(generation);
+
 #ifdef WHIP_DEGRADE_ACTIVE
 	WsDegradeClient::Instance().RegisterOutput(output);
 #endif
@@ -799,20 +981,52 @@ void WHIPOutput::StartThread(uint64_t generation)
 
 void WHIPOutput::SendDelete(const std::string &resourceURL, uint64_t generation, const char *reason)
 {
-	if (resourceURL.empty() || !IsActiveGeneration(generation)) return;
+	// Deliberately NOT gated on IsActiveGeneration(): the whole point of
+	// this call on the "obsolete" path is to clean up a session whose
+	// generation has already been superseded, so gating the request on the
+	// generation still being active would make that call a no-op and leak
+	// the resource server-side on every connect race.
+	if (resourceURL.empty()) return;
 	CURL *c = curl_easy_init();
+	char error_buffer[CURL_ERROR_SIZE] = {};
 	curl_easy_setopt(c, CURLOPT_URL, resourceURL.c_str());
 	curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
 	curl_easy_setopt(c, CURLOPT_TIMEOUT, 8L);
+	curl_easy_setopt(c, CURLOPT_ERRORBUFFER, error_buffer);
 	struct curl_slist *list = nullptr;
 	if (!bearer_token.empty())
 		list = curl_slist_append(list, ("Authorization: Bearer " + bearer_token).c_str());
 	list = curl_slist_append(list, ("User-Agent: " + user_agent).c_str());
 	curl_easy_setopt(c, CURLOPT_HTTPHEADER, list);
+
 	CURLcode res = curl_easy_perform(c);
-	do_log(LOG_INFO, "WHIPOutput: SendDelete (%s) result: %d", reason, res);
+	long response_code = 0;
+	if (res == CURLE_OK)
+		curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &response_code);
 	curl_slist_free_all(list);
 	curl_easy_cleanup(c);
+
+	if (res != CURLE_OK) {
+		do_log(LOG_WARNING, "[WHIP generation=%llu] DELETE for resource URL failed (%s): %s",
+		       static_cast<unsigned long long>(generation), reason ? reason : "unknown",
+		       error_buffer[0] ? error_buffer : curl_easy_strerror(res));
+		return;
+	}
+	if (response_code != 200) {
+		do_log(LOG_WARNING, "[WHIP generation=%llu] DELETE for resource URL failed (%s). HTTP Code: %ld",
+		       static_cast<unsigned long long>(generation), reason ? reason : "unknown", response_code);
+		return;
+	}
+
+	do_log(LOG_DEBUG, "[WHIP generation=%llu] DELETE for resource URL succeeded (%s)",
+	       static_cast<unsigned long long>(generation), reason ? reason : "unknown");
+	// Only drop the cached URL once the server has actually confirmed the
+	// teardown, and only if this generation still owns it.
+	if (IsActiveGeneration(generation)) {
+		std::lock_guard<std::mutex> rl(resource_mutex);
+		if (resource_url == resourceURL)
+			resource_url.clear();
+	}
 }
 
 void WHIPOutput::StopThread(bool signal, uint64_t generation, std::string resourceURL)
@@ -868,9 +1082,29 @@ void WHIPOutput::Send(void *data, uintptr_t size, uint64_t duration, std::shared
 	if (!track || !track->isOpen()) return;
 	std::vector<rtc::byte> sample{(rtc::byte *)data, (rtc::byte *)data + size};
 	auto rtp = rtcp_sr_reporter->rtpConfig;
-	rtp->timestamp = rtp->timestamp + (rtp->secondsToTimestamp(static_cast<double>(duration)) * rtp->clockRate);
-	try { track->send(sample); } catch (...) {}
-	total_bytes_sent += size;
+
+	// duration is in microseconds; secondsToTimestamp() already scales by
+	// clockRate, so it must be fed seconds and its result used as-is.
+	// Converting here (rather than multiplying by clockRate again) keeps
+	// the 32-bit RTP timestamp advancing at the true media rate - the
+	// value also feeds the RTCP sender report used for A/V sync.
+	auto elapsed_seconds = static_cast<double>(duration) / (1000.0 * 1000.0);
+	uint32_t elapsed_timestamp = rtp->secondsToTimestamp(elapsed_seconds);
+	rtp->timestamp = rtp->timestamp + elapsed_timestamp;
+
+#if RTC_VERSION_MAJOR == 0 && RTC_VERSION_MINOR < 23
+	// Ask for a fresh sender report if the last one is over a second old
+	auto report_elapsed_timestamp = rtp->timestamp - rtcp_sr_reporter->lastReportedTimestamp();
+	if (rtp->timestampToSeconds(report_elapsed_timestamp) > 1)
+		rtcp_sr_reporter->setNeedsToReport();
+#endif
+
+	try {
+		track->send(sample);
+		total_bytes_sent += sample.size();
+	} catch (const std::exception &e) {
+		do_log(LOG_ERROR, "error: %s", e.what());
+	}
 }
 
 bool WHIPOutput::IsActiveGeneration(uint64_t generation) const { return generation == active_generation.load(); }
@@ -957,10 +1191,138 @@ void WHIPOutput::StartDisconnectGraceTimer(uint64_t generation)
 
 void WHIPOutput::PrepareReconnect()
 {
-	const int attempt = reconnect_attempt.fetch_add(1);
+	// fetch_add returns the *previous* value, so the first attempt must be
+	// scaled by attempt + 1. Scaling by the raw fetch_add result made the
+	// first reconnect wait 0s, which let libobs's reconnect thread call
+	// Start() before the previous session's end_data_capture_thread had
+	// cleared the output's "active" flag; Start() then failed on
+	// obs_output_can_begin_data_capture() and the output was left stuck
+	// in the reconnecting state (streaming at 0 bitrate) until manually
+	// restarted. libobs's reconnect_thread() now reschedules a failed
+	// start as well, but there is no reason to schedule a doomed attempt
+	// in the first place.
+	const int attempt = reconnect_attempt.fetch_add(1) + 1;
 	const int delay_sec = reconnect_backoff_sec * attempt;
 	obs_output_set_reconnect_delay(output, delay_sec * 1000);
-	do_log(LOG_INFO, "WHIP reconnect attempt %d: waiting %ds before next session", attempt + 1, delay_sec);
+	do_log(LOG_INFO, "WHIP reconnect attempt %d: waiting %ds before next session", attempt, delay_sec);
+}
+
+// -------------------------------------------------------------------
+// Periodic liveness watchdog.
+// -------------------------------------------------------------------
+//
+// The PeerConnection state machine only reports transport-level faults:
+// it says nothing when a session is nominally Connected and "running"
+// but has silently stopped pushing bytes. That gap is exactly how a
+// stuck output can sit there for hours looking healthy in the UI while
+// the far end receives nothing, with the log showing no clue beyond the
+// absence of new lines - which is not something anyone notices at 2am.
+//
+// So poll instead of trusting state transitions: every
+// whip_watchdog_interval_sec, log a one-line heartbeat with the byte
+// counter, and if the counter has not advanced for whip_watchdog_stall_sec
+// while we still believe we are running, treat it as a dead session and
+// hand it to the same teardown path a Failed PeerConnection would use.
+// Recovery deliberately goes through Stop(false) +
+// OBS_OUTPUT_DISCONNECTED rather than any bespoke restart logic, so a
+// stall reuses the one reconnect path that is already exercised by the
+// grace timer and by Failed.
+//
+// Set whip_watchdog_interval_sec to 0 to disable entirely, or
+// whip_watchdog_stall_sec to 0 to keep the heartbeat logging but never
+// act on it (useful when diagnosing whether a stall is real).
+void WHIPOutput::StartWatchdog(uint64_t generation)
+{
+	// Reap any previous session's watchdog first, before the disable
+	// check below can return early and strand it. Joining here cannot
+	// deadlock even though this runs on start_stop_thread and a tripped
+	// watchdog calls Stop(), which joins start_stop_thread: Stop() calls
+	// StopWatchdog() before it acquires start_stop_mutex, and Start()
+	// cannot spawn this StartThread without that same mutex. So a
+	// watchdog still inside Stop() and a running StartThread are mutually
+	// exclusive, and the thread stays owned (never detached) so it can't
+	// outlive us.
+	StopWatchdog();
+
+	if (watchdog_interval_sec <= 0) {
+		do_log(LOG_INFO, "Watchdog disabled");
+		return;
+	}
+
+	{
+		std::lock_guard<std::mutex> lk(watchdog_mutex);
+		watchdog_cancel = false;
+	}
+
+	if (watchdog_stall_sec > 0)
+		do_log(LOG_INFO, "Watchdog started: polling every %ds, reconnecting after %ds without progress",
+		       watchdog_interval_sec, watchdog_stall_sec);
+	else
+		do_log(LOG_INFO, "Watchdog started: polling every %ds, stall recovery disabled (heartbeat log only)",
+		       watchdog_interval_sec);
+
+	watchdog_thread = std::thread([this, generation]() {
+		size_t last_bytes = total_bytes_sent.load();
+		int64_t last_progress_ns = os_gettime_ns();
+
+		for (;;) {
+			std::unique_lock<std::mutex> lk(watchdog_mutex);
+			bool cancelled = watchdog_cv.wait_for(lk, std::chrono::seconds(watchdog_interval_sec),
+							      [this]() { return watchdog_cancel; });
+			lk.unlock();
+
+			if (cancelled)
+				return;
+			// A newer session has taken over; its own watchdog
+			// owns the check from here.
+			if (!IsActiveGeneration(generation))
+				return;
+
+			const size_t bytes = total_bytes_sent.load();
+			const int64_t now_ns = os_gettime_ns();
+
+			if (bytes != last_bytes) {
+				last_bytes = bytes;
+				last_progress_ns = now_ns;
+			}
+
+			const double stalled_sec = (double)(now_ns - last_progress_ns) / 1e9;
+
+			// Only meaningful once data capture has actually
+			// begun; before that a flat counter is expected.
+			if (!running) {
+				do_log(LOG_INFO, "Watchdog: connecting, %zu bytes sent so far", bytes);
+				continue;
+			}
+
+			if (watchdog_stall_sec > 0 && stalled_sec >= (double)watchdog_stall_sec) {
+				do_log(LOG_WARNING,
+				       "Watchdog: no bytes sent for %.0fs (threshold %ds) - treating session as dead, tearing down and reconnecting",
+				       stalled_sec, watchdog_stall_sec);
+				PrepareReconnect();
+				Stop(false);
+				obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+				return;
+			}
+
+			do_log(LOG_INFO, "Watchdog: alive, %zu bytes sent, %.0fs since last progress", bytes,
+			       stalled_sec);
+		}
+	});
+}
+
+void WHIPOutput::StopWatchdog()
+{
+	{
+		std::lock_guard<std::mutex> lk(watchdog_mutex);
+		watchdog_cancel = true;
+	}
+	watchdog_cv.notify_all();
+
+	// Same self-join guard as CancelDisconnectGraceTimer(): the watchdog
+	// thread itself calls Stop() -> StopWatchdog() when it trips.
+	if (watchdog_thread.joinable() && watchdog_thread.get_id() != std::this_thread::get_id())
+		watchdog_thread.join();
 }
 
 void WHIPOutput::CancelDisconnectGraceTimer()

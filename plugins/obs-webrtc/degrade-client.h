@@ -7,6 +7,8 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <algorithm>
+#include <cstdint>
 
 #define ASIO_STANDALONE 1
 #include <websocketpp/config/asio_no_tls_client.hpp>
@@ -41,12 +43,37 @@ private:
 	bool ParseTargetState(const std::string &json, TargetState &out);
 	void ApplyIfNeeded(const TargetState &state);
 
+	// Scales the bitrate of encoder slots [0, count) by bitrate_percent.
+	// When live is true each encoder is reconfigured in place via
+	// obs_encoder_update() (safe on an active encoder - the settings are
+	// picked up on the encoder thread rather than dropped); otherwise the
+	// settings object is just updated for the encoder to read when the
+	// output next starts. Assumes mtx is held.
+	void ApplyBitrateLocked(obs_output_t *out, int count, int bitrate_percent, bool live);
+
+	// Opens a connection to ws_url. Assumes mtx is held, ws_url and
+	// ws_secret are non-empty, and any existing conn has been reset by the
+	// caller. Shared by RegisterOutput() (first connect / URL change) and
+	// the worker loop's reconnect check (same URL, connection dropped -
+	// see the close/fail handlers and ShouldReconnectLocked).
+	void ConnectLocked();
+
+	// True if we should attempt (re)connecting: we have a URL and secret,
+	// aren't already connected/connecting, and the backoff delay set by
+	// the close/fail handlers has elapsed. Assumes mtx is held.
+	bool ShouldReconnectLocked() const;
+
 	client_t client;
 	conn_ptr conn;
 
 	obs_output_t *output;
 	std::string whip_url;
 	std::string ws_url;
+
+	// Bearer secret for the control channel, cached from the service
+	// settings at RegisterOutput() time so a reconnect can re-authenticate
+	// without needing the service to still be reachable.
+	std::string ws_secret;
 
 	TargetState target_;
 	mutable std::mutex mtx;
@@ -56,6 +83,16 @@ private:
 
 	int last_layers;
 	int last_pct;
+
+	// Reconnect backoff state (protected by mtx). The close/fail handlers
+	// reset conn to null and schedule the next retry via these; the worker
+	// loop's idle tick checks ShouldReconnectLocked() and calls
+	// ConnectLocked() once the deadline passes. Doubles on each
+	// consecutive failure, capped, and resets once open_handler fires.
+	uint64_t next_reconnect_attempt_ns = 0;
+	int reconnect_backoff_ms = 2000;
+	static constexpr int kReconnectBackoffMinMs = 2000;
+	static constexpr int kReconnectBackoffMaxMs = 30000;
 
 	// Cached encoder pointers (all slots), saved at RegisterOutput time.
 	// Index 0 is the highest-resolution (full-res) encoder, index
