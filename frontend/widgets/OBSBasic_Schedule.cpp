@@ -17,6 +17,8 @@
 
 #include "OBSBasic.hpp"
 
+#include <components/UIValidation.hpp>
+
 #include <QDateTime>
 #include <QTimer>
 
@@ -236,6 +238,23 @@ void OBSBasic::ScheduleButtonClicked()
 	// switch check above.
 	if (nowEnabled && (streamingStarting || (outputHandler && outputHandler->StreamingActive())))
 		return;
+
+	// Same PPCenter field check the manual Start Streaming button runs
+	// (see StreamActionTriggered) - CheckSchedule() calls StartStreaming()
+	// directly once a slot's time window is entered, bypassing that
+	// button entirely, so this is the only chance to catch a missing
+	// field before the schedule silently fails to connect later.
+	if (nowEnabled) {
+		switch (UIValidation::PPCenterFieldsConfirmation(this, service)) {
+		case StreamSettingsAction::ContinueStream:
+			break;
+		case StreamSettingsAction::OpenSettings:
+			on_action_Settings_triggered();
+			return;
+		case StreamSettingsAction::Cancel:
+			return;
+		}
+	}
 
 	config_set_bool(activeConfiguration, "Schedule", "Enabled", nowEnabled);
 

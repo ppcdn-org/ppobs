@@ -257,7 +257,16 @@ void OBSBasicSettings::LoadStream1Settings()
 		ui->ppcenterUrl->setText(QT_UTF8(obs_data_get_string(settings, "ppcenter_url")));
 		ui->ppcenterAppId->setText(QT_UTF8(obs_data_get_string(settings, "ppcenter_appid")));
 		ui->ppcenterSecret->setText(QT_UTF8(obs_data_get_string(settings, "ppcenter_secret")));
-		ui->ppcenterRegion->setText(QT_UTF8(obs_data_get_string(settings, "ppcenter_region")));
+
+		// Empty by default rather than a required choice - "auto" (let
+		// the ppcenter server pick a region) is filled in explicitly so
+		// the PPCenter field-completeness check (see
+		// UIValidation::PPCenterFieldsConfirmation) doesn't block
+		// streaming just because the user never touched this field.
+		QString region = QT_UTF8(obs_data_get_string(settings, "ppcenter_region"));
+		if (region.trimmed().isEmpty())
+			region = QStringLiteral("auto");
+		ui->ppcenterRegion->setText(region);
 
 		QString nodeId = QT_UTF8(obs_data_get_string(settings, "ppcenter_node_id"));
 		if (nodeId.isEmpty())
@@ -1383,6 +1392,9 @@ void OBSBasicSettings::on_ppcenterEnabled_toggled()
 
 	if (enabled && ui->ppcenterNodeId->text().isEmpty())
 		ui->ppcenterNodeId->setText(QString::fromStdString(GetHardwareNodeId()));
+
+	if (enabled && ui->ppcenterRegion->text().trimmed().isEmpty())
+		ui->ppcenterRegion->setText(QStringLiteral("auto"));
 }
 
 bool OBSBasicSettings::IsCustomServer()

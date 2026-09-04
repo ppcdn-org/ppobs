@@ -25,4 +25,12 @@ public:
 	 * open settings, cancel, or continue.  Returns Continue if all
 	 * settings are valid. */
 	static StreamSettingsAction StreamSettingsConfirmation(QWidget *parent, OBSService service);
+
+	/* If PPCenter is enabled on the given (WHIP) service, checks that its
+	 * URL, App ID, App Secret and Region fields are all filled in, since
+	 * a stream/schedule start with any of them missing just fails later
+	 * with a less actionable error from the WHIP output. Shows a warning
+	 * with options to open settings or cancel. Returns Continue if
+	 * PPCenter is disabled, or all of its fields are filled in. */
+	static StreamSettingsAction PPCenterFieldsConfirmation(QWidget *parent, OBSService service);
 };

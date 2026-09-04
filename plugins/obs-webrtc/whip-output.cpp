@@ -722,8 +722,7 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 	rtc::Description localDescription(peer_connection->localDescription().value());
 	if (!video_track && !audio_track) return false;
 
-	std::string sdp;
-	localDescription.generateSdp(sdp);
+	std::string sdp = localDescription.generateSdp();
 
 	CURL *c = curl_easy_init();
 	std::string body;
@@ -779,17 +778,19 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 		do_log(LOG_ERROR, "WHIP request failed: HTTP %ld", http_code);
 		cleanupCurl();
 		if (IsActiveGeneration(generation)) {
-			// 401/403/404 mean the server rejected this specific stream
-			// (bad key/path/permissions) rather than a transient network
-			// problem - retrying via libobs's reconnect timer would just
-			// get the identical rejection every time. Signal
+			// 401/403/404/406 mean the server rejected this specific
+			// stream/offer (bad key/path/permissions, or 406 Not
+			// Acceptable for the offered SDP) rather than a transient
+			// network problem - retrying via libobs's reconnect timer
+			// would just resubmit the identical offer and get the
+			// identical rejection every time. Signal
 			// OBS_OUTPUT_INVALID_STREAM (not reconnectable, see
 			// can_reconnect() in libobs/obs-output.c) so the user gets a
 			// clear "invalid stream key/path" error and streaming
 			// actually stops, instead of retrying forever with no
 			// visible error (as OBS_OUTPUT_DISCONNECTED would do). Other
 			// codes (5xx, etc.) keep the existing reconnectable behavior.
-			bool permanent = http_code == 401 || http_code == 403 || http_code == 404;
+			bool permanent = http_code == 401 || http_code == 403 || http_code == 404 || http_code == 406;
 			obs_output_signal_stop(output, permanent ? OBS_OUTPUT_INVALID_STREAM : OBS_OUTPUT_DISCONNECTED);
 		}
 		return false;

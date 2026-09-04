@@ -86,10 +86,11 @@ static inline std::string generate_user_agent()
 #define OS_NAME "Linux"
 #endif
 
-	// Build the user-agent string
+	// Build the user-agent string. This is the header VALUE only - callers
+	// prepend "User-Agent: " themselves (see whip-output.cpp), so it must
+	// not be baked in here too or the header comes out doubled.
 	std::stringstream ua;
-	// User agent header prefix
-	ua << "User-Agent: obs-studio/" << obs_get_version_string() << " ";
+	ua << "obs-studio/" << obs_get_version_string() << " ";
 	// Operating system version info
 	ua << "(" << OS_NAME << "; " << obs_get_locale() << ")";
 

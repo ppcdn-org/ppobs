@@ -452,6 +452,16 @@ void OBSBasic::StreamActionTriggered()
 			return;
 		}
 
+		switch (UIValidation::PPCenterFieldsConfirmation(this, service)) {
+		case StreamSettingsAction::ContinueStream:
+			break;
+		case StreamSettingsAction::OpenSettings:
+			on_action_Settings_triggered();
+			return;
+		case StreamSettingsAction::Cancel:
+			return;
+		}
+
 		bool confirm = config_get_bool(App()->GetUserConfig(), "BasicWindow", "WarnBeforeStartingStream");
 
 		bool bwtest = false;

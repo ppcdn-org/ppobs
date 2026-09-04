@@ -107,3 +107,41 @@ StreamSettingsAction UIValidation::StreamSettingsConfirmation(QWidget *parent, O
 
 	return StreamSettingsAction::ContinueStream;
 }
+
+StreamSettingsAction UIValidation::PPCenterFieldsConfirmation(QWidget *parent, OBSService service)
+{
+	OBSDataAutoRelease settings = obs_service_get_settings(service);
+	if (!obs_data_get_bool(settings, "ppcenter_enabled"))
+		return StreamSettingsAction::ContinueStream;
+
+	auto isEmpty = [&](const char *key) {
+		const char *value = obs_data_get_string(settings, key);
+		return !value || !*value;
+	};
+
+	bool missingField = isEmpty("ppcenter_url") || isEmpty("ppcenter_appid") || isEmpty("ppcenter_secret") ||
+			    isEmpty("ppcenter_region");
+	if (!missingField)
+		return StreamSettingsAction::ContinueStream;
+
+	QMessageBox messageBox(parent);
+	messageBox.setWindowTitle(QTStr("Basic.Settings.Stream.MissingSettingAlert"));
+	messageBox.setText(QTStr("Basic.Settings.Stream.PPCenter.MissingFields"));
+
+	QPushButton *cancel;
+	QPushButton *settings_button;
+
+	settings_button = messageBox.addButton(QTStr("Basic.Settings.Stream.StreamSettingsWarning"), ACCEPT_BUTTON);
+	cancel = messageBox.addButton(QTStr("Cancel"), REJECT_BUTTON);
+
+	messageBox.setDefaultButton(settings_button);
+	messageBox.setEscapeButton(cancel);
+
+	messageBox.setIcon(QMessageBox::Warning);
+	messageBox.exec();
+
+	if (messageBox.clickedButton() == settings_button)
+		return StreamSettingsAction::OpenSettings;
+
+	return StreamSettingsAction::Cancel;
+}
