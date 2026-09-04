@@ -317,7 +317,7 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 	// the transport out from under a send() that libdatachannel's RTC
 	// worker thread is still in the middle of delivering.
 	std::shared_lock<std::shared_mutex> lk(tracks_mutex);
-	if (!running.load() || teardown_in_progress.load())
+	if (!sending_enabled.load() || teardown_in_progress.load())
 		return;
 	std::shared_ptr<rtc::Track> local_audio_track = audio_track;
 	std::shared_ptr<rtc::Track> local_video_track = video_track;
@@ -466,8 +466,6 @@ void WHIPOutput::ConfigureVideoTrack(std::string media_stream_id, std::string cn
 
 	const obs_encoder_t *encoder = obs_output_get_video_encoder2(output, 0);
 	if (!encoder) return;
-	OBSDataAutoRelease settings = obs_encoder_get_settings(encoder);
-	auto video_bitrate = (int)obs_data_get_int(settings, "bitrate");
 	const char *codec = obs_encoder_get_codec(encoder);
 	if (strcmp("h264", codec) == 0) {
 		video_description.addH264Codec(video_payload_type);
@@ -487,8 +485,43 @@ void WHIPOutput::ConfigureVideoTrack(std::string media_stream_id, std::string cn
 	auto new_video_sr_reporter = std::make_shared<rtc::RtcpSrReporter>(rtp_config);
 	packetizer->addToChain(new_video_sr_reporter);
 	packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>(video_nack_buffer_size));
-	if (video_bitrate != 0)
-		packetizer->addToChain(std::make_shared<rtc::PacingHandler>(static_cast<double>(video_bitrate * 10000), std::chrono::milliseconds(5)));
+
+	// Pace the whole video track against the sum of every simulcast layer's
+	// configured bitrate, not just layer 0's: all layers share this one
+	// track (and therefore this one PacingHandler), so sizing the budget
+	// from layer 0 alone would starve the others.
+	//
+	// The bitrate is in kbps, so the conversion to the bits/s PacingHandler
+	// wants is *1000 - a previous version used *10000, which inflated a
+	// 3000 kbps layer into a 30 Mbit/s budget against a few Mbit/s of
+	// actual traffic. A ceiling that far above the real rate never
+	// throttles anything, so packets are left in whatever bursts the
+	// encoder produced them in rather than being smoothed out, which is
+	// exactly what pacing exists to avoid on a congested uplink.
+	//
+	// Headroom is deliberate: pacing is meant to smooth bursts, not enforce
+	// a rate limit. Sizing the budget too close to the nominal bitrate
+	// would delay packets whenever the encoder legitimately overshoots
+	// (keyframes, scene changes), adding latency instead of removing
+	// burstiness.
+	int64_t total_bitrate_kbps = 0;
+	for (uint32_t idx = 0; idx < MAX_OUTPUT_VIDEO_ENCODERS; idx++) {
+		const obs_encoder_t *layer = obs_output_get_video_encoder2(output, idx);
+		if (!layer)
+			break;
+
+		OBSDataAutoRelease layer_settings = obs_encoder_get_settings(layer);
+		total_bitrate_kbps += obs_data_get_int(layer_settings, "bitrate");
+	}
+
+	if (total_bitrate_kbps > 0) {
+		const double pacing_bits_per_sec = static_cast<double>(total_bitrate_kbps) * 1000.0 * 1.5;
+		do_log(LOG_INFO, "Pacing video track at %.1f Mbit/s (%lld kbps across all layers + 50%% headroom)",
+		       pacing_bits_per_sec / 1000000.0, (long long)total_bitrate_kbps);
+		packetizer->addToChain(
+			std::make_shared<rtc::PacingHandler>(pacing_bits_per_sec, std::chrono::milliseconds(5)));
+	}
+
 	auto new_video_track = peer_connection->addTrack(video_description);
 	new_video_track->setMediaHandler(packetizer);
 
@@ -503,7 +536,7 @@ bool WHIPOutput::Init()
 	disconnect_grace_sec = (int)obs_data_get_int(output_settings, "whip_disconnect_grace_sec");
 	reconnect_backoff_sec = (int)obs_data_get_int(output_settings, "whip_reconnect_backoff_sec");
 	if (!obs_data_has_user_value(output_settings, "whip_disconnect_grace_sec"))
-		disconnect_grace_sec = 10;
+		disconnect_grace_sec = 5;
 	if (!obs_data_has_user_value(output_settings, "whip_reconnect_backoff_sec"))
 		reconnect_backoff_sec = 3;
 	if (disconnect_grace_sec < 0)
@@ -680,9 +713,21 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 			// them immediately so encoder threads cannot enter send() during
 			// that teardown window. Explicit StopThread() handles its own
 			// close under teardown_in_progress.
+			//
+			// Deliberately clears sending_enabled here, NOT running: running
+			// tells StopThread() whether it still owes libobs a stop signal,
+			// and clearing it from this callback - which can fire
+			// asynchronously, independent of our own StopThread() - raced
+			// StopThread() checking it, so the stop signal was silently
+			// skipped and obs_output_active() stayed wedged true forever.
+			// That in turn made every future CheckSchedule() poll see
+			// "should be streaming and already is" and do nothing,
+			// permanently, with no further log output - root-caused a
+			// stream that never resumed after a scheduled stop/start
+			// boundary.
 			if (teardown_in_progress.load())
 				break;
-			running = false;
+			sending_enabled = false;
 			{
 				std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 				audio_track = nullptr;
@@ -691,6 +736,21 @@ bool WHIPOutput::Connect(uint64_t generation, std::string &resourceURL)
 				audio_sr_reporter = nullptr;
 				video_sr_reporter = nullptr;
 			}
+
+			// Closed is terminal in libdatachannel: unlike Disconnected, a
+			// closed PeerConnection can never transition back to Connected,
+			// so there is nothing left for the grace timer to wait for.
+			// libdatachannel typically reports Closed within a millisecond
+			// of Disconnected whenever ICE gives up for real, which used to
+			// mean every teardown sat through the full grace period on a
+			// connection that was already dead. Cancel the timer and
+			// reconnect immediately instead; the grace period still applies
+			// to a bare Disconnected that has not (yet) been followed by
+			// Closed, which is the transient blip case it exists for.
+			CancelDisconnectGraceTimer();
+			PrepareReconnect();
+			Stop(false);
+			obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
 			break;
 		}
 	});
@@ -943,6 +1003,7 @@ void WHIPOutput::StartThread(uint64_t generation)
 	if (!Setup(generation)) return;
 	std::string resourceURL;
 	if (!Connect(generation, resourceURL)) {
+		sending_enabled = false;
 		teardown_in_progress = true;
 		std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 		if (peer_connection)
@@ -962,6 +1023,7 @@ void WHIPOutput::StartThread(uint64_t generation)
 		// releasing the resource server-side, otherwise it and its RTC
 		// worker thread leak for the rest of the process's lifetime.
 		{
+			sending_enabled = false;
 			teardown_in_progress = true;
 			std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 			if (peer_connection && peer_connection->state() != rtc::PeerConnection::State::Closed)
@@ -996,6 +1058,7 @@ void WHIPOutput::StartThread(uint64_t generation)
 
 	obs_output_begin_data_capture(output, 0);
 	running = true;
+	sending_enabled = true;
 
 	// Started only after data capture begins: before this point a flat
 	// byte counter is normal, and the connect path has its own timeouts.
@@ -1059,6 +1122,7 @@ void WHIPOutput::SendDelete(const std::string &resourceURL, uint64_t generation,
 void WHIPOutput::StopThread(bool signal, uint64_t generation, std::string resourceURL)
 {
 	running = false;
+	sending_enabled = false;
 	if (nodeChannel) { nodeChannel->Stop(); nodeChannel.reset(); }
 	if (p2pSignal) { p2pSignal.reset(); }
 	{
