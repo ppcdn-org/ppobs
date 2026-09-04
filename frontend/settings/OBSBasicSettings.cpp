@@ -429,7 +429,6 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->ppcenterAppId,        EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->ppcenterSecret,       EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->ppcenterRegion,       EDIT_CHANGED,   STREAM1_CHANGED);
-	HookWidget(ui->ppcenterNodeId,       EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->enableMultitrackVideo,      CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoMaximumAggregateBitrateAuto, CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoMaximumAggregateBitrate,     SCROLL_CHANGED, STREAM1_CHANGED);

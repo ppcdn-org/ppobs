@@ -63,11 +63,6 @@ string GetDefaultVideoSavePath()
     return url.path.fileSystemRepresentation;
 }
 
-string GetHardwareNodeId()
-{
-    return string();
-}
-
 vector<string> GetPreferredLocales()
 {
     NSArray *preferred = [NSLocale preferredLanguages];

@@ -18,19 +18,6 @@ static uint32_t generate_random_u32()
 	return dist(gen);
 }
 
-// Stable (non-cryptographic) string hash used to fold an arbitrary node
-// identity string (e.g. a disk serial) into the int32 workerId field of the
-// ppcenter node-channel wire protocol.
-static int32_t fnv1a_hash32(const std::string &str)
-{
-	uint32_t hash = 2166136261u;
-	for (unsigned char c : str) {
-		hash ^= c;
-		hash *= 16777619u;
-	}
-	return static_cast<int32_t>(hash);
-}
-
 static std::string trim_string(const std::string &source)
 {
 	std::string ret(source);

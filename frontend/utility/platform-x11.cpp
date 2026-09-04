@@ -226,11 +226,6 @@ string GetDefaultVideoSavePath()
 	return string(getenv("HOME"));
 }
 
-string GetHardwareNodeId()
-{
-	return string();
-}
-
 vector<string> GetPreferredLocales()
 {
 	vector<string> matched;

@@ -3,8 +3,6 @@
 #include "whip-service.h"
 #include "ppcenter-client.h"
 #include "ppcenter-signal.h"
-#include "ppcenter-node-channel.h"
-#include "ppcenter-node-proto.h"
 #include "uplink-qos-policy.h"
 
 #include <obs.hpp>
@@ -616,32 +614,6 @@ bool WHIPOutput::Setup(uint64_t generation)
 		       p2pSignalUrl.empty() ? "disabled" : "enabled");
 	}
 
-	// Configure node channel from service settings (derived from ppcenter)
-	{
-		std::string baseUrl = obs_data_get_string(service_settings, "ppcenter_url");
-		if (!baseUrl.empty()) {
-			// Derive ws URL from ppcenter URL
-			// e.g. http://ppcenter:8090 → ws://ppcenter:8090/ws/mmx
-			auto schemeEnd = baseUrl.find("://");
-			if (schemeEnd != std::string::npos) {
-				std::string hostPart = baseUrl.substr(schemeEnd + 3);
-				auto slashPos = hostPart.find('/');
-				if (slashPos != std::string::npos)
-					hostPart = hostPart.substr(0, slashPos);
-				nodeChannelConfig.url = (baseUrl.find("https") == 0 ? "wss://" : "ws://") + hostPart + "/ws/mmx";
-			}
-			nodeChannelConfig.bearerToken = obs_data_get_string(service_settings, "ppcenter_secret");
-			nodeChannelConfig.workerRole = "NODE_ROLE_PUBLISHER";
-			// ppcenter_node_id is a stable machine identity string (disk serial);
-			// fold it into the wire protocol's int32 workerId field.
-			nodeChannelConfig.workerId = fnv1a_hash32(obs_data_get_string(service_settings, "ppcenter_node_id"));
-			nodeChannelConfig.nodeVersion = "1.0.0";
-			nodeChannelConfig.nodeRegion = obs_data_get_string(service_settings, "ppcenter_region");
-			nodeChannelConfig.nodeCapacity = 1;
-			nodeChannelConfig.heartbeatIntervalSec = 10;
-		}
-	}
-
 	return true;
 }
 
@@ -1042,20 +1014,6 @@ void WHIPOutput::StartThread(uint64_t generation)
 	do_log(LOG_INFO, "WHIPOutput: Started");
 	StartP2PSignal();
 
-	// Start node channel to ppcenter (web socket control plane)
-	if (!nodeChannel && !nodeChannelConfig.url.empty()) {
-		nodeChannel = std::make_unique<NodeChannelClient>(nodeChannelConfig);
-		nodeChannel->SetCommandHandler([this](const NodeMsgReq &req) -> NodeMsgRspParams {
-			NodeMsgRspParams rsp;
-			rsp.workerType = nodeChannelConfig.workerRole;
-			rsp.workerId = nodeChannelConfig.workerId;
-			rsp.msgId = req.msgId;
-			rsp.code = 0;
-			return rsp;
-		});
-		nodeChannel->Start();
-	}
-
 	obs_output_begin_data_capture(output, 0);
 	running = true;
 	sending_enabled = true;
@@ -1123,7 +1081,6 @@ void WHIPOutput::StopThread(bool signal, uint64_t generation, std::string resour
 {
 	running = false;
 	sending_enabled = false;
-	if (nodeChannel) { nodeChannel->Stop(); nodeChannel.reset(); }
 	if (p2pSignal) { p2pSignal.reset(); }
 	{
 		teardown_in_progress = true;

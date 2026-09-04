@@ -268,11 +268,6 @@ void OBSBasicSettings::LoadStream1Settings()
 			region = QStringLiteral("auto");
 		ui->ppcenterRegion->setText(region);
 
-		QString nodeId = QT_UTF8(obs_data_get_string(settings, "ppcenter_node_id"));
-		if (nodeId.isEmpty())
-			nodeId = QString::fromStdString(GetHardwareNodeId());
-		ui->ppcenterNodeId->setText(nodeId);
-
 		ui->ppcenterFieldsWidget->setVisible(ppcenter_enabled);
 
 		ui->manualRoiGroupBox->show();
@@ -450,7 +445,6 @@ void OBSBasicSettings::SaveStream1Settings()
 					     QT_TO_UTF8(ParseWHIPStreamNameFromServerUrl(ui->customServer->text())));
 			obs_data_set_string(settings, "ppcenter_region",
 					     QT_TO_UTF8(ui->ppcenterRegion->text().trimmed()));
-			obs_data_set_string(settings, "ppcenter_node_id", QT_TO_UTF8(ui->ppcenterNodeId->text()));
 		}
 
 		// Mirrored into the service settings so the WHIP output (and
@@ -1389,9 +1383,6 @@ void OBSBasicSettings::on_ppcenterEnabled_toggled()
 
 	bool enabled = ui->ppcenterEnabled->isChecked();
 	ui->ppcenterFieldsWidget->setVisible(enabled);
-
-	if (enabled && ui->ppcenterNodeId->text().isEmpty())
-		ui->ppcenterNodeId->setText(QString::fromStdString(GetHardwareNodeId()));
 
 	if (enabled && ui->ppcenterRegion->text().trimmed().isEmpty())
 		ui->ppcenterRegion->setText(QStringLiteral("auto"));

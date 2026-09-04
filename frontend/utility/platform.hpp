@@ -31,10 +31,6 @@ std::string GetDefaultVideoSavePath();
 
 std::vector<std::string> GetPreferredLocales();
 
-/* Stable machine identity string (e.g. system disk serial) used as a
- * ppcenter node channel identity. Returns an empty string if unavailable. */
-std::string GetHardwareNodeId();
-
 bool IsAlwaysOnTop(QWidget *window);
 void SetAlwaysOnTop(QWidget *window, bool enable);
 

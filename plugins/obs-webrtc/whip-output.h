@@ -20,11 +20,8 @@
 
 #include <rtc/rtc.hpp>
 
-#include "ppcenter-node-channel.h"
-
 class P2PSignalClient;
 class UplinkQosPolicy;
-class NodeChannelClient;
 
 struct videoLayerState {
 	uint16_t sequenceNumber;
@@ -149,8 +146,6 @@ private:
 	std::unique_ptr<UplinkQosPolicy> qosPolicy;
 	int64_t lastQosCheckMs = 0;
 
-	std::unique_ptr<NodeChannelClient> nodeChannel;
-	NodeChannelConfig nodeChannelConfig;
 	bool StartP2PSignal();
 	void CheckUplinkQos();
 

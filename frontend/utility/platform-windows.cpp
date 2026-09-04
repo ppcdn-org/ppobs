@@ -31,7 +31,6 @@
 #include <sstream>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <winioctl.h>
 
 using namespace std;
 
@@ -66,42 +65,6 @@ string GetDefaultVideoSavePath()
 
 	os_wcs_to_utf8(path_utf16, wcslen(path_utf16), path_utf8, MAX_PATH);
 	return string(path_utf8);
-}
-
-/* Queries the physical serial number of the system's first disk via
- * IOCTL_STORAGE_QUERY_PROPERTY, which (unlike raw disk reads) does not
- * require administrator privileges when opened with zero access rights. */
-string GetHardwareNodeId()
-{
-	HANDLE handle = CreateFileW(L"\\\\.\\PhysicalDrive0", 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-				     OPEN_EXISTING, 0, nullptr);
-	if (handle == INVALID_HANDLE_VALUE)
-		return string();
-
-	STORAGE_PROPERTY_QUERY query = {};
-	query.PropertyId = StorageDeviceProperty;
-	query.QueryType = PropertyStandardQuery;
-
-	BYTE buffer[1024] = {};
-	DWORD bytesReturned = 0;
-	BOOL ok = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), buffer, sizeof(buffer),
-				   &bytesReturned, nullptr);
-	CloseHandle(handle);
-
-	if (!ok)
-		return string();
-
-	auto *desc = reinterpret_cast<STORAGE_DEVICE_DESCRIPTOR *>(buffer);
-	if (desc->SerialNumberOffset == 0 || desc->SerialNumberOffset >= sizeof(buffer))
-		return string();
-
-	string serial(reinterpret_cast<const char *>(buffer) + desc->SerialNumberOffset);
-	size_t begin_ws = serial.find_first_not_of(" \t\r\n");
-	size_t end_ws = serial.find_last_not_of(" \t\r\n");
-	if (begin_ws == string::npos)
-		return string();
-
-	return serial.substr(begin_ws, end_ws - begin_ws + 1);
 }
 
 static vector<string> GetUserPreferredLocales()
