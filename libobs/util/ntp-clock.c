@@ -55,7 +55,7 @@ static const char *ntp_servers[] = {
 
 struct ntp_anchor {
 	pthread_mutex_t lock;
-	int64_t offset_ms; /* ntp_utc_ms(t) - monotonic_ms(t), from the last successful sync */
+	int64_t offset_ms; /* ntp_utc_ms(t) - system_wall_clock_ms(t), from the last successful sync */
 	bool synced;
 };
 
@@ -102,8 +102,21 @@ static int64_t system_wall_clock_ms(void)
 #endif
 
 /* Queries one NTP server once. On success, *out_offset_ms is set such that
- * (monotonic_ms_now + *out_offset_ms) == current UTC ms, and *out_rtt_ns is
- * the measured round trip, used by the caller to pick the best sample. */
+ * (system_wall_clock_ms() + *out_offset_ms) == current UTC ms, and
+ * *out_rtt_ns is the measured round trip, used by the caller to pick the
+ * best sample.
+ *
+ * The offset is deliberately anchored to the wall clock rather than to the
+ * monotonic clock: the anchor is only refreshed every NTP_RESYNC_INTERVAL_MS,
+ * and a monotonic anchor accumulates the (unbounded) drift between the
+ * monotonic counter and real time over that whole window - on Windows,
+ * os_gettime_ns() is raw QueryPerformanceCounter, which was measured drifting
+ * ~6s from the wall clock over ~8 days of uptime, and diverges sharply across
+ * suspend/resume. That drift landed directly in every emitted timestamp and
+ * showed up downstream as absurd end-to-end delays. The wall clock is itself
+ * NTP-disciplined by the OS, so it tracks real time between our own syncs
+ * instead of drifting away from it; the RTT below still uses the monotonic
+ * clock, which is the right source for measuring a short interval. */
 static bool ntp_query_once(const char *host, int64_t *out_offset_ms, int64_t *out_rtt_ns)
 {
 	struct addrinfo hints;
@@ -170,9 +183,13 @@ static bool ntp_query_once(const char *host, int64_t *out_offset_ms, int64_t *ou
 			((uint64_t)tx_secs - NTP_UNIX_EPOCH_DELTA_SEC) * 1000ULL + (((uint64_t)tx_frac * 1000ULL) >> 32);
 
 		int64_t utc_at_recv_ms = (int64_t)server_unix_ms + (rtt_ns / 2) / 1000000;
-		int64_t mono_recv_ms = mono_recv_ns / 1000000;
 
-		*out_offset_ms = utc_at_recv_ms - mono_recv_ms;
+		/* Read the wall clock as close to mono_recv_ns as we can: both
+		 * are meant to describe the same instant, and any delay between
+		 * them lands straight in the offset. */
+		int64_t wall_recv_ms = system_wall_clock_ms();
+
+		*out_offset_ms = utc_at_recv_ms - wall_recv_ms;
 		*out_rtt_ns = rtt_ns;
 		ok = true;
 	}
@@ -294,15 +311,12 @@ uint64_t ntp_clock_now_ms(void)
 	pthread_once(&ntp_once, ntp_lazy_init);
 
 	pthread_mutex_lock(&anchor.lock);
-	bool have_sync = anchor.synced;
 	int64_t offset_ms = anchor.offset_ms;
 	pthread_mutex_unlock(&anchor.lock);
 
-	if (!have_sync)
-		return (uint64_t)system_wall_clock_ms();
-
-	int64_t mono_ms = (int64_t)(os_gettime_ns() / 1000000);
-	return (uint64_t)(mono_ms + offset_ms);
+	/* offset_ms is 0 until the first successful sync, so the uncorrected
+	 * wall clock is exactly what this returns in that case anyway. */
+	return (uint64_t)(system_wall_clock_ms() + offset_ms);
 }
 
 bool ntp_clock_is_synced(void)

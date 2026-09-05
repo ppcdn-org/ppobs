@@ -2,10 +2,14 @@
  * Absolute wall-clock time source, disciplined against public NTP
  * servers at startup and periodically thereafter.
  *
- * ntp_clock_now_ms() returns milliseconds since the Unix epoch (UTC),
- * corrected by the most recent NTP offset measurement. If no NTP
- * server has ever been reachable, it falls back to the local system
- * wall clock so callers always get a usable (if uncorrected) value.
+ * ntp_clock_now_ms() returns milliseconds since the Unix epoch (UTC):
+ * the local system wall clock plus the most recent NTP offset
+ * measurement. If no NTP server has ever been reachable the offset is
+ * zero, so callers still get a usable (if uncorrected) wall-clock value.
+ *
+ * The offset corrects the wall clock, not the monotonic clock - see the
+ * comment above ntp_query_once() in ntp-clock.c for why anchoring to the
+ * monotonic clock silently poisoned every timestamp between resyncs.
  */
 
 #pragma once
