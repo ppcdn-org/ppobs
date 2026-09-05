@@ -291,6 +291,29 @@ void WsDegradeClient::UnregisterOutput()
 {
 	std::lock_guard<std::mutex> lk(mtx);
 	output = nullptr;
+
+	// Stop reconnecting once nothing is streaming. Without this, only
+	// nulling `output` left `conn`/`ws_url` untouched, so the worker
+	// thread's idle tick (ShouldReconnectLocked/ConnectLocked) kept
+	// retrying ws_url on its backoff schedule - up to
+	// kReconnectBackoffMaxMs apart - forever, since the singleton's
+	// destructor is otherwise the only thing that ever closes conn or
+	// stops the worker. That both wasted network/CPU for as long as OBS
+	// stayed open after "Stop Streaming", and made app exit wait on
+	// whatever connect attempt the worker happened to be mid-retry on.
+	// Clearing ws_url also matters for correctness, not just cleanup:
+	// RegisterOutput()'s `new_ws == ws_url` check treats an unchanged
+	// URL as "already connected, nothing to do", so leaving the old
+	// value in place would make the next start to the same path silently
+	// skip reconnecting at all.
+	if (conn) {
+		websocketpp::lib::error_code ec;
+		conn->close(websocketpp::close::status::going_away, "output-unregistered", ec);
+		conn.reset();
+	}
+	ws_url.clear();
+	next_reconnect_attempt_ns = 0;
+
 	do_log(LOG_INFO, "Output unregistered");
 }
 
