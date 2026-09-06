@@ -536,7 +536,12 @@ void P2PSignalClient::CreatePeerVideo(P2PPeer &peer)
 {
 	uint32_t ssrc = peer.videoSsrc;
 	std::string cname = "p2p-video-" + peer.sessionId, msid = "p2p-" + peer.sessionId, trackId = msid + "-video";
-	auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, cname, 96, rtc::H264RtpPacketizer::defaultClockRate);
+	auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, cname, 96,
+#if RTC_VERSION_MAJOR == 0 && RTC_VERSION_MINOR > 22 || RTC_VERSION_MAJOR > 0
+									 rtc::H264RtpPacketizer::ClockRate);
+#else
+									 rtc::H264RtpPacketizer::defaultClockRate);
+#endif
 	if (videoCodec == "h264") {
 		rtc::Description::Video desc(VIDEO_MID, rtc::Description::Direction::SendOnly);
 		desc.addH264Codec(96); desc.addSSRC(ssrc, cname, msid, trackId);
