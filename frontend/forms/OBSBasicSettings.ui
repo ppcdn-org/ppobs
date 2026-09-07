@@ -2199,6 +2199,121 @@
                </widget>
                </item>
               <item>
+               <widget class="QGroupBox" name="ppcenterGroupBox">
+                <property name="title">
+                 <string>Basic.Settings.Stream.PPCenter.Title</string>
+                </property>
+                <layout class="QVBoxLayout" name="verticalLayout_ppcenter">
+                 <property name="leftMargin">
+                  <number>9</number>
+                 </property>
+                 <property name="topMargin">
+                  <number>2</number>
+                 </property>
+                 <property name="rightMargin">
+                  <number>9</number>
+                 </property>
+                 <property name="bottomMargin">
+                  <number>9</number>
+                 </property>
+                 <item>
+                  <widget class="QCheckBox" name="ppcenterEnabled">
+                   <property name="text">
+                    <string>Basic.Settings.Stream.PPCenter.Enable</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QWidget" name="ppcenterFieldsWidget" native="true">
+                   <layout class="QFormLayout" name="ppcenterFormLayout">
+                    <property name="fieldGrowthPolicy">
+                     <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
+                    </property>
+                    <property name="leftMargin">
+                     <number>0</number>
+                    </property>
+                    <property name="topMargin">
+                     <number>0</number>
+                    </property>
+                    <property name="rightMargin">
+                     <number>0</number>
+                    </property>
+                    <property name="bottomMargin">
+                     <number>0</number>
+                    </property>
+                    <item row="0" column="0">
+                     <widget class="QLabel" name="ppcenterUrlLabel">
+                      <property name="text">
+                       <string>Basic.Settings.Stream.PPCenter.Url</string>
+                      </property>
+                      <property name="minimumSize">
+                       <size>
+                        <width>170</width>
+                        <height>0</height>
+                       </size>
+                      </property>
+                      <property name="buddy">
+                       <cstring>ppcenterUrl</cstring>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="0" column="1">
+                     <widget class="QLineEdit" name="ppcenterUrl"/>
+                    </item>
+                    <item row="1" column="0">
+                     <widget class="QLabel" name="ppcenterAppIdLabel">
+                      <property name="text">
+                       <string>Basic.Settings.Stream.PPCenter.AppId</string>
+                      </property>
+                      <property name="buddy">
+                       <cstring>ppcenterAppId</cstring>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="1" column="1">
+                     <widget class="QLineEdit" name="ppcenterAppId"/>
+                    </item>
+                    <item row="2" column="0">
+                     <widget class="QLabel" name="ppcenterSecretLabel">
+                      <property name="text">
+                       <string>Basic.Settings.Stream.PPCenter.Secret</string>
+                      </property>
+                      <property name="buddy">
+                       <cstring>ppcenterSecret</cstring>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="2" column="1">
+                     <widget class="QLineEdit" name="ppcenterSecret">
+                      <property name="echoMode">
+                       <enum>QLineEdit::Password</enum>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="3" column="0">
+                     <widget class="QLabel" name="ppcenterRegionLabel">
+                      <property name="text">
+                       <string>Basic.Settings.Stream.PPCenter.Region</string>
+                      </property>
+                      <property name="buddy">
+                       <cstring>ppcenterRegion</cstring>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="3" column="1">
+                     <widget class="QLineEdit" name="ppcenterRegion">
+                      <property name="placeholderText">
+                       <string>auto</string>
+                      </property>
+                     </widget>
+                    </item>
+                   </layout>
+                  </widget>
+                 </item>
+                </layout>
+               </widget>
+              </item>
+              <item>
                <widget class="QGroupBox" name="manualRoiGroupBox">
                 <property name="title">
                  <string>Basic.Settings.Stream.ManualRoi</string>
@@ -2390,121 +2505,6 @@
                     </widget>
                    </item>
                   </layout>
-                 </item>
-                </layout>
-               </widget>
-              </item>
-              <item>
-               <widget class="QGroupBox" name="ppcenterGroupBox">
-                <property name="title">
-                 <string>Basic.Settings.Stream.PPCenter.Title</string>
-                </property>
-                <layout class="QVBoxLayout" name="verticalLayout_ppcenter">
-                 <property name="leftMargin">
-                  <number>9</number>
-                 </property>
-                 <property name="topMargin">
-                  <number>2</number>
-                 </property>
-                 <property name="rightMargin">
-                  <number>9</number>
-                 </property>
-                 <property name="bottomMargin">
-                  <number>9</number>
-                 </property>
-                 <item>
-                  <widget class="QCheckBox" name="ppcenterEnabled">
-                   <property name="text">
-                    <string>Basic.Settings.Stream.PPCenter.Enable</string>
-                   </property>
-                  </widget>
-                 </item>
-                 <item>
-                  <widget class="QWidget" name="ppcenterFieldsWidget" native="true">
-                   <layout class="QFormLayout" name="ppcenterFormLayout">
-                    <property name="fieldGrowthPolicy">
-                     <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
-                    </property>
-                    <property name="leftMargin">
-                     <number>0</number>
-                    </property>
-                    <property name="topMargin">
-                     <number>0</number>
-                    </property>
-                    <property name="rightMargin">
-                     <number>0</number>
-                    </property>
-                    <property name="bottomMargin">
-                     <number>0</number>
-                    </property>
-                    <item row="0" column="0">
-                     <widget class="QLabel" name="ppcenterUrlLabel">
-                      <property name="text">
-                       <string>Basic.Settings.Stream.PPCenter.Url</string>
-                      </property>
-                      <property name="minimumSize">
-                       <size>
-                        <width>170</width>
-                        <height>0</height>
-                       </size>
-                      </property>
-                      <property name="buddy">
-                       <cstring>ppcenterUrl</cstring>
-                      </property>
-                     </widget>
-                    </item>
-                    <item row="0" column="1">
-                     <widget class="QLineEdit" name="ppcenterUrl"/>
-                    </item>
-                    <item row="1" column="0">
-                     <widget class="QLabel" name="ppcenterAppIdLabel">
-                      <property name="text">
-                       <string>Basic.Settings.Stream.PPCenter.AppId</string>
-                      </property>
-                      <property name="buddy">
-                       <cstring>ppcenterAppId</cstring>
-                      </property>
-                     </widget>
-                    </item>
-                    <item row="1" column="1">
-                     <widget class="QLineEdit" name="ppcenterAppId"/>
-                    </item>
-                    <item row="2" column="0">
-                     <widget class="QLabel" name="ppcenterSecretLabel">
-                      <property name="text">
-                       <string>Basic.Settings.Stream.PPCenter.Secret</string>
-                      </property>
-                      <property name="buddy">
-                       <cstring>ppcenterSecret</cstring>
-                      </property>
-                     </widget>
-                    </item>
-                    <item row="2" column="1">
-                     <widget class="QLineEdit" name="ppcenterSecret">
-                      <property name="echoMode">
-                       <enum>QLineEdit::Password</enum>
-                      </property>
-                     </widget>
-                    </item>
-                    <item row="3" column="0">
-                     <widget class="QLabel" name="ppcenterRegionLabel">
-                      <property name="text">
-                       <string>Basic.Settings.Stream.PPCenter.Region</string>
-                      </property>
-                      <property name="buddy">
-                       <cstring>ppcenterRegion</cstring>
-                      </property>
-                     </widget>
-                    </item>
-                    <item row="3" column="1">
-                     <widget class="QLineEdit" name="ppcenterRegion">
-                      <property name="placeholderText">
-                       <string>auto</string>
-                      </property>
-                     </widget>
-                    </item>
-                   </layout>
-                  </widget>
                  </item>
                 </layout>
                </widget>

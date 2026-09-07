@@ -3,6 +3,31 @@
 const char *audio_codecs[] = {"opus", nullptr};
 const char *video_codecs[] = {"h264", "hevc", "av1", nullptr};
 
+// The Server URL may spell the PPCenter App ID as a "{ppcenter_appid}"
+// placeholder (e.g. "http://host:8889/{ppcenter_appid}/table-view/whip"): the
+// media server namespaces every stream under the app that publishes it, so the
+// App ID entered in the PPCenter section is also a path segment. Expanding it
+// once here on the service - rather than in each consumer - keeps every reader
+// of OBS_SERVICE_CONNECT_INFO_SERVER_URL (WHIPOutput::Init() and the degrade
+// channel's derived ws:// URL) pointed at the same endpoint, while the setting
+// saved to disk keeps the app-independent pattern.
+static std::string expand_ppcenter_appid(std::string url, const std::string &app_id)
+{
+	static const std::string placeholder = "{ppcenter_appid}";
+
+	// With no App ID to substitute, leave the placeholder in place: an empty
+	// substitution would collapse the segment into a "//" that still reads as
+	// a valid URL, whereas the literal placeholder makes the misconfiguration
+	// obvious in the connection log.
+	if (app_id.empty())
+		return url;
+
+	for (size_t pos = url.find(placeholder); pos != std::string::npos;
+	     pos = url.find(placeholder, pos + app_id.size()))
+		url.replace(pos, placeholder.size(), app_id);
+	return url;
+}
+
 WHIPService::WHIPService(obs_data_t *settings, obs_service_t *) : server(), bearer_token()
 {
 	Update(settings);
@@ -10,7 +35,8 @@ WHIPService::WHIPService(obs_data_t *settings, obs_service_t *) : server(), bear
 
 void WHIPService::Update(obs_data_t *settings)
 {
-	server = obs_data_get_string(settings, "server");
+	server = expand_ppcenter_appid(obs_data_get_string(settings, "server"),
+				       obs_data_get_string(settings, "ppcenter_appid"));
 	bearer_token = obs_data_get_string(settings, "bearer_token");
 }
 
