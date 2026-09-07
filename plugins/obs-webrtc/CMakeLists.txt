@@ -10,6 +10,7 @@ find_package(LibDataChannel 0.20 REQUIRED)
 find_package(CURL REQUIRED)
 find_package(Websocketpp 0.8 REQUIRED)
 find_package(Asio 1.12.1 REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
 # avcodec/swscale: quality-score.cpp decodes the stream's own top layer
 # back and compares it against the program feed.
 find_package(FFmpeg REQUIRED avcodec avutil swscale)
@@ -35,6 +36,8 @@ target_link_libraries(
           CURL::libcurl
           Websocketpp::Websocketpp
           Asio::Asio
+          OpenSSL::SSL
+          OpenSSL::Crypto
           FFmpeg::avcodec
           FFmpeg::avutil
           FFmpeg::swscale

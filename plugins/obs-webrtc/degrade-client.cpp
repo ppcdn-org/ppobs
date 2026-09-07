@@ -55,6 +55,18 @@ WsDegradeClient::WsDegradeClient()
 	client.clear_error_channels(websocketpp::log::elevel::all);
 
 	client.init_asio();
+	client.set_tls_init_handler([](handle_t) -> context_ptr {
+		auto context = websocketpp::lib::make_shared<websocketpp::lib::asio::ssl::context>(
+			websocketpp::lib::asio::ssl::context::tls_client);
+		context->set_options(websocketpp::lib::asio::ssl::context::default_workarounds |
+				      websocketpp::lib::asio::ssl::context::no_sslv2 |
+				      websocketpp::lib::asio::ssl::context::no_sslv3);
+		// The bundled OpenSSL build does not use the Windows root certificate
+		// store. Keep the channel encrypted, but do not reject the connection
+		// when the server certificate cannot be verified locally.
+		context->set_verify_mode(websocketpp::lib::asio::ssl::verify_none);
+		return context;
+	});
 
 	client.set_open_handler([this](handle_t) {
 		do_log(LOG_INFO, "WS connected to %s", ws_url.c_str());
@@ -211,7 +223,7 @@ void WsDegradeClient::ConnectLocked()
 // -------------------------------------------------------------------
 //  Output registration
 // -------------------------------------------------------------------
-void WsDegradeClient::RegisterOutput(obs_output_t *out)
+void WsDegradeClient::RegisterOutput(obs_output_t *out, const std::string &whip_url_in)
 {
 	std::lock_guard<std::mutex> lk(mtx);
 	output = out;
@@ -257,11 +269,18 @@ void WsDegradeClient::RegisterOutput(obs_output_t *out)
 	}
 	ws_secret = secret;
 
-	const char *url_c = obs_service_get_connect_info(svc, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
-	if (!url_c || !url_c[0])
+	// Use whatever WHIPOutput actually connected with - not the service's
+	// own static "server" setting (OBS_SERVICE_CONNECT_INFO_SERVER_URL).
+	// Those two only coincide when ppcenter resolution is off; when it's
+	// on, WHIPOutput::Setup() overwrites its endpoint_url with ppcenter's
+	// response, which can differ from the static field (e.g. after ppcenter
+	// migrates to a new domain/port, the static field left over from an
+	// older config would silently point the WS channel somewhere stale
+	// while the actual media connection is fine).
+	if (whip_url_in.empty())
 		return;
 
-	std::string new_whip(url_c);
+	std::string new_whip(whip_url_in);
 	std::string new_ws = whip_to_ws(new_whip);
 
 	// Same endpoint: nothing to do here. This early return is why the

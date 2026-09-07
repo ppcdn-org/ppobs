@@ -11,7 +11,7 @@
 #include <cstdint>
 
 #define ASIO_STANDALONE 1
-#include <websocketpp/config/asio_no_tls_client.hpp>
+#include <websocketpp/config/asio_client.hpp>
 #include <websocketpp/client.hpp>
 
 struct TargetState {
@@ -21,14 +21,15 @@ struct TargetState {
 };
 
 class WsDegradeClient {
-	using client_t = websocketpp::client<websocketpp::config::asio_client>;
+	using client_t = websocketpp::client<websocketpp::config::asio_tls_client>;
 	using handle_t = websocketpp::connection_hdl;
 	using conn_ptr = client_t::connection_ptr;
+	using context_ptr = websocketpp::lib::shared_ptr<websocketpp::lib::asio::ssl::context>;
 
 public:
 	static WsDegradeClient &Instance();
 
-	void RegisterOutput(obs_output_t *output);
+	void RegisterOutput(obs_output_t *output, const std::string &whip_url);
 	void UnregisterOutput();
 
 	TargetState currentTarget() const { return target_; }

@@ -1055,7 +1055,7 @@ void WHIPOutput::StartThread(uint64_t generation)
 	StartWatchdog(generation);
 
 #ifdef WHIP_DEGRADE_ACTIVE
-	WsDegradeClient::Instance().RegisterOutput(output);
+	WsDegradeClient::Instance().RegisterOutput(output, endpoint_url);
 #endif
 }
 

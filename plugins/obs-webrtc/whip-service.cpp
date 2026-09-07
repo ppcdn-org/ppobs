@@ -7,10 +7,16 @@ const char *video_codecs[] = {"h264", "hevc", "av1", nullptr};
 // placeholder (e.g. "http://host:8889/{ppcenter_appid}/table-view/whip"): the
 // media server namespaces every stream under the app that publishes it, so the
 // App ID entered in the PPCenter section is also a path segment. Expanding it
-// once here on the service - rather than in each consumer - keeps every reader
-// of OBS_SERVICE_CONNECT_INFO_SERVER_URL (WHIPOutput::Init() and the degrade
-// channel's derived ws:// URL) pointed at the same endpoint, while the setting
-// saved to disk keeps the app-independent pattern.
+// once here on the service - rather than in each consumer - keeps every
+// reader of OBS_SERVICE_CONNECT_INFO_SERVER_URL pointed at the same
+// endpoint, while the setting saved to disk keeps the app-independent
+// pattern. WHIPOutput::Init() reads this as the pre-ppcenter fallback value
+// of endpoint_url (overwritten by Setup() when ppcenter resolution is on);
+// the degrade channel's derived ws:// URL no longer reads this field at all
+// - it's handed WHIPOutput's actual (possibly ppcenter-resolved)
+// endpoint_url directly, so it can never drift from whichever endpoint the
+// media connection itself is using (see degrade-client.cpp's
+// RegisterOutput).
 static std::string expand_ppcenter_appid(std::string url, const std::string &app_id)
 {
 	static const std::string placeholder = "{ppcenter_appid}";
