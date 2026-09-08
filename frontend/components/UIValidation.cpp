@@ -1,11 +1,14 @@
 #include "UIValidation.hpp"
 
 #include <OBSApp.hpp>
+#include <widgets/OBSBasic.hpp>
 
 #include <QMessageBox>
 #include <QPushButton>
 
 #include "moc_UIValidation.cpp"
+
+static bool HevcMultitrackEncoderAvailable();
 
 static int CountVideoSources()
 {
@@ -111,8 +114,6 @@ StreamSettingsAction UIValidation::StreamSettingsConfirmation(QWidget *parent, O
 StreamSettingsAction UIValidation::PPCenterFieldsConfirmation(QWidget *parent, OBSService service)
 {
 	OBSDataAutoRelease settings = obs_service_get_settings(service);
-	if (!obs_data_get_bool(settings, "ppcenter_enabled"))
-		return StreamSettingsAction::ContinueStream;
 
 	auto isEmpty = [&](const char *key) {
 		const char *value = obs_data_get_string(settings, key);
@@ -121,12 +122,25 @@ StreamSettingsAction UIValidation::PPCenterFieldsConfirmation(QWidget *parent, O
 
 	bool missingField = isEmpty("ppcenter_url") || isEmpty("ppcenter_appid") || isEmpty("ppcenter_secret") ||
 			    isEmpty("ppcenter_region");
-	if (!missingField)
+
+	QString messageText;
+	if (missingField) {
+		messageText = QTStr("Basic.Settings.Stream.PPCenter.MissingFields");
+	} else if (!HevcMultitrackEncoderAvailable()) {
+		// See docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md
+		// §4.1 "对无法创建 HEVC encoder 的情况，启动失败并明确提示" -
+		// caught here, before streaming starts, rather than letting
+		// WHIPOutput fail after the H264 session is already live (which
+		// would then have to be aborted per the strong-consistency
+		// start requirement).
+		messageText = QTStr("Basic.Settings.Stream.WHIPHevcH264Multitrack.NoEncoder");
+	} else {
 		return StreamSettingsAction::ContinueStream;
+	}
 
 	QMessageBox messageBox(parent);
 	messageBox.setWindowTitle(QTStr("Basic.Settings.Stream.MissingSettingAlert"));
-	messageBox.setText(QTStr("Basic.Settings.Stream.PPCenter.MissingFields"));
+	messageBox.setText(messageText);
 
 	QPushButton *cancel;
 	QPushButton *settings_button;
@@ -144,4 +158,26 @@ StreamSettingsAction UIValidation::PPCenterFieldsConfirmation(QWidget *parent, O
 		return StreamSettingsAction::OpenSettings;
 
 	return StreamSettingsAction::Cancel;
+}
+
+// Checks only whether *some* HEVC video encoder is registered at all - not
+// whether it can pair with the user's specific H264 pick, which
+// ResolveWHIPHevcEncoderId() (utility/WHIPHevcEncoders.hpp, used at actual
+// stream start) resolves more precisely. Good enough for an early sanity
+// check: if there is no HEVC encoder whatsoever, streaming will fail no
+// matter which H264 encoder is selected. No-op (returns true) when
+// multitrack isn't even enabled, so this never blocks a plain WHIP stream.
+static bool HevcMultitrackEncoderAvailable()
+{
+	if (!config_get_bool(OBSBasic::Get()->Config(), "Stream1", "WHIPHevcH264Multitrack"))
+		return true;
+
+	size_t i = 0;
+	const char *id;
+	while (obs_enum_encoder_types(i++, &id)) {
+		const char *codec = obs_get_encoder_codec(id);
+		if (codec && strcmp(codec, "hevc") == 0 && obs_get_encoder_type(id) == OBS_ENCODER_VIDEO)
+			return true;
+	}
+	return false;
 }

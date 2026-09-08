@@ -84,6 +84,19 @@ void SimpleOutput::LoadStreamingPreset_Lossy(const char *encoderId)
 					      video_output_get_width(obs_get_video()),
 					      video_output_get_height(obs_get_video()), main->Config());
 	}
+	if (whipHevcEncoders != nullptr) {
+		std::string hevcEncoderId = ResolveWHIPHevcEncoderId(encoderId);
+		if (hevcEncoderId.empty()) {
+			blog(LOG_ERROR,
+			     "HEVC/H264 multitrack is enabled but no HEVC encoder is available - HEVC WHIP session will fail to start");
+		} else {
+			whipHevcEncoders->Create(hevcEncoderId, nullptr,
+						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
+						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
+						 video_output_get_width(obs_get_video()),
+						 video_output_get_height(obs_get_video()), main->Config());
+		}
+	}
 }
 
 /* mistakes have been made to lead us to this. */
@@ -363,6 +376,9 @@ void SimpleOutput::Update()
 		if (whipSimulcastEncoders != nullptr) {
 			whipSimulcastEncoders->SetVideoFormat(VIDEO_FORMAT_NV12);
 		}
+		if (whipHevcEncoders != nullptr) {
+			whipHevcEncoders->SetVideoFormat(VIDEO_FORMAT_NV12);
+		}
 	}
 
 	obs_encoder_update(videoStreaming, videoSettings);
@@ -371,6 +387,9 @@ void SimpleOutput::Update()
 
 	if (whipSimulcastEncoders != nullptr) {
 		whipSimulcastEncoders->Update(videoSettings, videoBitrate, main->Config());
+	}
+	if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
+		whipHevcEncoders->Update(videoSettings, videoBitrate, main->Config());
 	}
 }
 
@@ -568,6 +587,8 @@ inline void SimpleOutput::SetupOutputs()
 	obs_encoder_set_video(videoStreaming, obs_get_video());
 	if (whipSimulcastEncoders != nullptr)
 		whipSimulcastEncoders->SetVideo();
+	if (whipHevcEncoders != nullptr)
+		whipHevcEncoders->SetVideo();
 	obs_encoder_set_audio(audioStreaming, obs_get_audio());
 	obs_encoder_set_audio(audioArchive, obs_get_audio());
 	int tracks = config_get_int(main->Config(), "SimpleOutput", "RecTracks");
@@ -650,6 +671,15 @@ std::shared_future<void> SimpleOutput::SetupStreaming(obs_service_t *service, Se
 		obs_output_set_video_encoder(streamOutput, videoStreaming);
 		if (whipSimulcastEncoders != nullptr) {
 			whipSimulcastEncoders->SetStreamOutput(streamOutput);
+		}
+		if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
+			// See AdvancedOutput.cpp's identical comment on why the
+			// exact slot boundary only needs to avoid colliding with
+			// H264's own slots.
+			uint32_t h264SlotCount = whipSimulcastEncoders ? (uint32_t)config_get_int(main->Config(), "Stream1",
+												  "WHIPSimulcastTotalLayers")
+									: 1;
+			whipHevcEncoders->SetStreamOutput(streamOutput, h264SlotCount);
 		}
 		obs_output_set_audio_encoder(streamOutput, audioStreaming, 0);
 		obs_output_set_service(streamOutput, service);

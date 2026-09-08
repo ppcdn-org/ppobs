@@ -104,6 +104,12 @@ private:
 	QString curAMDPreset;
 	QString curAMDAV1Preset;
 
+	// The encoder type actually configured (as of dialog open, or the
+	// last in-session Save) for each output - lets the encoder-combo
+	// handlers in OBSBasicSettings.cpp tell "the encoder this dialog
+	// already has settings on disk for" apart from any other encoder the
+	// user is just trying out, so only the former may fall back to the
+	// legacy pre-per-encoder settings file.
 	QString curAdvStreamEncoder;
 	QString curAdvRecordEncoder;
 
@@ -200,7 +206,8 @@ private:
 	void LoadScheduleSettings();
 	void LoadSettings(bool changedOnly);
 
-	OBSPropertiesView *CreateEncoderPropertyView(const char *encoder, const char *path, bool changed = false);
+	OBSPropertiesView *CreateEncoderPropertyView(const char *encoder, const char *path,
+					      const char *legacyPath = nullptr, bool changed = false);
 
 	/* general */
 	void LoadLanguageList();
@@ -299,7 +306,6 @@ private slots:
 	void on_disconnectAccount_clicked();
 	void on_useStreamKey_clicked();
 	void on_useAuth_toggled();
-	void on_ppcenterEnabled_toggled();
 	void on_server_currentIndexChanged(int index);
 
 	void on_hotkeyFilterReset_clicked();

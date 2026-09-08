@@ -2,6 +2,7 @@
 
 #include <utility/MultitrackVideoOutput.hpp>
 #include <utility/WHIPSimulcastEncoders.hpp>
+#include <utility/WHIPHevcEncoders.hpp>
 
 #include <obs.hpp>
 #include <util/dstr.hpp>
@@ -44,6 +45,12 @@ struct BasicOutputHandler {
 	obs_sceneitem_t *vCamSourceSceneItem = nullptr;
 
 	std::unique_ptr<WHIPSimulcastEncoders> whipSimulcastEncoders;
+	// Only constructed when the WHIP service has HEVC/H264 multitrack
+	// enabled (Stream1.WHIPHevcH264Multitrack) - see
+	// docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md
+	// §4.1 and this member's Create() call sites in
+	// AdvancedOutput.cpp/SimpleOutput.cpp.
+	std::unique_ptr<WHIPHevcEncoders> whipHevcEncoders;
 
 	std::string outputType;
 	std::string lastError;

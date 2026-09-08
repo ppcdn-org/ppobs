@@ -412,19 +412,10 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->authPw,               EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->ignoreRecommended,    CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->temporalDenoiseEnable, CHECK_CHANGED, STREAM1_CHANGED);
-	HookWidget(ui->detectRoiEnable,      CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->qualityScoreEnable,   CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->beautyFilterEnable,   CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->clarityFilterEnable,  CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->whipSimulcastTotalLayers, SCROLL_CHANGED, STREAM1_CHANGED);
-	HookWidget(ui->manualRoiGroupBox,    GROUP_CHANGED,  STREAM1_CHANGED);
-	HookWidget(ui->roiLeft,              SCROLL_CHANGED, STREAM1_CHANGED);
-	HookWidget(ui->roiTop,               SCROLL_CHANGED, STREAM1_CHANGED);
-	HookWidget(ui->roiRight,             SCROLL_CHANGED, STREAM1_CHANGED);
-	HookWidget(ui->roiBottom,            SCROLL_CHANGED, STREAM1_CHANGED);
-	HookWidget(ui->roiPriority,          SCROLL_CHANGED, STREAM1_CHANGED);
-	HookWidget(ui->roiBgPriority,        SCROLL_CHANGED, STREAM1_CHANGED);
-	HookWidget(ui->ppcenterEnabled,      CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->ppcenterUrl,          EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->ppcenterAppId,        EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->ppcenterSecret,       EDIT_CHANGED,   STREAM1_CHANGED);
@@ -1944,7 +1935,28 @@ void OBSBasicSettings::LoadAdvOutputStreamingSettings()
 	SwapMultiTrack(protocol);
 }
 
-OBSPropertiesView *OBSBasicSettings::CreateEncoderPropertyView(const char *encoder, const char *path, bool changed)
+// Advanced-output encoder settings are persisted per encoder type (e.g.
+// "streamEncoder_obs_x264.json" vs "streamEncoder_jim_nvenc.json"), so
+// switching the encoder combo brings back that encoder's own last-used
+// settings instead of another encoder's - a shared file would otherwise
+// let one encoder's values (x264's "preset" strings, say) bleed into a
+// property with the same name but different meaning on another encoder
+// (NVENC's "preset" list).
+static std::string EncoderJsonFileName(const char *base, const char *encoderId)
+{
+	std::string name = base;
+	name += '_';
+	for (const char *c = encoderId; *c; c++) {
+		bool safe = (*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+			    *c == '_' || *c == '-';
+		name += safe ? *c : '_';
+	}
+	name += ".json";
+	return name;
+}
+
+OBSPropertiesView *OBSBasicSettings::CreateEncoderPropertyView(const char *encoder, const char *path,
+								const char *legacyPath, bool changed)
 {
 	OBSDataAutoRelease settings = obs_encoder_defaults(encoder);
 	OBSPropertiesView *view;
@@ -1953,7 +1965,15 @@ OBSPropertiesView *OBSBasicSettings::CreateEncoderPropertyView(const char *encod
 		const OBSBasic *basic = OBSBasic::Get();
 		const OBSProfile &currentProfile = basic->GetCurrentProfile();
 
-		const std::filesystem::path jsonFilePath = currentProfile.path / std::filesystem::u8path(path);
+		std::filesystem::path jsonFilePath = currentProfile.path / std::filesystem::u8path(path);
+
+		// First time this encoder's own file hasn't been written yet
+		// (e.g. right after upgrading from a build that kept only one
+		// shared file per output), fall back to that old shared file -
+		// but only the caller who knows it still describes *this*
+		// encoder passes a legacyPath at all (see the callers below).
+		if (legacyPath && !std::filesystem::exists(jsonFilePath))
+			jsonFilePath = currentProfile.path / std::filesystem::u8path(legacyPath);
 
 		if (!jsonFilePath.empty()) {
 			obs_data_t *data = obs_data_create_from_json_file_safe(jsonFilePath.u8string().c_str(), "bak");
@@ -1978,7 +1998,8 @@ void OBSBasicSettings::LoadAdvOutputStreamingEncoderProperties()
 	const char *type = config_get_string(main->Config(), "AdvOut", "Encoder");
 
 	delete streamEncoderProps;
-	streamEncoderProps = CreateEncoderPropertyView(type, "streamEncoder.json");
+	streamEncoderProps = CreateEncoderPropertyView(type, EncoderJsonFileName("streamEncoder", type).c_str(),
+						       "streamEncoder.json");
 	streamEncoderProps->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
 	ui->advOutEncoderLayout->addWidget(streamEncoderProps);
 
@@ -2082,7 +2103,8 @@ void OBSBasicSettings::LoadAdvOutputRecordingEncoderProperties()
 	recordEncoderProps = nullptr;
 
 	if (astrcmpi(type, "none") != 0) {
-		recordEncoderProps = CreateEncoderPropertyView(type, "recordEncoder.json");
+		recordEncoderProps = CreateEncoderPropertyView(type, EncoderJsonFileName("recordEncoder", type).c_str(),
+							       "recordEncoder.json");
 		recordEncoderProps->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
 		ui->advOutRecEncoderProps->layout()->addWidget(recordEncoderProps);
 		connect(recordEncoderProps, &OBSPropertiesView::Changed, this,
@@ -3547,8 +3569,8 @@ void OBSBasicSettings::SaveOutputSettings()
 	SaveSpinBox(ui->advRBSecMax, "AdvOut", "RecRBTime");
 	SaveSpinBox(ui->advRBMegsMax, "AdvOut", "RecRBSize");
 
-	WriteJsonData(streamEncoderProps, "streamEncoder.json");
-	WriteJsonData(recordEncoderProps, "recordEncoder.json");
+	WriteJsonData(streamEncoderProps, EncoderJsonFileName("streamEncoder", QT_TO_UTF8(curAdvStreamEncoder)).c_str());
+	WriteJsonData(recordEncoderProps, EncoderJsonFileName("recordEncoder", QT_TO_UTF8(curAdvRecordEncoder)).c_str());
 	main->ResetOutputs();
 }
 
@@ -4016,11 +4038,18 @@ void OBSBasicSettings::on_advOutEncoder_currentIndexChanged()
 {
 	QString encoder = GetComboData(ui->advOutEncoder);
 	if (!loading) {
-		bool loadSettings = encoder == curAdvStreamEncoder;
+		// Only the encoder that's actually configured (at dialog open, or
+		// the last in-session Save) may fall back to the legacy shared
+		// file - it only ever holds settings for that one encoder, and
+		// applying them to a different encoder's properties is exactly
+		// the cross-encoder mixing this per-encoder storage exists to
+		// avoid.
+		bool isConfiguredEncoder = encoder == curAdvStreamEncoder;
 
 		delete streamEncoderProps;
-		streamEncoderProps = CreateEncoderPropertyView(QT_TO_UTF8(encoder),
-							       loadSettings ? "streamEncoder.json" : nullptr, true);
+		streamEncoderProps = CreateEncoderPropertyView(
+			QT_TO_UTF8(encoder), EncoderJsonFileName("streamEncoder", QT_TO_UTF8(encoder)).c_str(),
+			isConfiguredEncoder ? "streamEncoder.json" : nullptr, true);
 		streamEncoderProps->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
 		ui->advOutEncoderLayout->addWidget(streamEncoderProps);
 	}
@@ -4044,11 +4073,13 @@ void OBSBasicSettings::on_advOutRecEncoder_currentIndexChanged(int idx)
 	}
 
 	QString encoder = GetComboData(ui->advOutRecEncoder);
-	bool loadSettings = encoder == curAdvRecordEncoder;
+	// See the matching comment in on_advOutEncoder_currentIndexChanged().
+	bool isConfiguredEncoder = encoder == curAdvRecordEncoder;
 
 	if (!loading) {
-		recordEncoderProps = CreateEncoderPropertyView(QT_TO_UTF8(encoder),
-							       loadSettings ? "recordEncoder.json" : nullptr, true);
+		recordEncoderProps = CreateEncoderPropertyView(
+			QT_TO_UTF8(encoder), EncoderJsonFileName("recordEncoder", QT_TO_UTF8(encoder)).c_str(),
+			isConfiguredEncoder ? "recordEncoder.json" : nullptr, true);
 		recordEncoderProps->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
 		ui->advOutRecEncoderProps->layout()->addWidget(recordEncoderProps);
 		connect(recordEncoderProps, &OBSPropertiesView::Changed, this,
@@ -5147,8 +5178,14 @@ void OBSBasicSettings::AdvReplayBufferChanged()
 	} else if (!useStream && recordEncoderProps) {
 		settings = recordEncoderProps->GetSettings();
 	} else {
-		if (useStream)
-			encoder = GetComboData(ui->advOutEncoder);
+		// Neither properties view exists yet - mirror whichever one would
+		// actually apply (see CreateEncoderPropertyView()) by reading its
+		// own per-encoder file straight off disk rather than always
+		// "recordEncoder.json", which would be the wrong file entirely
+		// when useStream is set and could be a different encoder's file
+		// otherwise.
+		const char *fileBase = useStream ? "streamEncoder" : "recordEncoder";
+		encoder = useStream ? GetComboData(ui->advOutEncoder) : GetComboData(ui->advOutRecEncoder);
 		settings = obs_encoder_defaults(encoder.toUtf8().constData());
 
 		if (!settings)
@@ -5157,7 +5194,8 @@ void OBSBasicSettings::AdvReplayBufferChanged()
 		const OBSProfile &currentProfile = main->GetCurrentProfile();
 
 		const std::filesystem::path jsonFilePath =
-			currentProfile.path / std::filesystem::u8path("recordEncoder.json");
+			currentProfile.path /
+			std::filesystem::u8path(EncoderJsonFileName(fileBase, encoder.toUtf8().constData()));
 
 		if (!jsonFilePath.empty()) {
 			OBSDataAutoRelease data =

@@ -21,7 +21,6 @@
 #include <QUuid>
 
 #include <algorithm>
-#include <cmath>
 
 static const QUuid &CustomServerUUID()
 {
@@ -133,6 +132,7 @@ void OBSBasicSettings::LoadStream1Settings()
 {
 	bool ignoreRecommended = config_get_bool(main->Config(), "Stream1", "IgnoreRecommended");
 	int whipSimulcastTotalLayers = config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers");
+	bool whipHevcH264Multitrack = config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
 
 	obs_service_t *service_obj = main->GetService();
 	const char *type = obs_service_get_type(service_obj);
@@ -252,8 +252,6 @@ void OBSBasicSettings::LoadStream1Settings()
 		ui->whipSimulcastGroupBox->show();
 		ui->ppcenterGroupBox->show();
 
-		bool ppcenter_enabled = obs_data_get_bool(settings, "ppcenter_enabled");
-		ui->ppcenterEnabled->setChecked(ppcenter_enabled);
 		ui->ppcenterUrl->setText(QT_UTF8(obs_data_get_string(settings, "ppcenter_url")));
 		ui->ppcenterAppId->setText(QT_UTF8(obs_data_get_string(settings, "ppcenter_appid")));
 		ui->ppcenterSecret->setText(QT_UTF8(obs_data_get_string(settings, "ppcenter_secret")));
@@ -267,71 +265,10 @@ void OBSBasicSettings::LoadStream1Settings()
 		if (region.trimmed().isEmpty())
 			region = QStringLiteral("auto");
 		ui->ppcenterRegion->setText(region);
-
-		ui->ppcenterFieldsWidget->setVisible(ppcenter_enabled);
-
-		ui->manualRoiGroupBox->show();
-
-		// obs_service_get_settings() never merges WHIPService::Defaults()
-		// into the returned object (see the matching comment in
-		// WHIPOutput::ApplyRoi()), so the intended fallbacks have to be
-		// re-registered here before reading them back too. Default +6 QP
-		// inside / -8 QP outside (see the roiPriority/roiBgPriority
-		// conversion below), Manual ROI off by default (the Ball & Person
-		// detector handles the moving-subject case instead).
-		obs_data_set_default_double(settings, "roi_priority", 6.0 / 51.0);
-		obs_data_set_default_double(settings, "roi_bg_priority", -8.0 / 51.0);
-		obs_data_set_default_bool(settings, "roi_enabled", false);
-
-		int64_t roiLeft = obs_data_get_int(settings, "roi_left");
-		int64_t roiTop = obs_data_get_int(settings, "roi_top");
-		int64_t roiRight = obs_data_get_int(settings, "roi_right");
-		int64_t roiBottom = obs_data_get_int(settings, "roi_bottom");
-
-		if (roiRight <= roiLeft || roiBottom <= roiTop) {
-			// No valid rectangle saved yet (fresh service, or the
-			// 0/0/0/0 built-in default) - seed a centred box that
-			// covers the middle half of the frame horizontally and
-			// most of its height, which is where a framed subject
-			// sits in the general case. Deliberately not the full
-			// frame: the point of the ROI is to take bits away from
-			// the edges and spend them on the subject, and a box
-			// loose enough to "safely" include the background
-			// spreads the same boost over a much larger area and
-			// visibly blunts it. Only a starting point to drag or
-			// resize from, not a crop.
-			uint32_t outputWidth, outputHeight;
-			GetWHIPSimulcastMainResolution(outputWidth, outputHeight);
-
-			roiLeft = outputWidth * 25 / 100;
-			roiTop = outputHeight * 15 / 100;
-			roiRight = outputWidth * 75 / 100;
-			roiBottom = outputHeight * 95 / 100;
-		}
-
-		ui->manualRoiGroupBox->setChecked(obs_data_get_bool(settings, "roi_enabled"));
-		ui->roiLeft->setValue((int)roiLeft);
-		ui->roiTop->setValue((int)roiTop);
-		ui->roiRight->setValue((int)roiRight);
-		ui->roiBottom->setValue((int)roiBottom);
-
-		// roi_priority/roi_bg_priority are libobs encoder-ROI priority
-		// values (-1..1, see obs-encoder.h), which x264/NVENC convert to
-		// a per-macroblock QP offset via qp_offset = -51 * priority (AV1
-		// uses a wider 0-255 QP range and scales by 128 instead, but 51
-		// is the right constant for the H.264/HEVC encoders this app
-		// actually targets). roi_priority is constrained to [0,1] and
-		// roi_bg_priority to [-1,0] (see WHIPOutput::ApplyRoi()), so each
-		// spinbox shows an unsigned QP magnitude - sign is implied by
-		// which field it is, not part of the displayed number.
-		ui->roiPriority->setValue((int)std::lround(obs_data_get_double(settings, "roi_priority") * 51.0));
-		ui->roiBgPriority->setValue((int)std::lround(obs_data_get_double(settings, "roi_bg_priority") * -51.0));
 	} else {
 		ui->key->setText(key);
 		ui->whipSimulcastGroupBox->hide();
 		ui->ppcenterGroupBox->hide();
-
-		ui->manualRoiGroupBox->hide();
 	}
 
 	ServiceChanged(true);
@@ -347,11 +284,11 @@ void OBSBasicSettings::LoadStream1Settings()
 
 	ui->ignoreRecommended->setChecked(ignoreRecommended);
 	ui->temporalDenoiseEnable->setChecked(config_get_bool(main->Config(), "Stream1", "TemporalDenoise"));
-	ui->detectRoiEnable->setChecked(config_get_bool(main->Config(), "Stream1", "DetectRoi"));
 	ui->qualityScoreEnable->setChecked(config_get_bool(main->Config(), "Stream1", "QualityScore"));
 	ui->beautyFilterEnable->setChecked(config_get_bool(main->Config(), "Stream1", "BeautyFilter"));
 	ui->clarityFilterEnable->setChecked(config_get_bool(main->Config(), "Stream1", "ClarityFilter"));
 	ui->whipSimulcastTotalLayers->setValue(whipSimulcastTotalLayers);
+	ui->whipHevcH264Multitrack->setChecked(whipHevcH264Multitrack);
 	RebuildWHIPSimulcastLayerRows();
 
 	loading = false;
@@ -434,37 +371,21 @@ void OBSBasicSettings::SaveStream1Settings()
 		obs_data_set_string(settings, "service", "WHIP");
 		obs_data_set_string(settings, "bearer_token", QT_TO_UTF8(ui->key->text()));
 
-		bool ppcenter_enabled = ui->ppcenterEnabled->isChecked();
-		obs_data_set_bool(settings, "ppcenter_enabled", ppcenter_enabled);
-		if (ppcenter_enabled) {
-			obs_data_set_string(settings, "ppcenter_url", QT_TO_UTF8(ui->ppcenterUrl->text().trimmed()));
-			obs_data_set_string(settings, "ppcenter_appid",
-					     QT_TO_UTF8(ui->ppcenterAppId->text().trimmed()));
-			obs_data_set_string(settings, "ppcenter_secret", QT_TO_UTF8(ui->ppcenterSecret->text()));
-			obs_data_set_string(settings, "ppcenter_stream",
-					     QT_TO_UTF8(ParseWHIPStreamNameFromServerUrl(ui->customServer->text())));
-			obs_data_set_string(settings, "ppcenter_region",
-					     QT_TO_UTF8(ui->ppcenterRegion->text().trimmed()));
-		}
+		// PPCenter resolution is unconditional for WHIP - there is no
+		// longer a switch for it in the UI. The flag is still written so
+		// that a service.json saved here keeps working with builds that
+		// predate its removal.
+		obs_data_set_bool(settings, "ppcenter_enabled", true);
+		obs_data_set_string(settings, "ppcenter_url", QT_TO_UTF8(ui->ppcenterUrl->text().trimmed()));
+		obs_data_set_string(settings, "ppcenter_appid", QT_TO_UTF8(ui->ppcenterAppId->text().trimmed()));
+		obs_data_set_string(settings, "ppcenter_secret", QT_TO_UTF8(ui->ppcenterSecret->text()));
+		obs_data_set_string(settings, "ppcenter_stream",
+				    QT_TO_UTF8(ParseWHIPStreamNameFromServerUrl(ui->customServer->text())));
+		obs_data_set_string(settings, "ppcenter_region", QT_TO_UTF8(ui->ppcenterRegion->text().trimmed()));
 
-		// Mirrored into the service settings so the WHIP output (and
-		// the ball/person ROI detection it drives) can read it at
-		// stream start without reaching into frontend config.
-		obs_data_set_bool(settings, "detect_roi", ui->detectRoiEnable->isChecked());
+		// Mirrored into the service settings so the WHIP output can read
+		// it at stream start without reaching into frontend config.
 		obs_data_set_bool(settings, "quality_score", ui->qualityScoreEnable->isChecked());
-
-		// Manually-configured ROI rectangle - see WHIPOutput::ApplyRoi(),
-		// which gives this precedence over the detector above whenever
-		// it's enabled.
-		obs_data_set_bool(settings, "roi_enabled", ui->manualRoiGroupBox->isChecked());
-		obs_data_set_int(settings, "roi_left", ui->roiLeft->value());
-		obs_data_set_int(settings, "roi_top", ui->roiTop->value());
-		obs_data_set_int(settings, "roi_right", ui->roiRight->value());
-		obs_data_set_int(settings, "roi_bottom", ui->roiBottom->value());
-
-		// Inverse of the QP -> priority conversion in LoadStream1Settings().
-		obs_data_set_double(settings, "roi_priority", ui->roiPriority->value() / 51.0);
-		obs_data_set_double(settings, "roi_bg_priority", ui->roiBgPriority->value() / -51.0);
 	} else {
 		obs_data_set_string(settings, "key", QT_TO_UTF8(ui->key->text()));
 	}
@@ -486,17 +407,22 @@ void OBSBasicSettings::SaveStream1Settings()
 
 	SaveCheckBox(ui->ignoreRecommended, "Stream1", "IgnoreRecommended");
 	SaveCheckBox(ui->temporalDenoiseEnable, "Stream1", "TemporalDenoise");
-	SaveCheckBox(ui->detectRoiEnable, "Stream1", "DetectRoi");
 	SaveCheckBox(ui->qualityScoreEnable, "Stream1", "QualityScore");
 	SaveCheckBox(ui->beautyFilterEnable, "Stream1", "BeautyFilter");
 	SaveCheckBox(ui->clarityFilterEnable, "Stream1", "ClarityFilter");
 	main->ApplyTemporalDenoiseSetting();
 	main->ApplyBeautyFilterSetting();
 	main->ApplyClarityFilterSetting();
-	main->UpdateRoiSelectButton();
 
 	auto oldWHIPSimulcastTotalLayers = config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers");
 	SaveSpinBox(ui->whipSimulcastTotalLayers, "Stream1", "WHIPSimulcastTotalLayers");
+
+	// See docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md
+	// §4.1 - read by WHIPOutput::Init() (via the output's own settings,
+	// not the service's, mirroring whip_disconnect_grace_sec) to decide
+	// whether to publish a second HEVC WHIP session alongside H264.
+	auto oldWHIPHevcH264Multitrack = config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
+	SaveCheckBox(ui->whipHevcH264Multitrack, "Stream1", "WHIPHevcH264Multitrack");
 
 	// Per-layer resolution/bitrate (see RebuildWHIPSimulcastLayerRows and
 	// WHIPSimulcastEncoders.hpp, which reads these same keys back at
@@ -577,7 +503,8 @@ void OBSBasicSettings::SaveStream1Settings()
 	SaveComboData(ui->multitrackVideoAdditionalCanvas, "Stream1", "MultitrackExtraCanvas");
 
 	if (oldMultitrackVideoSetting != ui->enableMultitrackVideo->isChecked() ||
-	    oldWHIPSimulcastTotalLayers != ui->whipSimulcastTotalLayers->value() || whipLayerSettingsChanged)
+	    oldWHIPSimulcastTotalLayers != ui->whipSimulcastTotalLayers->value() || whipLayerSettingsChanged ||
+	    oldWHIPHevcH264Multitrack != ui->whipHevcH264Multitrack->isChecked())
 		main->ResetOutputs();
 
 	SwapMultiTrack(QT_TO_UTF8(protocol));
@@ -1035,12 +962,9 @@ void OBSBasicSettings::on_service_currentIndexChanged(int idx)
 	if (IsWHIP()) {
 		ui->whipSimulcastGroupBox->show();
 		ui->ppcenterGroupBox->show();
-		ui->ppcenterFieldsWidget->setVisible(ui->ppcenterEnabled->isChecked());
-		ui->manualRoiGroupBox->show();
 	} else {
 		ui->whipSimulcastGroupBox->hide();
 		ui->ppcenterGroupBox->hide();
-		ui->manualRoiGroupBox->hide();
 	}
 }
 
@@ -1374,18 +1298,6 @@ void OBSBasicSettings::on_useAuth_toggled()
 	ui->authUsername->setVisible(use_auth);
 	ui->authPwLabel->setVisible(use_auth);
 	ui->authPwWidget->setVisible(use_auth);
-}
-
-void OBSBasicSettings::on_ppcenterEnabled_toggled()
-{
-	if (!IsWHIP())
-		return;
-
-	bool enabled = ui->ppcenterEnabled->isChecked();
-	ui->ppcenterFieldsWidget->setVisible(enabled);
-
-	if (enabled && ui->ppcenterRegion->text().trimmed().isEmpty())
-		ui->ppcenterRegion->setText(QStringLiteral("auto"));
 }
 
 bool OBSBasicSettings::IsCustomServer()

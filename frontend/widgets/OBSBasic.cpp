@@ -426,12 +426,6 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	connect(ui->previewZoomInButton, &QPushButton::clicked, ui->preview, &OBSBasicPreview::increaseScalingLevel);
 	connect(ui->previewZoomOutButton, &QPushButton::clicked, ui->preview, &OBSBasicPreview::decreaseScalingLevel);
 
-	/* Manual ROI select tool (WHIP only - see UpdateRoiSelectButton()) */
-	connect(ui->previewRoiSelectButton, &QPushButton::toggled, ui->preview, &OBSBasicPreview::SetRoiSelectMode);
-	connect(ui->preview, &OBSBasicPreview::roiSelectModeChanged, ui->previewRoiSelectButton,
-		&QPushButton::setChecked);
-	connect(ui->preview, &OBSBasicPreview::roiRegionSelected, this, &OBSBasic::OnRoiRegionSelected);
-
 	/* Preview Actions */
 	connect(ui->actionScaleWindow, &QAction::triggered, this, &OBSBasic::setPreviewScalingWindow);
 	connect(ui->actionScaleCanvas, &QAction::triggered, this, &OBSBasic::setPreviewScalingCanvas);
@@ -739,7 +733,6 @@ bool OBSBasic::InitBasicConfigDefaults()
 	config_set_default_bool(activeConfiguration, "Stream1", "TemporalDenoise", true);
 	config_set_default_bool(activeConfiguration, "Stream1", "BeautyFilter", false);
 	config_set_default_bool(activeConfiguration, "Stream1", "ClarityFilter", true);
-	config_set_default_bool(activeConfiguration, "Stream1", "DetectRoi", false);
 	config_set_default_bool(activeConfiguration, "Stream1", "QualityScore", true);
 	config_set_default_bool(activeConfiguration, "Stream1", "EnableMultitrackVideo", false);
 	config_set_default_bool(activeConfiguration, "Stream1", "MultitrackVideoMaximumAggregateBitrateAuto", true);
@@ -1417,7 +1410,6 @@ void OBSBasic::OnFirstLoad()
 	ApplyTemporalDenoiseSetting();
 	ApplyBeautyFilterSetting();
 	ApplyClarityFilterSetting();
-	UpdateRoiSelectButton();
 
 	bool showLogViewerOnStartup = config_get_bool(App()->GetUserConfig(), "LogViewer", "ShowLogStartup");
 

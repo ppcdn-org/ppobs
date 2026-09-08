@@ -28,8 +28,8 @@ static constexpr int64_t REPORT_INTERVAL_US = 10000000; /* one log line / 10s */
  * warning rather than info. The score is mean Y-SSIM x 100 against the
  * program feed, where the high 80s is ordinary streaming compression;
  * sustained sub-80 means the encode is visibly costing picture quality
- * (starved bitrate, a ROI region eating the budget, a resolution the
- * encoder can't hold), which is what someone reads the log to find. It
+ * (starved bitrate, a resolution the encoder can't hold), which is what
+ * someone reads the log to find. It
  * raises the level of the existing line instead of adding a second one,
  * so a window still produces exactly one score entry. */
 static constexpr double SCORE_WARN_THRESHOLD = 80.0;
