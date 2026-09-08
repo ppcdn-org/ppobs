@@ -140,6 +140,19 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 					      video_output_get_width(obs_get_video()),
 					      video_output_get_height(obs_get_video()), main->Config());
 	}
+	if (whipHevcEncoders != nullptr) {
+		std::string hevcEncoderId = ResolveWHIPHevcEncoderId(streamEncoder);
+		if (hevcEncoderId.empty()) {
+			blog(LOG_ERROR,
+			     "HEVC/H264 multitrack is enabled but no HEVC encoder is available - HEVC WHIP session will fail to start");
+		} else {
+			whipHevcEncoders->Create(hevcEncoderId, streamEncSettings,
+						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
+						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
+						 video_output_get_width(obs_get_video()),
+						 video_output_get_height(obs_get_video()), main->Config());
+		}
+	}
 
 	const char *rate_control =
 		obs_data_get_string(useStreamEncoder ? streamEncSettings : recordEncSettings, "rate_control");
@@ -257,6 +270,9 @@ void AdvancedOutput::UpdateStreamSettings()
 	obs_encoder_update(videoStreaming, settings);
 	if (whipSimulcastEncoders != nullptr) {
 		whipSimulcastEncoders->Update(settings, obs_data_get_int(settings, "bitrate"), main->Config());
+	}
+	if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
+		whipHevcEncoders->Update(settings, obs_data_get_int(settings, "bitrate"), main->Config());
 	}
 }
 
@@ -543,6 +559,8 @@ void AdvancedOutput::SetupOutputs()
 		obs_encoder_set_video(videoRecording, obs_get_video());
 	if (whipSimulcastEncoders != nullptr)
 		whipSimulcastEncoders->SetVideo();
+	if (whipHevcEncoders != nullptr)
+		whipHevcEncoders->SetVideo();
 	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
 		obs_encoder_set_audio(streamTrack[i], obs_get_audio());
 		obs_encoder_set_audio(recordTrack[i], obs_get_audio());
@@ -664,6 +682,18 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 		obs_output_set_video_encoder(streamOutput, videoStreaming);
 		if (whipSimulcastEncoders != nullptr) {
 			whipSimulcastEncoders->SetStreamOutput(streamOutput);
+		}
+		if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
+			// HEVC's ladder starts right after H264's own slots (main +
+			// its Simulcast layers) - see collectVideoLayers() in
+			// whip-output.cpp, which tells the two codecs' layers apart
+			// purely by obs_encoder_get_codec(), not by slot range, so
+			// the exact boundary here only has to avoid colliding with
+			// H264's slots, not match any fixed convention.
+			uint32_t h264SlotCount = whipSimulcastEncoders ? (uint32_t)config_get_int(main->Config(), "Stream1",
+												  "WHIPSimulcastTotalLayers")
+									: 1;
+			whipHevcEncoders->SetStreamOutput(streamOutput, h264SlotCount);
 		}
 		obs_output_set_audio_encoder(streamOutput, streamAudioEnc, 0);
 

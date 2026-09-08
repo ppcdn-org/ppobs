@@ -4,6 +4,7 @@
 #include <obs.h>
 #include <curl/curl.h>
 #include <cstring>
+#include <nlohmann/json.hpp>
 
 namespace {
 constexpr long PPCENTER_TIMEOUT_SECONDS = 8;
@@ -35,16 +36,26 @@ bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPub
 		return false;
 	}
 
-	obs_data_t *body = obs_data_create();
-	obs_data_set_string(body, "appId", request.app_id.c_str());
-	obs_data_set_string(body, "appSecret", request.app_secret.c_str());
-	obs_data_set_string(body, "streamName", request.stream_name.c_str());
-	obs_data_set_string(body, "requestRegion", request.region.c_str());
-	const char *json = obs_data_get_json(body);
+	// Built directly as JSON (rather than through obs_data_t) so
+	// "capabilities" can be a plain JSON string array, matching
+	// ppcenter's publishRequestV1.Capabilities []string (see
+	// ppcenter/internal/apis/publish_v1.go) - obs_data_array_t's element
+	// type is fixed to an object, with no "push a bare string" call.
+	nlohmann::json body = {
+		{"appId", request.app_id},
+		{"appSecret", request.app_secret},
+		{"streamName", request.stream_name},
+		{"requestRegion", request.region},
+	};
+	if (request.request_hevc_h264_multitrack) {
+		// "whip-hevc-h264" is the only capability value the dual-codec
+		// publish path needs - see the design doc's §3.2.
+		body["capabilities"] = nlohmann::json::array({"whip-hevc-h264"});
+	}
+	const std::string json_body = body.dump();
 
 	CURL *curl = curl_easy_init();
 	if (!curl) {
-		obs_data_release(body);
 		error = "failed to initialize HTTP client";
 		return false;
 	}
@@ -56,8 +67,8 @@ bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPub
 	char curl_error[CURL_ERROR_SIZE] = {};
 	curl_easy_setopt(curl, CURLOPT_URL, request.url.c_str());
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(strlen(json)));
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(json_body.size()));
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_response);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
@@ -69,7 +80,6 @@ bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPub
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 	curl_slist_free_all(headers);
 	curl_easy_cleanup(curl);
-	obs_data_release(body);
 
 	if (result != CURLE_OK) {
 		error = buffer.exceeded ? "ppcenter response is too large" :
@@ -81,20 +91,35 @@ bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPub
 		return false;
 	}
 
-	obs_data_t *decoded = obs_data_create_from_json(buffer.data.c_str());
-	if (!decoded) {
+	nlohmann::json decoded;
+	try {
+		decoded = nlohmann::json::parse(buffer.data);
+	} catch (const std::exception &) {
 		error = "ppcenter returned invalid JSON";
 		return false;
 	}
-	response.whip_url = obs_data_get_string(decoded, "whipUrl");
-	response.bearer_token = obs_data_get_string(decoded, "bearerToken");
-	obs_data_t *signal = obs_data_get_obj(decoded, "signal");
-	if (signal) {
-		response.signal_token = obs_data_get_string(signal, "token");
-		response.signal_url = obs_data_get_string(signal, "signalUrl");
-		obs_data_release(signal);
+
+	response.whip_url = decoded.value("whipUrl", "");
+	response.bearer_token = decoded.value("bearerToken", "");
+	if (decoded.contains("signal") && decoded["signal"].is_object()) {
+		const auto &signal = decoded["signal"];
+		response.signal_token = signal.value("token", "");
+		response.signal_url = signal.value("signalUrl", "");
 	}
-	obs_data_release(decoded);
+	response.whip_tracks.clear();
+	if (decoded.contains("whipTracks") && decoded["whipTracks"].is_object()) {
+		// Keyed "h264"/"hevc" - see the design doc's §3.2 and
+		// ppcenter's publishDecisionV1.WHIPTracks
+		// (map[string]publishTrackV1).
+		for (auto &[codec, track] : decoded["whipTracks"].items()) {
+			if (!track.is_object())
+				continue;
+			PPCenterWhipTrack t;
+			t.url = track.value("url", "");
+			t.bearer_token = track.value("bearerToken", "");
+			response.whip_tracks[codec] = t;
+		}
+	}
 	if (response.whip_url.empty() || response.bearer_token.empty()) {
 		error = "ppcenter response is missing WHIP credentials";
 		return false;
