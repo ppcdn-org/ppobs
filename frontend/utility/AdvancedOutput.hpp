@@ -9,6 +9,10 @@ struct AdvancedOutput : BasicOutputHandler {
 	OBSEncoder recordTrack[MAX_AUDIO_MIXES];
 	OBSEncoder videoStreaming;
 	OBSEncoder videoRecording;
+	// Only created for WHIP when the main stream encoder is not H264 -
+	// WHIP always publishes an H264 base track (see AdvancedOutput's
+	// constructor and collectVideoLayers() in whip-output.cpp).
+	OBSEncoder whipH264Base;
 
 	bool ffmpegOutput;
 	bool ffmpegRecording;

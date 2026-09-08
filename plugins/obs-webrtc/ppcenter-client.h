@@ -2,6 +2,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 struct PPCenterPublishRequest {
 	std::string url;
@@ -9,13 +10,8 @@ struct PPCenterPublishRequest {
 	std::string app_secret;
 	std::string stream_name;
 	std::string region;
-	// Set true to ask ppcenter for the HEVC/H264 multitrack "whipTracks"
-	// map (capability "whip-hevc-h264") in addition to the legacy
-	// top-level whipUrl/bearerToken - see
-	// docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md
-	// §3.2. Ignored by an old ppcenter, which simply won't include
-	// whipTracks in its response.
-	bool request_hevc_h264_multitrack = false;
+	std::string device_id;
+	std::string nat_probe_id;
 };
 
 // One codec's WHIP endpoint inside PPCenterPublishResponse::whip_tracks -
@@ -26,17 +22,17 @@ struct PPCenterWhipTrack {
 };
 
 struct PPCenterPublishResponse {
-	std::string whip_url;
-	std::string bearer_token;
 	std::string signal_token;
 	std::string signal_url;
-	// Keyed "h264"/"hevc" - populated only when the request asked for
-	// whip-hevc-h264 and ppcenter supports it. Empty (both keys absent)
-	// otherwise; callers must check both PPCenterWhipTrack.url are
-	// non-empty before trusting this map for a dual-codec publish (see
-	// the design doc's §3.2 "不完整时拒绝启动双轨").
+	// ICE servers supplied by ppcenter for direct P2P media. Older
+	// ppcenter versions omit this field; callers provide a temporary
+	// public-STUN fallback so NAT traversal still works during rollout.
+	std::vector<std::string> stun_servers;
+	// Keyed "h264"/"hevc" - "h264" is always required, "hevc" only when
+	// HEVC/H264 multitrack is enabled - see the design doc's §3.1/§3.2.
 	std::map<std::string, PPCenterWhipTrack> whip_tracks;
 };
 
+std::string ppcenter_build_publish_json(const PPCenterPublishRequest &request);
 bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPublishResponse &response,
 			      std::string &error);

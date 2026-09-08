@@ -28,6 +28,25 @@ size_t write_response(char *ptr, size_t size, size_t nmemb, void *userdata)
 }
 }
 
+std::string ppcenter_build_publish_json(const PPCenterPublishRequest &request)
+{
+	nlohmann::json body = {
+		{"appId", request.app_id},
+		{"appSecret", request.app_secret},
+		{"streamName", request.stream_name},
+		{"requestRegion", request.region},
+		// Every WHIP publish is codec-tagged (".../h264/whip"), so this
+		// capability is requested unconditionally - see the design
+		// doc's §3.1 URL convention.
+		{"capabilities", nlohmann::json::array({"whip-hevc-h264"})},
+	};
+	if (!request.device_id.empty())
+		body["deviceId"] = request.device_id;
+	if (!request.nat_probe_id.empty())
+		body["natProbeId"] = request.nat_probe_id;
+	return body.dump();
+}
+
 bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPublishResponse &response,
 			      std::string &error)
 {
@@ -38,21 +57,8 @@ bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPub
 
 	// Built directly as JSON (rather than through obs_data_t) so
 	// "capabilities" can be a plain JSON string array, matching
-	// ppcenter's publishRequestV1.Capabilities []string (see
-	// ppcenter/internal/apis/publish_v1.go) - obs_data_array_t's element
-	// type is fixed to an object, with no "push a bare string" call.
-	nlohmann::json body = {
-		{"appId", request.app_id},
-		{"appSecret", request.app_secret},
-		{"streamName", request.stream_name},
-		{"requestRegion", request.region},
-	};
-	if (request.request_hevc_h264_multitrack) {
-		// "whip-hevc-h264" is the only capability value the dual-codec
-		// publish path needs - see the design doc's §3.2.
-		body["capabilities"] = nlohmann::json::array({"whip-hevc-h264"});
-	}
-	const std::string json_body = body.dump();
+	// ppcenter's publishRequestV1.Capabilities []string.
+	const std::string json_body = ppcenter_build_publish_json(request);
 
 	CURL *curl = curl_easy_init();
 	if (!curl) {
@@ -99,12 +105,20 @@ bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPub
 		return false;
 	}
 
-	response.whip_url = decoded.value("whipUrl", "");
-	response.bearer_token = decoded.value("bearerToken", "");
 	if (decoded.contains("signal") && decoded["signal"].is_object()) {
 		const auto &signal = decoded["signal"];
 		response.signal_token = signal.value("token", "");
 		response.signal_url = signal.value("signalUrl", "");
+	}
+	response.stun_servers.clear();
+	if (decoded.contains("stunServers") && decoded["stunServers"].is_array()) {
+		for (const auto &server : decoded["stunServers"]) {
+			if (server.is_string()) {
+				auto url = server.get<std::string>();
+				if (url.compare(0, 5, "stun:") == 0 || url.compare(0, 6, "stuns:") == 0)
+					response.stun_servers.push_back(std::move(url));
+			}
+		}
 	}
 	response.whip_tracks.clear();
 	if (decoded.contains("whipTracks") && decoded["whipTracks"].is_object()) {
@@ -120,8 +134,10 @@ bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPub
 			response.whip_tracks[codec] = t;
 		}
 	}
-	if (response.whip_url.empty() || response.bearer_token.empty()) {
-		error = "ppcenter response is missing WHIP credentials";
+	auto h264Track = response.whip_tracks.find("h264");
+	if (h264Track == response.whip_tracks.end() || h264Track->second.url.empty() ||
+	    h264Track->second.bearer_token.empty()) {
+		error = "ppcenter response is missing the h264 WHIP track";
 		return false;
 	}
 	return true;

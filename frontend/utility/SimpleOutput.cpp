@@ -746,6 +746,14 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 	obs_data_set_bool(settings, "low_latency_mode_enabled", enableLowLatencyMode);
 #endif
 	obs_data_set_bool(settings, "dyn_bitrate", enableDynBitrate);
+	// WHIPOutput::multitrackEnabled() reads this output-private setting
+	// (see whip-output.cpp), not Stream1.WHIPHevcH264Multitrack directly -
+	// it has to be forwarded here or the HEVC session never gets enabled
+	// even when the checkbox is on and whipHevcEncoders already built the
+	// HEVC encoder ladder. See AdvancedOutput::StartStreaming's identical
+	// forwarding.
+	obs_data_set_bool(settings, "whip_hevc_h264_multitrack",
+			  config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack"));
 
 	auto streamOutput = StreamingOutput(); // shadowing is sort of bad, but also convenient
 

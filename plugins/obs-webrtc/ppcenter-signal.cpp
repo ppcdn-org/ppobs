@@ -178,6 +178,11 @@ public:
 			blog(LOG_ERROR, "[ppobs P2P] refusing invalid signaling URL; only ws:// and wss:// are supported");
 			return false;
 		}
+		if (!IsAllowedWebSocketSignalURL(signalUrl)) {
+			blog(LOG_ERROR,
+			     "[ppobs P2P] refusing insecure remote signaling URL; use wss:// (ws:// is allowed only for loopback development)");
+			return false;
+		}
 		this->onMessage = std::move(onMessage);
 		running = true;
 		thread = std::thread(&P2PSignalImpl::run, this);
@@ -293,10 +298,25 @@ private:
 		struct addrinfo hints = {}, *result = nullptr;
 		hints.ai_family = AF_UNSPEC;
 		hints.ai_socktype = SOCK_STREAM;
-		auto portPos = host.find(':');
 		std::string h = host;
 		std::string port = "80";
-		if (portPos != std::string::npos) { h = host.substr(0, portPos); port = host.substr(portPos + 1); }
+		if (!host.empty() && host.front() == '[') {
+			auto close = host.find(']');
+			if (close == std::string::npos)
+				return false;
+			h = host.substr(1, close - 1);
+			if (close + 1 < host.size()) {
+				if (host[close + 1] != ':' || close + 2 >= host.size())
+					return false;
+				port = host.substr(close + 2);
+			}
+		} else {
+			auto portPos = host.find(':');
+			if (portPos != std::string::npos) {
+				h = host.substr(0, portPos);
+				port = host.substr(portPos + 1);
+			}
+		}
 
 		if (getaddrinfo(h.c_str(), port.c_str(), &hints, &result) != 0) return false;
 
@@ -440,9 +460,11 @@ private:
 };
 
 P2PSignalClient::P2PSignalClient(const std::string &url, const std::string &token, const std::string &streamPath,
-				 const std::string &videoCodec, const std::string &audioCodec, uint32_t baseSsrc)
+				 const std::string &videoCodec, const std::string &audioCodec, uint32_t baseSsrc,
+				 std::vector<std::string> stunServers)
 	: impl(std::make_unique<P2PSignalImpl>(url, token)),
-	  streamPath(streamPath), videoCodec(videoCodec), audioCodec(audioCodec), baseSsrc(baseSsrc)
+	  streamPath(streamPath), videoCodec(videoCodec), audioCodec(audioCodec), baseSsrc(baseSsrc),
+	  stunServers(std::move(stunServers))
 {
 }
 
@@ -493,6 +515,13 @@ void P2PSignalClient::HandleOffer(const std::string &sessionId, const std::strin
 	{ std::lock_guard<std::mutex> lock(peersMutex); auto it = peers.find(sessionId); if (it == peers.end()) return; peer = it->second; }
 
 	rtc::Configuration cfg;
+	for (const auto &server : stunServers) {
+		try {
+			cfg.iceServers.emplace_back(server);
+		} catch (const std::exception &e) {
+			blog(LOG_WARNING, "[ppobs P2P] ignoring invalid STUN server '%s': %s", server.c_str(), e.what());
+		}
+	}
 	peer->pc = std::make_shared<rtc::PeerConnection>(cfg);
 	CreatePeerVideo(*peer); CreatePeerAudio(*peer);
 

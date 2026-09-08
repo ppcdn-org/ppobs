@@ -133,6 +133,30 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		throw "Failed to create streaming video encoder "
 		      "(advanced output)";
 	obs_encoder_release(videoStreaming);
+
+	// WHIP needs an H264 base track, but the user is free to pick HEVC (or
+	// AV1) as the main stream encoder - so rather than overriding that
+	// choice, add a dedicated H264 encoder alongside it. WHIPOutput picks
+	// its base track by codec (see collectVideoLayers() in
+	// whip-output.cpp), so this is what keeps the publish from failing with
+	// "No H264 video encoder assigned".
+	if (strcmp(obs_service_get_id(main->GetService()), "whip_custom") == 0) {
+		const char *streamCodec = obs_get_encoder_codec(streamEncoder);
+		if (!streamCodec || strcmp(streamCodec, "h264") != 0) {
+			std::string h264EncoderId = ResolveWHIPH264EncoderId(streamEncoder);
+			whipH264Base = obs_video_encoder_create(h264EncoderId.c_str(), "whip_h264_base",
+								streamEncSettings, nullptr);
+			if (whipH264Base) {
+				obs_encoder_release(whipH264Base);
+				blog(LOG_INFO, "WHIP: added '%s' as the H264 base track for a '%s' stream encoder",
+				     h264EncoderId.c_str(), streamEncoder);
+			} else {
+				blog(LOG_ERROR, "WHIP: failed to create the H264 base track encoder '%s'",
+				     h264EncoderId.c_str());
+			}
+		}
+	}
+
 	if (whipSimulcastEncoders != nullptr) {
 		whipSimulcastEncoders->Create(streamEncoder, streamEncSettings,
 					      config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
@@ -557,6 +581,8 @@ void AdvancedOutput::SetupOutputs()
 	obs_encoder_set_video(videoStreaming, obs_get_video());
 	if (videoRecording)
 		obs_encoder_set_video(videoRecording, obs_get_video());
+	if (whipH264Base)
+		obs_encoder_set_video(whipH264Base, obs_get_video());
 	if (whipSimulcastEncoders != nullptr)
 		whipSimulcastEncoders->SetVideo();
 	if (whipHevcEncoders != nullptr)
@@ -695,6 +721,12 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 									: 1;
 			whipHevcEncoders->SetStreamOutput(streamOutput, h264SlotCount);
 		}
+		if (whipH264Base) {
+			// Placed after the Simulcast/HEVC ladders so it cannot
+			// overwrite one of their slots; WHIPOutput matches tracks
+			// by codec, so the exact index does not matter.
+			obs_output_set_video_encoder2(streamOutput, whipH264Base, MAX_OUTPUT_VIDEO_ENCODERS - 1);
+		}
 		obs_output_set_audio_encoder(streamOutput, streamAudioEnc, 0);
 
 		if (!is_multitrack_output) {
@@ -765,6 +797,13 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	obs_data_set_bool(settings, "dyn_bitrate", enableDynBitrate);
 	obs_data_set_int(settings, "whip_disconnect_grace_sec", whipDisconnectGraceSec);
 	obs_data_set_int(settings, "whip_reconnect_backoff_sec", whipReconnectBackoffSec);
+	// WHIPOutput::multitrackEnabled() reads this output-private setting
+	// (see whip-output.cpp), not Stream1.WHIPHevcH264Multitrack directly -
+	// it has to be forwarded here, the same as the two settings above,
+	// or the HEVC session never gets enabled even when the checkbox is on
+	// and whipHevcEncoders already built the HEVC encoder ladder.
+	obs_data_set_bool(settings, "whip_hevc_h264_multitrack",
+			  config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack"));
 
 	auto streamOutput = StreamingOutput(); // shadowing is sort of bad, but also convenient
 

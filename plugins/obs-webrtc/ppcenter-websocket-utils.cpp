@@ -126,6 +126,52 @@ ParsedWebSocketSignalURL ParseWebSocketSignalURL(const std::string &url)
 	return parsed;
 }
 
+bool IsAllowedWebSocketSignalURL(const std::string &url)
+{
+	auto parsed = ParseWebSocketSignalURL(url);
+	if (!parsed.valid)
+		return false;
+	if (parsed.tls)
+		return true;
+
+	std::string hostname = parsed.host;
+	if (!hostname.empty() && hostname.front() == '[') {
+		auto close = hostname.find(']');
+		if (close == std::string::npos)
+			return false;
+		hostname = hostname.substr(1, close - 1);
+	} else {
+		auto colon = hostname.find(':');
+		if (colon != std::string::npos)
+			hostname.resize(colon);
+	}
+
+	hostname = ToLower(hostname);
+	if (hostname == "localhost" || hostname == "::1")
+		return true;
+	if (hostname.compare(0, 4, "127.") != 0)
+		return false;
+
+	// Parse the rest of 127/8 strictly enough to avoid accepting names such
+	// as 127.example.com as a local debugging exemption.
+	int octets = 0;
+	size_t start = 0;
+	while (start < hostname.size()) {
+		auto end = hostname.find('.', start);
+		auto part = hostname.substr(start, end == std::string::npos ? std::string::npos : end - start);
+		if (part.empty() || part.size() > 3 ||
+		    !std::all_of(part.begin(), part.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+			return false;
+		if (std::stoi(part) > 255)
+			return false;
+		++octets;
+		if (end == std::string::npos)
+			break;
+		start = end + 1;
+	}
+	return octets == 4;
+}
+
 std::string BuildWebSocketAccept(const std::string &websocketKey)
 {
 	static const std::string guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";

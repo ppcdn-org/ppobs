@@ -31,6 +31,12 @@ int main()
 	}
 	Require(!ParseWebSocketSignalURL("http://center.example/v1/p2p/signal").valid, "http URL should be rejected");
 	Require(!ParseWebSocketSignalURL("wss:///v1/p2p/signal").valid, "missing host should be rejected");
+	Require(IsAllowedWebSocketSignalURL("wss://center.example/v1/p2p/signal"), "remote wss URL should be allowed");
+	Require(!IsAllowedWebSocketSignalURL("ws://center.example/v1/p2p/signal"), "remote ws URL should be rejected");
+	Require(IsAllowedWebSocketSignalURL("ws://localhost:8080/v1/p2p/signal"), "localhost ws URL should be allowed");
+	Require(IsAllowedWebSocketSignalURL("ws://127.0.0.1:8080/v1/p2p/signal"), "IPv4 loopback ws URL should be allowed");
+	Require(IsAllowedWebSocketSignalURL("ws://[::1]:8080/v1/p2p/signal"), "IPv6 loopback ws URL should be allowed");
+	Require(!IsAllowedWebSocketSignalURL("ws://127.example.com/v1/p2p/signal"), "loopback-looking hostname should be rejected");
 
 	const std::string key = "dGhlIHNhbXBsZSBub25jZQ==";
 	Require(BuildWebSocketAccept(key) == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "RFC accept mismatch");

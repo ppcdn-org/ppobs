@@ -20,7 +20,7 @@ add_library(OBS::webrtc ALIAS obs-webrtc)
 
 target_sources(
   obs-webrtc
-  PRIVATE obs-webrtc.cpp ppcenter-client.cpp ppcenter-client.h ppcenter-signal-message.cpp ppcenter-signal-message.h ppcenter-signal-outgoing.cpp ppcenter-signal-outgoing.h ppcenter-websocket-frame.cpp ppcenter-websocket-frame.h ppcenter-websocket-utils.cpp ppcenter-websocket-utils.h ppcenter-signal.cpp ppcenter-signal.h uplink-qos-policy.cpp uplink-qos-policy.h whip-output.cpp whip-output.h whip-codec-session.cpp whip-codec-session.h whip-service.cpp whip-service.h whip-utils.h degrade-client.cpp degrade-client.h quality-score.cpp quality-score.h
+  PRIVATE obs-webrtc.cpp nat-probe.cpp nat-probe.h ppcenter-client.cpp ppcenter-client.h ppcenter-signal-message.cpp ppcenter-signal-message.h ppcenter-signal-outgoing.cpp ppcenter-signal-outgoing.h ppcenter-websocket-frame.cpp ppcenter-websocket-frame.h ppcenter-websocket-utils.cpp ppcenter-websocket-utils.h ppcenter-signal.cpp ppcenter-signal.h uplink-qos-policy.cpp uplink-qos-policy.h whip-output.cpp whip-output.h whip-codec-session.cpp whip-codec-session.h whip-service.cpp whip-service.h whip-utils.h degrade-client.cpp degrade-client.h quality-score.cpp quality-score.h
 )
 
 target_compile_definitions(
@@ -61,3 +61,7 @@ target_link_libraries(obs-webrtc-p2p-signal-outgoing-test PRIVATE OBS::libobs)
 
 add_executable(obs-webrtc-uplink-qos-policy-test EXCLUDE_FROM_ALL tests/uplink-qos-policy-test.cpp uplink-qos-policy.cpp uplink-qos-policy.h)
 target_include_directories(obs-webrtc-uplink-qos-policy-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(obs-webrtc-ppcenter-publish-request-test EXCLUDE_FROM_ALL tests/ppcenter-publish-request-test.cpp ppcenter-client.cpp ppcenter-client.h)
+target_include_directories(obs-webrtc-ppcenter-publish-request-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(obs-webrtc-ppcenter-publish-request-test PRIVATE OBS::libobs CURL::libcurl)

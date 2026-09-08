@@ -9,6 +9,7 @@
 #include <mutex>
 #include <map>
 #include <cstdint>
+#include <vector>
 
 struct P2PPeer {
 	std::string sessionId;
@@ -33,7 +34,8 @@ class P2PSignalImpl;
 class P2PSignalClient {
 public:
 	P2PSignalClient(const std::string &url, const std::string &token, const std::string &streamPath,
-			const std::string &videoCodec, const std::string &audioCodec, uint32_t baseSsrc);
+			const std::string &videoCodec, const std::string &audioCodec, uint32_t baseSsrc,
+			std::vector<std::string> stunServers);
 	~P2PSignalClient();
 
 	bool Start();
@@ -62,6 +64,7 @@ private:
 	std::string videoCodec;
 	std::string audioCodec;
 	uint32_t baseSsrc;
+	std::vector<std::string> stunServers;
 	std::function<void()> onPeerUpdated;
 	std::mutex peersMutex;
 	std::map<std::string, std::shared_ptr<P2PPeer>> peers;

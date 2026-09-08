@@ -2317,126 +2317,6 @@
                </widget>
               </item>
               <item>
-               <widget class="QGroupBox" name="serviceAdvancedOptionsGroupBox">
-                <property name="title">
-                 <string>Basic.Settings.Stream.AdvancedOptions</string>
-                </property>
-                <layout class="QFormLayout" name="serviceAdvancedOptionsLayout">
-                 <property name="fieldGrowthPolicy">
-                  <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
-                 </property>
-                 <property name="labelAlignment">
-                  <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
-                 </property>
-                 <property name="leftMargin">
-                  <number>9</number>
-                 </property>
-                 <property name="topMargin">
-                  <number>2</number>
-                 </property>
-                 <property name="rightMargin">
-                  <number>9</number>
-                 </property>
-                 <property name="bottomMargin">
-                  <number>9</number>
-                 </property>
-                 <item row="0" column="0">
-                  <widget class="QLabel" name="twitchAddonLabel">
-                   <property name="text">
-                    <string>Basic.Settings.Stream.TTVAddon</string>
-                   </property>
-                   <property name="buddy">
-                    <cstring>twitchAddonDropdown</cstring>
-                   </property>
-                  </widget>
-                 </item>
-                 <item row="0" column="1">
-                  <widget class="QComboBox" name="twitchAddonDropdown"/>
-                 </item>
-                 <item row="1" column="0">
-                  <spacer name="horizontalSpacer_18_1">
-                   <property name="orientation">
-                    <enum>Qt::Horizontal</enum>
-                   </property>
-                   <property name="sizeHint" stdset="0">
-                    <size>
-                     <width>170</width>
-                     <height>0</height>
-                    </size>
-                   </property>
-                  </spacer>
-                 </item>
-                 <item row="1" column="1">
-                  <widget class="QCheckBox" name="bandwidthTestEnable">
-                   <property name="text">
-                    <string>Basic.Settings.Stream.BandwidthTestMode</string>
-                   </property>
-                  </widget>
-                 </item>
-                 <item row="2" column="1">
-                  <widget class="QCheckBox" name="ignoreRecommended">
-                   <property name="text">
-                    <string>Basic.Settings.Stream.IgnoreRecommended</string>
-                   </property>
-                  </widget>
-                 </item>
-                 <item row="3" column="1">
-                  <widget class="QLabel" name="enforceSettingsLabel">
-                   <property name="text">
-                    <string notr="true"/>
-                   </property>
-                   <property name="textFormat">
-                    <enum>Qt::RichText</enum>
-                   </property>
-                   <property name="openExternalLinks">
-                    <bool>true</bool>
-                   </property>
-                  </widget>
-                 </item>
-                 <item row="4" column="1">
-                  <widget class="QCheckBox" name="temporalDenoiseEnable">
-                   <property name="text">
-                    <string>Basic.Settings.Stream.TemporalDenoise</string>
-                   </property>
-                   <property name="checked">
-                    <bool>true</bool>
-                   </property>
-                  </widget>
-                 </item>
-                 <item row="5" column="1">
-                  <widget class="QCheckBox" name="qualityScoreEnable">
-                   <property name="text">
-                    <string>Basic.Settings.Stream.QualityScore</string>
-                   </property>
-                   <property name="checked">
-                    <bool>true</bool>
-                   </property>
-                  </widget>
-                 </item>
-                 <item row="6" column="1">
-                  <widget class="QCheckBox" name="beautyFilterEnable">
-                   <property name="text">
-                    <string>Basic.Settings.Stream.BeautyFilter</string>
-                   </property>
-                   <property name="checked">
-                    <bool>false</bool>
-                   </property>
-                  </widget>
-                 </item>
-                 <item row="7" column="1">
-                  <widget class="QCheckBox" name="clarityFilterEnable">
-                   <property name="text">
-                    <string>Basic.Settings.Stream.ClarityFilter</string>
-                   </property>
-                   <property name="checked">
-                    <bool>true</bool>
-                   </property>
-                  </widget>
-                 </item>
-                </layout>
-               </widget>
-              </item>
-              <item>
                <widget class="QGroupBox" name="scheduleGroupBox">
                 <property name="title">
                  <string>Basic.Settings.Schedule.GroupTitle</string>
@@ -6954,6 +6834,126 @@
                </size>
               </property>
              </spacer>
+            </item>
+           </layout>
+          </widget>
+         </item>
+         <item>
+          <widget class="QGroupBox" name="serviceAdvancedOptionsGroupBox">
+           <property name="title">
+            <string>Basic.Settings.Stream.AdvancedOptions</string>
+           </property>
+           <layout class="QFormLayout" name="serviceAdvancedOptionsLayout">
+            <property name="fieldGrowthPolicy">
+             <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
+            </property>
+            <property name="labelAlignment">
+             <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+            </property>
+            <property name="leftMargin">
+             <number>9</number>
+            </property>
+            <property name="topMargin">
+             <number>2</number>
+            </property>
+            <property name="rightMargin">
+             <number>9</number>
+            </property>
+            <property name="bottomMargin">
+             <number>9</number>
+            </property>
+            <item row="0" column="0">
+             <widget class="QLabel" name="twitchAddonLabel">
+              <property name="text">
+               <string>Basic.Settings.Stream.TTVAddon</string>
+              </property>
+              <property name="buddy">
+               <cstring>twitchAddonDropdown</cstring>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="1">
+             <widget class="QComboBox" name="twitchAddonDropdown"/>
+            </item>
+            <item row="1" column="0">
+             <spacer name="horizontalSpacer_18_1">
+              <property name="orientation">
+               <enum>Qt::Horizontal</enum>
+              </property>
+              <property name="sizeHint" stdset="0">
+               <size>
+                <width>170</width>
+                <height>0</height>
+               </size>
+              </property>
+             </spacer>
+            </item>
+            <item row="1" column="1">
+             <widget class="QCheckBox" name="bandwidthTestEnable">
+              <property name="text">
+               <string>Basic.Settings.Stream.BandwidthTestMode</string>
+              </property>
+             </widget>
+            </item>
+            <item row="2" column="1">
+             <widget class="QCheckBox" name="ignoreRecommended">
+              <property name="text">
+               <string>Basic.Settings.Stream.IgnoreRecommended</string>
+              </property>
+             </widget>
+            </item>
+            <item row="3" column="1">
+             <widget class="QLabel" name="enforceSettingsLabel">
+              <property name="text">
+               <string notr="true"/>
+              </property>
+              <property name="textFormat">
+               <enum>Qt::RichText</enum>
+              </property>
+              <property name="openExternalLinks">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="4" column="1">
+             <widget class="QCheckBox" name="temporalDenoiseEnable">
+              <property name="text">
+               <string>Basic.Settings.Stream.TemporalDenoise</string>
+              </property>
+              <property name="checked">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="5" column="1">
+             <widget class="QCheckBox" name="qualityScoreEnable">
+              <property name="text">
+               <string>Basic.Settings.Stream.QualityScore</string>
+              </property>
+              <property name="checked">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="6" column="1">
+             <widget class="QCheckBox" name="beautyFilterEnable">
+              <property name="text">
+               <string>Basic.Settings.Stream.BeautyFilter</string>
+              </property>
+              <property name="checked">
+               <bool>false</bool>
+              </property>
+             </widget>
+            </item>
+            <item row="7" column="1">
+             <widget class="QCheckBox" name="clarityFilterEnable">
+              <property name="text">
+               <string>Basic.Settings.Stream.ClarityFilter</string>
+              </property>
+              <property name="checked">
+               <bool>true</bool>
+              </property>
+             </widget>
             </item>
            </layout>
           </widget>

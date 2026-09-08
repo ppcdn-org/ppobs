@@ -74,6 +74,35 @@ static inline std::string ResolveWHIPHevcEncoderId(const std::string &h264Encode
 	return std::string();
 }
 
+// WHIP always needs H264 as its base track. Convert an HEVC/AV1 encoder
+// saved by an older profile to the matching H264 encoder family; this is
+// also used as a runtime guard when the user starts streaming without first
+// opening Settings (where non-H264 WHIP choices are filtered out).
+static inline std::string ResolveWHIPH264EncoderId(const std::string &encoderId)
+{
+	const char *codec = obs_get_encoder_codec(encoderId.c_str());
+	if (codec && strcmp(codec, "h264") == 0)
+		return encoderId;
+
+	struct Fallback {
+		const char *sourceSubstring;
+		const char *h264Id;
+	};
+	static const Fallback fallbacks[] = {
+		{"nvenc", "obs_nvenc_h264_tex"},
+		{"qsv", "obs_qsv11_v2"},
+		{"amf", "h264_texture_amf"},
+		{"videotoolbox", "com.apple.videotoolbox.videoencoder.ave.avc"},
+	};
+
+	for (const auto &fallback : fallbacks) {
+		if (encoderId.find(fallback.sourceSubstring) != std::string::npos &&
+		    obs_get_encoder_codec(fallback.h264Id))
+			return fallback.h264Id;
+	}
+	return "obs_x264";
+}
+
 struct WHIPHevcEncoders {
 public:
 	// HEVC Simulcast is capped at 3 layers total (design doc §11: "严格

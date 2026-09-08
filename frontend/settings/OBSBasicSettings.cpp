@@ -416,6 +416,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->beautyFilterEnable,   CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->clarityFilterEnable,  CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->whipSimulcastTotalLayers, SCROLL_CHANGED, STREAM1_CHANGED);
+	HookWidget(ui->whipHevcH264Multitrack, CHECK_CHANGED, STREAM1_CHANGED);
 	HookWidget(ui->ppcenterUrl,          EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->ppcenterAppId,        EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->ppcenterSecret,       EDIT_CHANGED,   STREAM1_CHANGED);

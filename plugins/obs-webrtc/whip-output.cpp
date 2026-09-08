@@ -3,6 +3,7 @@
 #include "whip-utils.h"
 #include "ppcenter-client.h"
 #include "ppcenter-signal.h"
+#include "nat-probe.h"
 #include "uplink-qos-policy.h"
 
 #include <obs.hpp>
@@ -60,8 +61,6 @@ bool WHIPOutput::Start()
 		multitrack_permanent_failure = false;
 
 	if (!obs_output_can_begin_data_capture(output, 0))
-		return false;
-	if (!obs_output_initialize_encoders(output, 0))
 		return false;
 
 	if (start_stop_thread.joinable())
@@ -252,14 +251,29 @@ bool WHIPOutput::Setup(uint64_t generation)
 		return false;
 	}
 
+	// wantMultitrack only gates whether the HEVC session is additionally
+	// set up and connected below - the publish request itself always asks
+	// ppcenter for codec-tagged WHIP tracks (see
+	// ppcenter_build_publish_json), since every WHIP publish, H264-only
+	// included, lands on the codec-suffixed path (".../h264/whip"),
+	// matching the design doc's §3.1 URL convention.
 	const bool wantMultitrack = multitrackEnabled(output);
 
 	PPCenterPublishRequest request{ppcenter_url,
 				       obs_data_get_string(service_settings, "ppcenter_appid"),
 				       obs_data_get_string(service_settings, "ppcenter_secret"),
 				       obs_data_get_string(service_settings, "ppcenter_stream"),
-				       obs_data_get_string(service_settings, "ppcenter_region"),
-				       wantMultitrack};
+				       obs_data_get_string(service_settings, "ppcenter_region")};
+	request.device_id = GetOrCreateP2PClientId();
+	const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name);
+	if (probe.succeeded) {
+		request.nat_probe_id = probe.probe_id;
+		do_log(LOG_INFO, "P2P publisher NAT probe registered");
+	} else {
+		// NAT probing is an optional P2P optimization. Publishing must
+		// continue normally; ppcenter will naturally choose edge-only.
+		do_log(LOG_WARNING, "P2P publisher NAT probe failed; continuing with edge-only fallback");
+	}
 	PPCenterPublishResponse resp;
 	std::string error;
 	if (!ppcenter_resolve_publish(request, resp, error)) {
@@ -271,6 +285,9 @@ bool WHIPOutput::Setup(uint64_t generation)
 	p2pToken = resp.signal_token;
 	p2pSignalUrl = resp.signal_url;
 	p2pStreamPath = request.app_id + "/" + request.stream_name;
+	p2pStunServers = std::move(resp.stun_servers);
+	if (p2pStunServers.empty())
+		p2pStunServers.emplace_back("stun:stun.l.google.com:19302");
 
 	auto h264Layers = collectVideoLayers(output, "h264");
 	if (h264Layers.empty()) {
@@ -280,8 +297,19 @@ bool WHIPOutput::Setup(uint64_t generation)
 		return false;
 	}
 
-	std::string h264Url = resp.whip_url;
-	std::string h264Token = resp.bearer_token;
+	// H264 always publishes on its codec-tagged track (".../h264/whip"),
+	// never the legacy bare whipUrl/bearerToken - see the design doc's
+	// §3.1 URL convention.
+	auto h264Track = resp.whip_tracks.find("h264");
+	if (h264Track == resp.whip_tracks.end() || h264Track->second.url.empty() ||
+	    h264Track->second.bearer_token.empty()) {
+		do_log(LOG_ERROR, "ppcenter did not return an h264 WHIP track");
+		if (IsActiveGeneration(generation))
+			obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
+		return false;
+	}
+	std::string h264Url = h264Track->second.url;
+	std::string h264Token = h264Track->second.bearer_token;
 
 	std::vector<obs_encoder_t *> hevcLayers;
 	std::string hevcUrl, hevcToken;
@@ -294,23 +322,18 @@ bool WHIPOutput::Setup(uint64_t generation)
 				obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
 			return false;
 		}
-		auto h264Track = resp.whip_tracks.find("h264");
 		auto hevcTrack = resp.whip_tracks.find("hevc");
-		if (h264Track == resp.whip_tracks.end() || h264Track->second.url.empty() ||
-		    h264Track->second.bearer_token.empty() || hevcTrack == resp.whip_tracks.end() ||
-		    hevcTrack->second.url.empty() || hevcTrack->second.bearer_token.empty()) {
+		if (hevcTrack == resp.whip_tracks.end() || hevcTrack->second.url.empty() ||
+		    hevcTrack->second.bearer_token.empty()) {
 			// See the design doc's §3.2: an incomplete whipTracks
-			// response (old ppcenter, or ppcenter rejected the
-			// capability) must not silently fall back to a
+			// response must not silently fall back to a
 			// single-codec publish.
 			do_log(LOG_ERROR,
-			       "HEVC/H264 multitrack requested but ppcenter did not return a complete whipTracks response");
+			       "HEVC/H264 multitrack requested but ppcenter did not return an hevc WHIP track");
 			if (IsActiveGeneration(generation))
 				obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
 			return false;
 		}
-		h264Url = h264Track->second.url;
-		h264Token = h264Track->second.bearer_token;
 		hevcUrl = hevcTrack->second.url;
 		hevcToken = hevcTrack->second.bearer_token;
 	}
@@ -346,12 +369,16 @@ bool WHIPOutput::Setup(uint64_t generation)
 		WHIPCodecSession::Config hevcCfg = h264Cfg;
 		hevcCfg.endpoint_url = hevcUrl;
 		hevcCfg.bearer_token = hevcToken;
-		// Audio already goes out on the H264 session; sending it
-		// twice on the wire for no player-visible benefit would
-		// double the audio bitrate for nothing, since no client ever
-		// plays both codec sessions' audio at once (see the design
-		// doc's §2.2 "codecType" being an exclusive choice).
-		hevcCfg.has_audio = false;
+		// Each codec session is a fully independent WHIP/WHEP path - a
+		// player picks exactly one (h264 or hevc), never both at once
+		// (see the design doc's §2.2 "codecType" being an exclusive
+		// choice), so a player that lands on the hevc path has no
+		// other session to get audio from. has_audio must stay true
+		// here: see the design doc's §4.1 point 5 and §4.2 "音频同时
+		// 发送到两条会话" - both sessions carry their own independent
+		// Opus track, doubling upstream audio bandwidth by design
+		// (§8.4 upline checklist explicitly expects "两份 Opus").
+		hevcCfg.has_audio = true;
 
 		hevcSession = std::make_unique<WHIPCodecSession>(output, "hevc");
 		hevcSession->SetVideoLayers(hevcLayers);
@@ -420,6 +447,25 @@ void WHIPOutput::StartThread(uint64_t generation)
 		return;
 	}
 
+	// Setup can fail for network, credentials, or codec reasons. Initializing
+	// encoders before it succeeds leaves them active even though data capture
+	// never began, so libobs's normal stop path cannot release them and the
+	// Output settings remain disabled. Initialize only after every requested
+	// WHIP session is established.
+	if (!obs_output_initialize_encoders(output, 0)) {
+		if (h264Session) {
+			h264Session->Stop();
+			h264Session.reset();
+		}
+		if (hevcSession) {
+			hevcSession->Stop();
+			hevcSession.reset();
+		}
+		if (IsActiveGeneration(generation))
+			obs_output_signal_stop(output, OBS_OUTPUT_ENCODE_ERROR);
+		return;
+	}
+
 	do_log(LOG_INFO, "WHIPOutput: Started (%s)", hevcSession ? "H264+HEVC multitrack" : "H264 only");
 	StartP2PSignal();
 
@@ -475,7 +521,7 @@ bool WHIPOutput::StartP2PSignal()
 	const char *videoCodec = "h264";
 	const char *audioCodec = "opus";
 	p2pSignal = std::make_unique<P2PSignalClient>(p2pSignalUrl, p2pToken, p2pStreamPath, videoCodec, audioCodec,
-						      generate_random_u32());
+						      generate_random_u32(), p2pStunServers);
 	p2pSignal->Start();
 	qosPolicy = std::make_unique<UplinkQosPolicy>(UplinkQosConfig{});
 	return true;

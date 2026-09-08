@@ -95,6 +95,7 @@ private:
 	std::string p2pToken;
 	std::string p2pSignalUrl;
 	std::string p2pStreamPath;
+	std::vector<std::string> p2pStunServers;
 	std::unique_ptr<UplinkQosPolicy> qosPolicy;
 	int64_t lastQosCheckMs = 0;
 
