@@ -218,6 +218,8 @@ private:
 	void InitStreamPage();
 	bool IsCustomService() const;
 	inline bool IsWHIP() const;
+	bool IsWHIPSimulcast() const;
+	void UpdateWHIPSimulcastControls();
 	void LoadServices(bool showAll);
 	void OnOAuthStreamKeyConnected();
 	void OnAuthConnected();
