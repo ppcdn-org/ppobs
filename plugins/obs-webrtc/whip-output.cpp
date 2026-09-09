@@ -230,6 +230,69 @@ static std::vector<obs_encoder_t *> collectVideoLayers(obs_output_t *output, con
 	return layers;
 }
 
+// ppobs推流限制 (operator-specified limits, not an upstream OBS thing):
+//   1. resolution no higher than 3840x2160 for landscape (width >= height)
+//      or 2160x3840 for portrait - a single hard ceiling that also covers
+//      the 2560x1440 tier the requirement calls out, since anything at or
+//      under 1440p is by definition under this 4K ceiling too.
+//   2. FPS <= 60
+//   3. video bitrate <= 10000 Kbps (10 Mbps)
+//
+// Enforced here - inside WHIPOutput::Setup(), after every video layer
+// encoder has already been assigned - rather than only in the Settings UI,
+// so it applies uniformly no matter how the stream was started (manual
+// button, hotkey, scheduled streaming, or an automatic reconnect) and
+// can't be bypassed by an old profile/service.json that predates this
+// limit. Checked against every layer actually being published (all WHIP
+// Simulcast/HEVC layers), since a lower Simulcast layer inheriting a
+// too-high per-layer override would otherwise slip through.
+namespace {
+constexpr uint32_t kMaxLandscapeWidth = 3840;
+constexpr uint32_t kMaxLandscapeHeight = 2160;
+constexpr uint32_t kMaxPortraitWidth = 2160;
+constexpr uint32_t kMaxPortraitHeight = 3840;
+constexpr double kMaxFps = 60.0;
+constexpr int64_t kMaxVideoBitrateKbps = 10000;
+
+bool checkStreamLimits(const std::vector<obs_encoder_t *> &layers, std::string &error)
+{
+	for (auto *encoder : layers) {
+		if (!encoder)
+			continue;
+
+		const uint32_t width = obs_encoder_get_width(encoder);
+		const uint32_t height = obs_encoder_get_height(encoder);
+		const bool landscape = width >= height;
+		const uint32_t maxWidth = landscape ? kMaxLandscapeWidth : kMaxPortraitWidth;
+		const uint32_t maxHeight = landscape ? kMaxLandscapeHeight : kMaxPortraitHeight;
+		if (width > maxWidth || height > maxHeight) {
+			error = "resolution " + std::to_string(width) + "x" + std::to_string(height) +
+				" exceeds the " + std::to_string(maxWidth) + "x" + std::to_string(maxHeight) +
+				" limit for " + (landscape ? "landscape" : "portrait") + " streams";
+			return false;
+		}
+
+		if (video_t *video = obs_encoder_video(encoder)) {
+			const double fps = video_output_get_frame_rate(video);
+			if (fps > kMaxFps + 0.01) {
+				error = "frame rate " + std::to_string(fps) + " exceeds the " +
+					std::to_string((int)kMaxFps) + " FPS limit";
+				return false;
+			}
+		}
+
+		OBSDataAutoRelease settings = obs_encoder_get_settings(encoder);
+		const int64_t bitrate = obs_data_get_int(settings, "bitrate");
+		if (bitrate > kMaxVideoBitrateKbps) {
+			error = "video bitrate " + std::to_string(bitrate) + " Kbps exceeds the " +
+				std::to_string(kMaxVideoBitrateKbps) + " Kbps limit";
+			return false;
+		}
+	}
+	return true;
+}
+} // namespace
+
 bool WHIPOutput::Setup(uint64_t generation)
 {
 	if (!Init())
@@ -297,6 +360,16 @@ bool WHIPOutput::Setup(uint64_t generation)
 		return false;
 	}
 
+	{
+		std::string limitError;
+		if (!checkStreamLimits(h264Layers, limitError)) {
+			do_log(LOG_ERROR, "H264 stream exceeds ppobs limits: %s", limitError.c_str());
+			if (IsActiveGeneration(generation))
+				obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
+			return false;
+		}
+	}
+
 	// H264 always publishes on its codec-tagged track (".../h264/whip"),
 	// never the legacy bare whipUrl/bearerToken - see the design doc's
 	// §3.1 URL convention.
@@ -321,6 +394,16 @@ bool WHIPOutput::Setup(uint64_t generation)
 			if (IsActiveGeneration(generation))
 				obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
 			return false;
+		}
+
+		{
+			std::string limitError;
+			if (!checkStreamLimits(hevcLayers, limitError)) {
+				do_log(LOG_ERROR, "HEVC stream exceeds ppobs limits: %s", limitError.c_str());
+				if (IsActiveGeneration(generation))
+					obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
+				return false;
+			}
 		}
 		auto hevcTrack = resp.whip_tracks.find("hevc");
 		if (hevcTrack == resp.whip_tracks.end() || hevcTrack->second.url.empty() ||

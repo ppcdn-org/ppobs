@@ -24,6 +24,7 @@
 
 #ifdef _WIN32
 #include <util/windows/win-version.h>
+#include <util/windows/net-adapter-type.h>
 #endif
 
 #ifndef SEC_TO_NSEC
@@ -1125,27 +1126,30 @@ static void win32_log_interface_type(struct rtmp_stream *stream)
 		if (!GetIfEntry2(&row)) {
 			uint32_t rxSpeed = row.ReceiveLinkSpeed / 1000000;
 			uint32_t txSpeed = row.TransmitLinkSpeed / 1000000;
-			char *type;
-			struct dstr other = {0};
 
+			enum net_adapter_type adapter_type;
 			switch (row.PhysicalMediumType) {
 			case NdisPhysicalMedium802_3:
-				type = "ethernet";
+				adapter_type = NET_ADAPTER_TYPE_ETHERNET;
 				break;
 			case NdisPhysicalMediumWirelessLan:
 			case NdisPhysicalMediumNative802_11:
-				type = "802.11";
+				adapter_type = NET_ADAPTER_TYPE_WIFI;
+				break;
+			case NdisPhysicalMediumWirelessWan:
+			case NdisPhysicalMediumWiMax:
+				adapter_type = NET_ADAPTER_TYPE_CELLULAR;
 				break;
 			default:
-				dstr_printf(&other, "type %d", (int)row.PhysicalMediumType);
-				type = other.array;
+				adapter_type = NET_ADAPTER_TYPE_OTHER;
 				break;
 			}
 
 			char *desc;
 			os_wcs_to_utf8_ptr(row.Description, 0, &desc);
 
-			info("Interface: %s (%s, %lu↓/%lu↑ mbps)", desc, type, rxSpeed, txSpeed);
+			info("Interface: %s (%s, %s, %lu↓/%lu↑ mbps)", desc, net_adapter_type_name(adapter_type),
+			     stream->path.array, rxSpeed, txSpeed);
 
 			bfree(desc);
 
@@ -1154,8 +1158,6 @@ static void win32_log_interface_type(struct rtmp_stream *stream)
 				     "/%" PRIu64 " discards)",
 				     row.InErrors, row.OutErrors, row.InDiscards, row.OutDiscards);
 			}
-
-			dstr_free(&other);
 		}
 	}
 }

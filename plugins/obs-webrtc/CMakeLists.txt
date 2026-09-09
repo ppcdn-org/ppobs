@@ -38,9 +38,10 @@ target_link_libraries(
           Asio::Asio
           OpenSSL::SSL
           OpenSSL::Crypto
-          FFmpeg::avcodec
-          FFmpeg::avutil
-          FFmpeg::swscale
+           FFmpeg::avcodec
+           FFmpeg::avutil
+           FFmpeg::swscale
+           $<$<PLATFORM_ID:Windows>:iphlpapi>
 )
 
 set_target_properties_obs(obs-webrtc PROPERTIES FOLDER plugins PREFIX "")

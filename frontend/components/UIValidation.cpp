@@ -9,6 +9,7 @@
 #include "moc_UIValidation.cpp"
 
 static bool HevcMultitrackEncoderAvailable();
+static bool WHIPResolutionFpsWithinLimits(QString &outOfRangeText);
 
 static int CountVideoSources()
 {
@@ -123,6 +124,8 @@ StreamSettingsAction UIValidation::PPCenterFieldsConfirmation(QWidget *parent, O
 	bool missingField = isEmpty("ppcenter_url") || isEmpty("ppcenter_appid") || isEmpty("ppcenter_secret") ||
 			    isEmpty("ppcenter_region");
 
+	QString outOfRangeText;
+
 	QString messageText;
 	if (missingField) {
 		messageText = QTStr("Basic.Settings.Stream.PPCenter.MissingFields");
@@ -134,6 +137,14 @@ StreamSettingsAction UIValidation::PPCenterFieldsConfirmation(QWidget *parent, O
 		// would then have to be aborted per the strong-consistency
 		// start requirement).
 		messageText = QTStr("Basic.Settings.Stream.WHIPHevcH264Multitrack.NoEncoder");
+	} else if (!WHIPResolutionFpsWithinLimits(outOfRangeText)) {
+		// ppobs推流限制: resolution/FPS ceiling (see the matching hard
+		// enforcement in WHIPOutput::Setup(), whip-output.cpp - this is
+		// only the early, user-facing warning; the bitrate leg of the
+		// same limit isn't duplicated here since it depends on which of
+		// Simple/Advanced output mode is active and is already caught
+		// with a clear error at actual stream start).
+		messageText = outOfRangeText;
 	} else {
 		return StreamSettingsAction::ContinueStream;
 	}
@@ -180,4 +191,52 @@ static bool HevcMultitrackEncoderAvailable()
 			return true;
 	}
 	return false;
+}
+
+// ppobs推流限制 §1/§2 (resolution/FPS) early warning - reads the same
+// applied "Video" config values WHIPOutput::Setup() will see once the
+// encoders are actually created (config_get_uint("OutputCX"/"OutputCY")
+// mirrors obs_video_info after main->ResetVideo() has run, and FPS from
+// the same config keys OBSBasicSettings uses). This is advisory only:
+// the authoritative check that can't be bypassed lives in
+// WHIPOutput::Setup() (see checkStreamLimits() there) and covers bitrate
+// too, which this early check does not duplicate.
+static bool WHIPResolutionFpsWithinLimits(QString &outOfRangeText)
+{
+	config_t *config = OBSBasic::Get()->Config();
+
+	const uint32_t cx = config_get_uint(config, "Video", "OutputCX");
+	const uint32_t cy = config_get_uint(config, "Video", "OutputCY");
+	const bool landscape = cx >= cy;
+	const uint32_t maxCx = landscape ? 3840 : 2160;
+	const uint32_t maxCy = landscape ? 2160 : 3840;
+
+	double fps = 30.0;
+	const uint32_t fpsType = config_get_uint(config, "Video", "FPSType");
+	if (fpsType == 1) {
+		fps = (double)config_get_uint(config, "Video", "FPSInt");
+	} else if (fpsType == 2) {
+		const double num = (double)config_get_uint(config, "Video", "FPSNum");
+		const double den = (double)config_get_uint(config, "Video", "FPSDen");
+		if (den > 0)
+			fps = num / den;
+	} else {
+		const char *common = config_get_string(config, "Video", "FPSCommon");
+		if (common)
+			sscanf(common, "%lf", &fps);
+	}
+
+	if (cx > maxCx || cy > maxCy) {
+		QString resStr = QString("%1x%2").arg(QString::number(cx), QString::number(cy));
+		QString limitStr = QString("%1x%2").arg(QString::number(maxCx), QString::number(maxCy));
+		outOfRangeText = QTStr("Basic.Settings.Stream.WHIPResolutionTooHigh").arg(resStr, limitStr);
+		return false;
+	}
+
+	if (fps > 60.01) {
+		outOfRangeText = QTStr("Basic.Settings.Stream.WHIPFpsTooHigh").arg(QString::number(fps, 'g', 4));
+		return false;
+	}
+
+	return true;
 }

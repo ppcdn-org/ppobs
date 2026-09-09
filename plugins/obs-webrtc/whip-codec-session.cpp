@@ -4,6 +4,9 @@
 #include <obs.hpp>
 #include <util/dstr.h>
 #include <util/ntp-clock.h>
+#ifdef _WIN32
+#include <util/windows/net-adapter-type.h>
+#endif
 
 #include <algorithm>
 #include <curl/curl.h>
@@ -22,6 +25,42 @@ constexpr uint8_t audio_payload_type = 111;
 const char *video_mid = "1";
 constexpr uint8_t video_payload_type = 96;
 constexpr int video_nack_buffer_size = 4000;
+
+#ifdef _WIN32
+static void log_whip_network_adapter(const std::string &url)
+{
+	auto scheme_end = url.find("://");
+	if (scheme_end == std::string::npos)
+		return;
+
+	const auto host_start = scheme_end + 3;
+	auto host_end = url.find('/', host_start);
+	std::string authority = url.substr(host_start, host_end == std::string::npos ? std::string::npos
+																	 : host_end - host_start);
+	if (!authority.empty() && authority.front() == '[')
+		return; // The route helper currently resolves IPv4 destinations only.
+	if (auto colon = authority.rfind(':'); colon != std::string::npos)
+		authority.resize(colon);
+	if (authority.empty())
+		return;
+
+	addrinfo hints = {};
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	addrinfo *result = nullptr;
+	if (getaddrinfo(authority.c_str(), nullptr, &hints, &result) != 0 || !result)
+		return;
+
+	const auto *address = reinterpret_cast<const sockaddr_in *>(result->ai_addr);
+	char *description = nullptr;
+	const auto type = net_adapter_type_for_route(address->sin_addr.S_un.S_addr, 0, &description);
+	blog(LOG_INFO, "[obs-webrtc] WHIP network adapter: %s (%s)",
+	     description ? description : "unknown", net_adapter_type_name(type));
+	if (description)
+		bfree(description);
+	freeaddrinfo(result);
+}
+#endif
 
 const std::string rtpHeaderExtUriMid = "urn:ietf:params:rtp-hdrext:sdes:mid";
 const std::string rtpHeaderExtUriRid = "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
@@ -314,6 +353,10 @@ void WHIPCodecSession::ConfigureVideoTrack(const std::string &media_stream_id, c
 
 bool WHIPCodecSession::DoConnect(uint64_t generation, std::string &resourceURL)
 {
+	#ifdef _WIN32
+	log_whip_network_adapter(cfg.endpoint_url);
+	#endif
+
 	rtc::Configuration rtcConfig;
 	std::vector<rtc::IceServer> iceServers;
 	iceServers.emplace_back("stun:stun.l.google.com:19302");
