@@ -229,6 +229,14 @@ private:
 	int prevLangIndex;
 	bool prevBrowserAccel;
 
+	// Custom and WHIP share the same endpoint widget, but each service type
+	// must retain its own endpoint when switching between them.
+	enum class StreamDestinationField { Common, Custom, WHIP };
+	StreamDestinationField lastStreamDestinationField = StreamDestinationField::Common;
+	QString customServiceEndpoint;
+	QString whipServiceEndpoint;
+	void SwapStreamDestinationField();
+
 	/* WHIP Simulcast per-layer resolution/bitrate settings (Settings >
 	 * Stream, below the "Total Layers" spinbox - see
 	 * WHIPSimulcastEncoders.hpp for how these are consumed). One row of

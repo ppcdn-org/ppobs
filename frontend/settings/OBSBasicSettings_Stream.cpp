@@ -169,6 +169,16 @@ void OBSBasicSettings::LoadStream1Settings()
 		ui->customServer->setText(server);
 
 	if (is_rtmp_custom) {
+		customServiceEndpoint = QT_UTF8(server);
+		lastStreamDestinationField = StreamDestinationField::Custom;
+	} else if (is_whip) {
+		whipServiceEndpoint = QT_UTF8(server);
+		lastStreamDestinationField = StreamDestinationField::WHIP;
+	} else {
+		lastStreamDestinationField = StreamDestinationField::Common;
+	}
+
+	if (is_rtmp_custom) {
 		ui->service->setCurrentIndex(0);
 		lastServiceIdx = 0;
 		lastCustomServer = ui->customServer->text();
@@ -932,6 +942,30 @@ static void get_yt_ch_title(Ui::OBSBasicSettings *ui)
 }
 #endif
 
+void OBSBasicSettings::SwapStreamDestinationField()
+{
+	switch (lastStreamDestinationField) {
+	case StreamDestinationField::Custom:
+		customServiceEndpoint = ui->customServer->text();
+		break;
+	case StreamDestinationField::WHIP:
+		whipServiceEndpoint = ui->customServer->text();
+		break;
+	case StreamDestinationField::Common:
+		break;
+	}
+
+	if (IsCustomService()) {
+		ui->customServer->setText(customServiceEndpoint);
+		lastStreamDestinationField = StreamDestinationField::Custom;
+	} else if (IsWHIP()) {
+		ui->customServer->setText(whipServiceEndpoint);
+		lastStreamDestinationField = StreamDestinationField::WHIP;
+	} else {
+		lastStreamDestinationField = StreamDestinationField::Common;
+	}
+}
+
 void OBSBasicSettings::UseStreamKeyAdvClicked()
 {
 	ui->streamKeyWidget->setVisible(true);
@@ -947,6 +981,7 @@ void OBSBasicSettings::on_service_currentIndexChanged(int idx)
 		return;
 	}
 
+	SwapStreamDestinationField();
 	ServiceChanged();
 
 	UpdateMoreInfoLink();
@@ -1830,10 +1865,15 @@ bool OBSBasicSettings::ServiceAndACodecCompatible()
 		codec = obs_get_encoder_codec(QT_TO_UTF8(encoder));
 	}
 
+	// Custom services do not impose a protocol-specific audio codec. Preserve
+	// the encoder selected by the user for custom WHIP, SRT, RIST, or RTMP.
+	if (IsCustomService())
+		return true;
+
 	OBSService service = SpawnTempService();
 	const char **codecs = obs_service_get_supported_audio_codecs(service);
 
-	if (!codecs || IsCustomService()) {
+	if (!codecs) {
 		const char *output;
 		char **output_codecs;
 
@@ -1996,7 +2036,7 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 		vcodecs = (const char **)output_vcodecs.Get();
 	}
 
-	if (!acodecs || IsCustomService()) {
+	if (!acodecs && !IsCustomService()) {
 		const char *output;
 
 		obs_enum_output_types_with_protocol(QT_TO_UTF8(protocol), &output, return_first_id);
