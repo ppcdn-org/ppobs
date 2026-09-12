@@ -99,7 +99,7 @@ static inline bool GetWHIPSimulcastLayerConfig(config_t *config, int layerNum, W
 
 struct WHIPSimulcastEncoders {
 public:
-	explicit WHIPSimulcastEncoders(int maxLayers = 5) : maxLayers(maxLayers) {}
+	explicit WHIPSimulcastEncoders(int maxLayers = 4) : maxLayers(maxLayers) {}
 
 	// config is main->Config() (see AdvancedOutput.cpp/SimpleOutput.cpp
 	// call sites) - read here rather than threaded through as

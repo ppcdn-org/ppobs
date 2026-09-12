@@ -86,8 +86,7 @@ void OBSBasicSettings::UpdateWHIPSimulcastControls()
 	const bool simulcast = IsWHIPSimulcast();
 	ui->whipSimulcastGroupBox->setVisible(simulcast);
 	ui->whipSimulcastGroupBox->setEnabled(simulcast);
-	ui->whipSimulcastTotalLayers->setMaximum(
-		IsCustomService() && protocol.compare("SRT", Qt::CaseInsensitive) == 0 ? 4 : 5);
+	ui->whipSimulcastTotalLayers->setMaximum(4);
 }
 
 void OBSBasicSettings::InitStreamPage()
@@ -273,6 +272,11 @@ void OBSBasicSettings::LoadStream1Settings()
 
 	if (is_whip) {
 		ui->key->setText(bearer_token);
+	} else {
+		ui->key->setText(key);
+	}
+
+	if (is_whip || (is_rtmp_custom && protocol.compare("SRT", Qt::CaseInsensitive) == 0)) {
 		ui->ppcenterGroupBox->show();
 
 		ui->ppcenterUrl->setText(QT_UTF8(obs_data_get_string(settings, "ppcenter_url")));
@@ -289,7 +293,6 @@ void OBSBasicSettings::LoadStream1Settings()
 			region = QStringLiteral("auto");
 		ui->ppcenterRegion->setText(region);
 	} else {
-		ui->key->setText(key);
 		ui->ppcenterGroupBox->hide();
 	}
 	UpdateWHIPSimulcastControls();
@@ -394,10 +397,15 @@ void OBSBasicSettings::SaveStream1Settings()
 		obs_data_set_string(settings, "service", "WHIP");
 		obs_data_set_string(settings, "bearer_token", QT_TO_UTF8(ui->key->text()));
 
-		// PPCenter resolution is unconditional for WHIP - there is no
-		// longer a switch for it in the UI. The flag is still written so
-		// that a service.json saved here keeps working with builds that
-		// predate its removal.
+		// Mirrored into the service settings so the WHIP output can read
+		// it at stream start without reaching into frontend config.
+		obs_data_set_bool(settings, "quality_score", ui->qualityScoreEnable->isChecked());
+	} else {
+		obs_data_set_string(settings, "key", QT_TO_UTF8(ui->key->text()));
+	}
+
+	// PPCenter fields are saved for both WHIP and Custom+SRT services.
+	if (whip || (customServer && protocol.compare("SRT", Qt::CaseInsensitive) == 0)) {
 		obs_data_set_bool(settings, "ppcenter_enabled", true);
 		obs_data_set_string(settings, "ppcenter_url", QT_TO_UTF8(ui->ppcenterUrl->text().trimmed()));
 		obs_data_set_string(settings, "ppcenter_appid", QT_TO_UTF8(ui->ppcenterAppId->text().trimmed()));
@@ -405,12 +413,6 @@ void OBSBasicSettings::SaveStream1Settings()
 		obs_data_set_string(settings, "ppcenter_stream",
 				    QT_TO_UTF8(ParseWHIPStreamNameFromServerUrl(ui->customServer->text())));
 		obs_data_set_string(settings, "ppcenter_region", QT_TO_UTF8(ui->ppcenterRegion->text().trimmed()));
-
-		// Mirrored into the service settings so the WHIP output can read
-		// it at stream start without reaching into frontend config.
-		obs_data_set_bool(settings, "quality_score", ui->qualityScoreEnable->isChecked());
-	} else {
-		obs_data_set_string(settings, "key", QT_TO_UTF8(ui->key->text()));
 	}
 
 	OBSServiceAutoRelease newService = obs_service_create(service_id, "default_service", settings, hotkeyData);
@@ -1007,7 +1009,7 @@ void OBSBasicSettings::on_service_currentIndexChanged(int idx)
 		SwapMultiTrack(QT_TO_UTF8(protocol));
 	}
 
-	if (IsWHIP()) {
+	if (IsWHIP() || (IsCustomService() && protocol.compare("SRT", Qt::CaseInsensitive) == 0)) {
 		ui->ppcenterGroupBox->show();
 	} else {
 		ui->ppcenterGroupBox->hide();
