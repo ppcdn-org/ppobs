@@ -5773,8 +5773,9 @@ void OBSBasicSettings::UpdateMultitrackVideo()
 	// flexibility, so just disable everything while outputs are active.
 	auto toggle_available = !main->Active();
 
-	// FIXME: protocol is not updated properly for WHIP; what do?
-	auto available = protocol.startsWith("RTMP");
+	// Custom services use the RTMP output protocol for compatibility, but do
+	// not expose the separate multitrack-video service configuration here.
+	auto available = protocol.startsWith("RTMP") && !IsCustomService();
 
 	if (available && !IsCustomService()) {
 		OBSDataAutoRelease settings = obs_data_create();

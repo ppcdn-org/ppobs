@@ -78,7 +78,7 @@ inline bool OBSBasicSettings::IsWHIP() const
 
 bool OBSBasicSettings::IsWHIPSimulcast() const
 {
-	return IsWHIP() || (IsCustomService() && protocol.compare("SRT", Qt::CaseInsensitive) == 0);
+	return IsWHIP() || IsCustomService();
 }
 
 void OBSBasicSettings::UpdateWHIPSimulcastControls()
@@ -276,7 +276,7 @@ void OBSBasicSettings::LoadStream1Settings()
 		ui->key->setText(key);
 	}
 
-	if (is_whip || (is_rtmp_custom && protocol.compare("SRT", Qt::CaseInsensitive) == 0)) {
+	if (is_whip || is_rtmp_custom) {
 		ui->ppcenterGroupBox->show();
 
 		ui->ppcenterUrl->setText(QT_UTF8(obs_data_get_string(settings, "ppcenter_url")));
@@ -405,7 +405,7 @@ void OBSBasicSettings::SaveStream1Settings()
 	}
 
 	// PPCenter fields are saved for both WHIP and Custom+SRT services.
-	if (whip || (customServer && protocol.compare("SRT", Qt::CaseInsensitive) == 0)) {
+	if (whip || customServer) {
 		obs_data_set_bool(settings, "ppcenter_enabled", true);
 		obs_data_set_string(settings, "ppcenter_url", QT_TO_UTF8(ui->ppcenterUrl->text().trimmed()));
 		obs_data_set_string(settings, "ppcenter_appid", QT_TO_UTF8(ui->ppcenterAppId->text().trimmed()));
@@ -1009,7 +1009,7 @@ void OBSBasicSettings::on_service_currentIndexChanged(int idx)
 		SwapMultiTrack(QT_TO_UTF8(protocol));
 	}
 
-	if (IsWHIP() || (IsCustomService() && protocol.compare("SRT", Qt::CaseInsensitive) == 0)) {
+	if (IsWHIP() || IsCustomService()) {
 		ui->ppcenterGroupBox->show();
 	} else {
 		ui->ppcenterGroupBox->hide();

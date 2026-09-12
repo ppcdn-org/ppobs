@@ -3,9 +3,22 @@
 
 struct rtmp_custom {
 	char *server, *key;
+	char *ppcenter_appid;
 	bool use_auth;
 	char *username, *password;
 };
+
+static char *expand_ppcenter_appid(const char *server, const char *app_id)
+{
+	static const char placeholder[] = "{ppcenter_appid}";
+	struct dstr url = {0};
+
+	dstr_copy(&url, server ? server : "");
+	if (app_id && *app_id)
+		dstr_replace(&url, placeholder, app_id);
+
+	return url.array;
+}
 
 static const char *rtmp_custom_name(void *unused)
 {
@@ -19,10 +32,12 @@ static void rtmp_custom_update(void *data, obs_data_t *settings)
 
 	bfree(service->server);
 	bfree(service->key);
+	bfree(service->ppcenter_appid);
 	bfree(service->username);
 	bfree(service->password);
 
-	service->server = bstrdup(obs_data_get_string(settings, "server"));
+	service->ppcenter_appid = bstrdup(obs_data_get_string(settings, "ppcenter_appid"));
+	service->server = expand_ppcenter_appid(obs_data_get_string(settings, "server"), service->ppcenter_appid);
 	service->key = bstrdup(obs_data_get_string(settings, "key"));
 	service->use_auth = obs_data_get_bool(settings, "use_auth");
 	service->username = bstrdup(obs_data_get_string(settings, "username"));
@@ -35,6 +50,7 @@ static void rtmp_custom_destroy(void *data)
 
 	bfree(service->server);
 	bfree(service->key);
+	bfree(service->ppcenter_appid);
 	bfree(service->username);
 	bfree(service->password);
 	bfree(service);
