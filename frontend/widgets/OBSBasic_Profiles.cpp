@@ -579,12 +579,27 @@ void OBSBasic::on_actionImportProfile_triggered()
 			return;
 		}
 
-		const std::array<std::pair<std::string, bool>, 4> profileFiles{{
+		std::vector<std::pair<std::string, bool>> profileFiles{
 			{"basic.ini", true},
 			{"service.json", false},
 			{"streamEncoder.json", false},
 			{"recordEncoder.json", false},
-		}};
+		};
+
+		// Advanced-output encoder settings live in per-encoder files
+		// (see EncoderJsonFileName) whose names depend on which
+		// encoders the profile has used, so they can't be listed
+		// up front the way the fixed files above can - omitting them
+		// would import a profile whose advanced encoder settings
+		// silently fall back to the legacy shared file.
+		for (const auto &entry : std::filesystem::directory_iterator(sourcePath)) {
+			if (!entry.is_regular_file())
+				continue;
+
+			const std::string name = entry.path().filename().u8string();
+			if (name.rfind("streamEncoder_", 0) == 0 || name.rfind("recordEncoder_", 0) == 0)
+				profileFiles.emplace_back(name, false);
+		}
 
 		for (auto &[file, isMandatory] : profileFiles) {
 			const std::filesystem::path sourceFile = sourcePath / std::filesystem::u8path(file);
@@ -622,11 +637,23 @@ void OBSBasic::on_actionExportProfile_triggered()
 
 	const QString destinationDirectory = SelectDirectory(this, QTStr("Basic.MainMenu.Profile.Export"), home);
 
-	const std::array<std::string, 4> profileFiles{"basic.ini", "service.json", "streamEncoder.json",
-						      "recordEncoder.json"};
+	std::vector<std::string> profileFiles{"basic.ini", "service.json", "streamEncoder.json", "recordEncoder.json"};
 
 	if (!destinationDirectory.isEmpty() && !destinationDirectory.isNull()) {
 		const std::filesystem::path sourcePath = currentProfile.path;
+
+		// Same per-encoder settings files the import side picks up -
+		// see the comment there for why they can't be listed
+		// statically.
+		for (const auto &entry : std::filesystem::directory_iterator(sourcePath)) {
+			if (!entry.is_regular_file())
+				continue;
+
+			const std::string name = entry.path().filename().u8string();
+			if (name.rfind("streamEncoder_", 0) == 0 || name.rfind("recordEncoder_", 0) == 0)
+				profileFiles.push_back(name);
+		}
+
 		const std::filesystem::path destinationPath =
 			std::filesystem::u8path(destinationDirectory.toStdString()) /
 			std::filesystem::u8path(currentProfile.directoryName);
