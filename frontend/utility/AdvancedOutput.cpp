@@ -3,6 +3,7 @@
 #include <abs-ts.h>
 #include <utility/audio-encoders.hpp>
 #include <utility/EncoderSettingsFile.hpp>
+#include <utility/PublishCodecCheck.hpp>
 #include <utility/StartMultiTrackVideoStreamingGuard.hpp>
 #include <widgets/OBSBasic.hpp>
 
@@ -185,7 +186,18 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	}
 
 	if (whipSimulcastEncoders != nullptr) {
-		whipSimulcastEncoders->Create(streamEncoder, streamEncSettings,
+		// The Simulcast ladder normally follows whatever codec the user
+		// picked as the stream encoder. With HEVC/H264 multitrack on,
+		// the HEVC ladder is built separately below, so this one has to
+		// stay H264 - otherwise picking HEVC as the stream encoder
+		// produces two HEVC ladders and no H264 at all, which is both
+		// double the encoding work and a publish no H264 player can
+		// consume.
+		std::string simulcastEncoder = streamEncoder;
+		if (whipHevcEncoders != nullptr)
+			simulcastEncoder = ResolveWHIPH264EncoderId(streamEncoder);
+
+		whipSimulcastEncoders->Create(simulcastEncoder.c_str(), streamEncSettings,
 					      config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 					      config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 					      video_output_get_width(obs_get_video()),
@@ -780,6 +792,21 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 
 bool AdvancedOutput::StartStreaming(obs_service_t *service)
 {
+	// A codec-pinned publish path is only enforced by the server once the
+	// stream's codec becomes visible to it, which for SRT is after the
+	// connection is up - OBS would otherwise see a working connection drop
+	// and retry forever, with no local explanation. Fail here instead.
+	const char *serverURL = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
+	if (std::string err = CheckPublishCodecMatchesURL(
+		    serverURL ? serverURL : "",
+		    obs_get_encoder_codec(config_get_string(main->Config(), "AdvOut", "Encoder")),
+		    whipHevcEncoders != nullptr);
+	    !err.empty()) {
+		lastError = err;
+		blog(LOG_ERROR, "%s", err.c_str());
+		return false;
+	}
+
 	obs_output_set_service(streamOutput, service);
 
 	bool reconnect = config_get_bool(main->Config(), "Output", "Reconnect");

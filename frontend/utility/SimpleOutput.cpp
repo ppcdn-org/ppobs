@@ -2,6 +2,7 @@
 
 #include <abs-ts.h>
 #include <utility/audio-encoders.hpp>
+#include <utility/PublishCodecCheck.hpp>
 #include <utility/StartMultiTrackVideoStreamingGuard.hpp>
 #include <widgets/OBSBasic.hpp>
 
@@ -78,7 +79,14 @@ void SimpleOutput::LoadStreamingPreset_Lossy(const char *encoderId)
 	obs_encoder_release(videoStreaming);
 
 	if (whipSimulcastEncoders != nullptr) {
-		whipSimulcastEncoders->Create(encoderId, nullptr,
+		// See AdvancedOutput::CreateStreamingEncoders: with multitrack
+		// on, this ladder must stay H264 so the HEVC ladder built below
+		// is the only HEVC one.
+		std::string simulcastEncoder = encoderId;
+		if (whipHevcEncoders != nullptr)
+			simulcastEncoder = ResolveWHIPH264EncoderId(encoderId);
+
+		whipSimulcastEncoders->Create(simulcastEncoder.c_str(), nullptr,
 					      config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 					      config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 					      video_output_get_width(obs_get_video()),
@@ -718,6 +726,18 @@ void SimpleOutput::SetupVodTrack(obs_service_t *service)
 
 bool SimpleOutput::StartStreaming(obs_service_t *service)
 {
+	// See AdvancedOutput::StartStreaming for why this is checked here
+	// rather than left to the server to reject mid-connection.
+	const char *serverURL = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
+	if (std::string err = CheckPublishCodecMatchesURL(serverURL ? serverURL : "",
+							  obs_encoder_get_codec(videoStreaming),
+							  whipHevcEncoders != nullptr);
+	    !err.empty()) {
+		lastError = err;
+		blog(LOG_ERROR, "%s", err.c_str());
+		return false;
+	}
+
 	bool reconnect = config_get_bool(main->Config(), "Output", "Reconnect");
 	int retryDelay = config_get_uint(main->Config(), "Output", "RetryDelay");
 	int maxRetries = config_get_uint(main->Config(), "Output", "MaxRetries");
