@@ -41,6 +41,67 @@ inline std::string PublishCodecFromURL(const std::string &url)
 	return std::string();
 }
 
+// WithPublishCodec returns url with its publish path ending in /<codec>,
+// replacing an existing codec segment or appending one when there is none.
+//
+// The publish path isn't always the URL's own path: a SRT URL carries it
+// inside the streamid parameter ("srt://host:port?streamid=publish:app/name"),
+// where the surrounding query syntax has to be respected or the segment ends
+// up in the host part instead. The streamid value runs to the next '&', and
+// may itself end in ",token=..." or ":query" fields that must stay after the
+// codec segment - so the insertion point is the end of the *pathname*, not
+// the end of the value.
+inline std::string WithPublishCodec(const std::string &url, const std::string &codec)
+{
+	if (codec.empty())
+		return url;
+
+	// Replace an existing segment in place, keeping whatever follows it.
+	const std::string existing = PublishCodecFromURL(url);
+	if (!existing.empty()) {
+		const size_t at = url.rfind("/" + existing);
+		return url.substr(0, at) + "/" + codec + url.substr(at + 1 + existing.size());
+	}
+
+	// Locate the publish path: the streamid value when there is one,
+	// otherwise the URL's own path.
+	size_t pathStart, pathEnd;
+	const size_t sid = url.find("streamid=");
+	if (sid != std::string::npos) {
+		pathStart = sid + strlen("streamid=");
+		pathEnd = url.find('&', pathStart);
+		if (pathEnd == std::string::npos)
+			pathEnd = url.size();
+
+		// A streamid may append extra fields after the pathname,
+		// separated by ',' (the "#!::" form's key=value list) or ':'
+		// (the "action:path:query" form). Stop at whichever comes
+		// first so the codec stays part of the pathname - but skip the
+		// leading "publish:"/"read:" action, whose ':' is not a field
+		// separator.
+		size_t scan = pathStart;
+		const size_t action = url.find(':', pathStart);
+		if (action != std::string::npos && action < pathEnd)
+			scan = action + 1;
+
+		const size_t field = url.find_first_of(",:", scan);
+		if (field != std::string::npos && field < pathEnd)
+			pathEnd = field;
+	} else {
+		pathStart = url.find("://");
+		pathStart = (pathStart == std::string::npos) ? 0 : pathStart + 3;
+		pathStart = url.find('/', pathStart);
+		if (pathStart == std::string::npos)
+			return url; // no path to extend
+
+		pathEnd = url.find_first_of("?#", pathStart);
+		if (pathEnd == std::string::npos)
+			pathEnd = url.size();
+	}
+
+	return url.substr(0, pathEnd) + "/" + codec + url.substr(pathEnd);
+}
+
 // StreamTransportIsSingleCodec reports whether a service's transport can
 // only carry one video codec per connection. MPEG-TS (SRT/RIST/UDP) muxes
 // every video encoder into one program and rejects a mix (see
@@ -69,20 +130,16 @@ inline std::string CheckPublishCodecMatchesURL(const std::string &url, const cha
 	const std::string codec = streamCodec ? streamCodec : "";
 
 	// Multitrack builds an H264 ladder and a HEVC ladder. On a single-codec
-	// transport they go out as two connections (see
-	// BasicOutputHandler::hevcStreamOutput), this one carrying H264 and a
-	// companion carrying HEVC. The companion's URL is derived by swapping
-	// the codec segment, so the configured URL has to name one - otherwise
-	// both connections would publish to the same path.
-	if (multitrack && singleCodecTransport) {
-		if (urlCodec.empty()) {
-			return "HEVC/H264 multitrack publishes each codec on its own connection, so the stream URL "
-			       "needs a /h264 segment to tell them apart. Add /h264 to the end of the stream path.";
-		}
-		if (urlCodec == "hevc") {
-			return "The stream URL is pinned to hevc, but with HEVC/H264 multitrack the HEVC ladder is "
-			       "published on its own connection and this one carries H264. Use /h264 instead.";
-		}
+	// transport they go out as two connections, each publishing to its own
+	// /h264 or /hevc path derived from this URL (see WithPublishCodec), so
+	// the configured URL needs no codec segment of its own. One pinned to
+	// a codec is still accepted - it just fixes which path the pair is
+	// derived from - but pinning to hevc would be misleading, since it's
+	// the H264 half that this URL's own connection carries.
+	if (multitrack && singleCodecTransport && urlCodec == "hevc") {
+		return "The stream URL is pinned to hevc, but with HEVC/H264 multitrack each codec is published "
+		       "on its own connection - the /h264 and /hevc paths are derived automatically. Drop the "
+		       "/hevc segment from the URL.";
 	}
 
 	// The main encoder feeds the H264 ladder whenever multitrack is on

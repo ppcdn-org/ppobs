@@ -242,42 +242,23 @@ static void OBSCompanionStopStreaming(void *data, calldata_t *params)
 		obs_output_stop(output->streamOutput);
 }
 
-// BuildCompanionServiceSettings copies the primary service's settings and
-// rewrites the publish URL's codec segment, which is the only thing that
-// differs between the two publishes.
-static OBSDataAutoRelease BuildCompanionServiceSettings(obs_service_t *primary, const char *codec)
+// BuildCodecServiceSettings copies a service's settings and points the
+// publish URL at that codec's own path, which is the only thing that differs
+// between the two connections of a multitrack publish.
+static OBSDataAutoRelease BuildCodecServiceSettings(obs_service_t *primary, const char *codec)
 {
 	OBSDataAutoRelease settings = obs_service_get_settings(primary);
 	if (!settings)
 		return nullptr;
 
-	// Re-derive from the *configured* server string rather than the
-	// resolved URL, so a placeholder like {ppcenter_appid} is expanded once
-	// by the service itself instead of being baked in here.
+	// Derived from the *configured* server string rather than the resolved
+	// URL, so a placeholder like {ppcenter_appid} is expanded once by the
+	// service itself instead of being baked in here.
 	const char *server = obs_data_get_string(settings, "server");
 	if (!server || !*server)
 		return nullptr;
 
-	std::string url = server;
-	const std::string existing = PublishCodecFromURL(url);
-	if (existing.empty()) {
-		// The publish path has to already name a codec for the two
-		// connections to land on different paths. For SRT the path
-		// lives inside the streamid, so there is no reliable place to
-		// append one here - a naive insert before the query string
-		// lands in the host part instead.
-		blog(LOG_ERROR,
-		     "HEVC multitrack: the stream URL has no /h264 or /hevc segment, so the HEVC publish would "
-		     "collide with the H264 one. Add /h264 to the stream URL.");
-		return nullptr;
-	}
-
-	// Replace the trailing codec segment, keeping anything after it
-	// (a token in the streamid's third field, query parameters, ...).
-	const size_t at = url.rfind("/" + existing);
-	url = url.substr(0, at) + "/" + codec + url.substr(at + 1 + existing.size());
-
-	obs_data_set_string(settings, "server", url.c_str());
+	obs_data_set_string(settings, "server", WithPublishCodec(server, codec).c_str());
 	return settings;
 }
 
@@ -293,6 +274,7 @@ void BasicOutputHandler::SetupCompanionStream(const char *outputType)
 		hevcStopStreaming.Disconnect();
 		hevcStreamOutput = nullptr;
 		hevcStreamService = nullptr;
+		h264StreamService = nullptr;
 		return;
 	}
 
@@ -300,15 +282,24 @@ void BasicOutputHandler::SetupCompanionStream(const char *outputType)
 		return;
 
 	obs_service_t *primary = main->GetService();
-	OBSDataAutoRelease settings = BuildCompanionServiceSettings(primary, "hevc");
-	if (!settings) {
-		blog(LOG_ERROR, "HEVC multitrack: could not derive the HEVC publish URL from the service");
+
+	// Both halves publish to their own codec path, derived from the one
+	// configured URL - the user configures a single stream path and does
+	// not have to know the pair exists.
+	OBSDataAutoRelease h264Settings = BuildCodecServiceSettings(primary, "h264");
+	OBSDataAutoRelease settings = BuildCodecServiceSettings(primary, "hevc");
+	if (!h264Settings || !settings) {
+		blog(LOG_ERROR, "HEVC multitrack: could not derive the per-codec publish URLs from the service");
 		return;
 	}
 
+	h264StreamService = obs_service_create(obs_service_get_id(primary), "h264_stream_service", h264Settings,
+					       nullptr);
 	hevcStreamService = obs_service_create(obs_service_get_id(primary), "hevc_stream_service", settings, nullptr);
-	if (!hevcStreamService) {
-		blog(LOG_ERROR, "HEVC multitrack: failed to create the HEVC publish service");
+	if (!h264StreamService || !hevcStreamService) {
+		blog(LOG_ERROR, "HEVC multitrack: failed to create the per-codec publish services");
+		h264StreamService = nullptr;
+		hevcStreamService = nullptr;
 		return;
 	}
 
@@ -316,6 +307,7 @@ void BasicOutputHandler::SetupCompanionStream(const char *outputType)
 	if (!hevcStreamOutput) {
 		blog(LOG_ERROR, "HEVC multitrack: failed to create the HEVC publish output");
 		hevcStreamService = nullptr;
+		h264StreamService = nullptr;
 		return;
 	}
 

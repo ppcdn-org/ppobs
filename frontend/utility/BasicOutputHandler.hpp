@@ -65,6 +65,10 @@ struct BasicOutputHandler {
 	// URL's codec segment.
 	OBSOutputAutoRelease hevcStreamOutput;
 	OBSServiceAutoRelease hevcStreamService;
+	// The primary output's service while multitrack is on: the configured
+	// service with /h264 appended, so both halves publish to their own
+	// codec path without the user having to spell either one out.
+	OBSServiceAutoRelease h264StreamService;
 	OBSSignal hevcStopStreaming;
 	// Set while StopStreaming is tearing the pair down on purpose, so the
 	// companion's own "stop" signal isn't mistaken for a failure that

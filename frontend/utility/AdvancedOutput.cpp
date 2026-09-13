@@ -823,7 +823,10 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 		return false;
 	}
 
-	obs_output_set_service(streamOutput, service);
+	// With multitrack on a single-codec transport this publish carries the
+	// H264 half, and publishes to its own /h264 path rather than the
+	// configured one (see SetupCompanionStream).
+	obs_output_set_service(streamOutput, h264StreamService ? h264StreamService.Get() : service);
 
 	bool reconnect = config_get_bool(main->Config(), "Output", "Reconnect");
 	int retryDelay = config_get_int(main->Config(), "Output", "RetryDelay");
