@@ -247,7 +247,15 @@ static void OBSCompanionStopStreaming(void *data, calldata_t *params)
 // between the two connections of a multitrack publish.
 static OBSDataAutoRelease BuildCodecServiceSettings(obs_service_t *primary, const char *codec)
 {
-	OBSDataAutoRelease settings = obs_service_get_settings(primary);
+	// obs_service_get_settings hands back the service's own live settings
+	// object, not a copy, so this has to duplicate before rewriting -
+	// otherwise each call mutates the configured service (and the previous
+	// call's result, since they'd all be the same object).
+	OBSDataAutoRelease original = obs_service_get_settings(primary);
+	if (!original)
+		return nullptr;
+
+	OBSDataAutoRelease settings = obs_data_create_from_json(obs_data_get_json(original));
 	if (!settings)
 		return nullptr;
 
