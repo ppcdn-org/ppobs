@@ -926,12 +926,20 @@ static bool setup_video_settings(struct ffmpeg_output *stream, struct ffmpeg_cfg
 		obs_data_release(settings);
 	}
 
+	/* Every layer of a simulcast ladder must use the same codec. Mixing
+	 * them is rejected rather than muxed: the receiving server builds one
+	 * ABR ladder per path from a single codec, so the layers of whichever
+	 * codec lost would be silently discarded there. Publishing HEVC and
+	 * H264 together is done with two separate outputs, each carrying its
+	 * own single-codec ladder. */
 	if (video_encoder_count > 1) {
+		const char *first_codec = obs_encoder_get_codec(first_vencoder);
+
 		for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++) {
-			if (config->video_encoders[i] && strcmp(config->video_encoders[i], "h264") != 0) {
-				const char *error = "MPEG-TS simulcast requires H264 for every video encoder";
-				blog(LOG_ERROR, "[ffmpeg mpegts muxer]: %s (encoder %zu is '%s')", error, i,
-				     config->video_encoders[i]);
+			if (config->video_encoders[i] && strcmp(config->video_encoders[i], first_codec) != 0) {
+				const char *error = "MPEG-TS simulcast requires one video codec for every encoder";
+				blog(LOG_ERROR, "[ffmpeg mpegts muxer]: %s (encoder %zu is '%s', expected '%s')",
+				     error, i, config->video_encoders[i], first_codec);
 				obs_output_set_last_error(stream->output, error);
 				*code = OBS_OUTPUT_ERROR;
 				return false;
@@ -939,7 +947,12 @@ static bool setup_video_settings(struct ffmpeg_output *stream, struct ffmpeg_cfg
 		}
 	}
 	config->video_encoder = obs_encoder_get_codec(first_vencoder);
-	config->video_encoder_id = strcmp(config->video_encoder, "h264") == 0 ? AV_CODEC_ID_H264 : AV_CODEC_ID_AV1;
+	if (strcmp(config->video_encoder, "h264") == 0)
+		config->video_encoder_id = AV_CODEC_ID_H264;
+	else if (strcmp(config->video_encoder, "hevc") == 0)
+		config->video_encoder_id = AV_CODEC_ID_HEVC;
+	else
+		config->video_encoder_id = AV_CODEC_ID_AV1;
 
 	/* c) set video format from OBS to FFmpeg */
 	video_t *video = obs_encoder_video(first_vencoder);
@@ -1278,12 +1291,16 @@ static inline int64_t rescale_ts2(AVStream *stream, AVRational codec_time_base, 
 				AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
 }
 
-/* Normalize hardware-encoder H.264 for FFmpeg's MPEG-TS writer. Some first
- * access units contain legal Annex-B leading_zero_8bits that its strict start
- * code check rejects; others can use AVCC even when later units are Annex-B.
- * Strip the former and convert the latter in place (both formats spend four
- * bytes on each NAL delimiter). */
-static bool h264_packet_to_annexb(AVPacket *packet)
+/* Normalize hardware-encoder H.264/HEVC for FFmpeg's MPEG-TS writer. Some
+ * first access units contain legal Annex-B leading_zero_8bits that its strict
+ * start code check rejects; others can use AVCC even when later units are
+ * Annex-B. Strip the former and convert the latter in place (both formats
+ * spend four bytes on each NAL delimiter).
+ *
+ * Applies to HEVC unchanged: this only rewrites the delimiters between NALs,
+ * never the NAL headers themselves, so HEVC's two-byte header is irrelevant
+ * here. */
+static bool nal_packet_to_annexb(AVPacket *packet)
 {
 	if (packet->size < 4)
 		return false;
@@ -1362,8 +1379,11 @@ void mpegts_write_packet(struct ffmpeg_output *stream, struct encoder_packet *en
 		goto fail;
 	}
 	memcpy(packet->data, encpacket->data, encpacket->size);
-	if (is_video && avstream->codecpar->codec_id == AV_CODEC_ID_H264 && !h264_packet_to_annexb(packet)) {
-		error("Invalid H264 access unit: neither Annex-B nor valid 4-byte-length AVCC");
+	if (is_video &&
+	    (avstream->codecpar->codec_id == AV_CODEC_ID_H264 || avstream->codecpar->codec_id == AV_CODEC_ID_HEVC) &&
+	    !nal_packet_to_annexb(packet)) {
+		error("Invalid %s access unit: neither Annex-B nor valid 4-byte-length AVCC",
+		      avstream->codecpar->codec_id == AV_CODEC_ID_H264 ? "H264" : "HEVC");
 		goto fail;
 	}
 	packet->stream_index = avstream->id;

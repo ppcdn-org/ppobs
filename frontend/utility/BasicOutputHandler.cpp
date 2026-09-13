@@ -245,7 +245,11 @@ BasicOutputHandler::BasicOutputHandler(OBSBasic *main_) : main(main_)
 	if ((is_whip || is_srt_custom) && configured_layers > 1)
 		whipSimulcastEncoders = make_unique<WHIPSimulcastEncoders>(4);
 
-	if (config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack"))
+	// Same protocol gate as the Simulcast encoders above: only WHIP and
+	// custom SRT can carry a second codec's ladder. Without it the HEVC
+	// encoders were created for every service and attached to the output,
+	// which an RTMP/MPEG-TS muxer then rejected outright.
+	if ((is_whip || is_srt_custom) && config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack"))
 		whipHevcEncoders = make_unique<WHIPHevcEncoders>();
 }
 
