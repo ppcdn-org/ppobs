@@ -797,10 +797,12 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	// connection is up - OBS would otherwise see a working connection drop
 	// and retry forever, with no local explanation. Fail here instead.
 	const char *serverURL = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
+	const char *streamProtocol = obs_service_get_protocol(service);
+	const bool singleCodecTransport = !streamProtocol || astrcmpi(streamProtocol, "WHIP") != 0;
 	if (std::string err = CheckPublishCodecMatchesURL(
 		    serverURL ? serverURL : "",
 		    obs_get_encoder_codec(config_get_string(main->Config(), "AdvOut", "Encoder")),
-		    whipHevcEncoders != nullptr);
+		    whipHevcEncoders != nullptr, singleCodecTransport);
 	    !err.empty()) {
 		lastError = err;
 		blog(LOG_ERROR, "%s", err.c_str());

@@ -42,32 +42,38 @@ inline std::string PublishCodecFromURL(const std::string &url)
 }
 
 // CheckPublishCodecMatchesURL returns an error message when the configured
-// encoders can't satisfy the codec the URL pins, or an empty string when the
-// combination is publishable.
+// encoders can't produce a publishable stream for this URL, or an empty
+// string when the combination is fine.
 //
 // streamCodec is the main stream encoder's codec ("h264"/"hevc"/...);
 // multitrack says whether HEVC/H264 multitrack is enabled, which adds a
-// second codec's ladder to the same output.
-inline std::string CheckPublishCodecMatchesURL(const std::string &url, const char *streamCodec, bool multitrack)
+// second codec's ladder alongside the first; singleCodecTransport says
+// whether the transport can only carry one video codec per connection
+// (MPEG-TS over SRT can't - see obs-ffmpeg-mpegts.c's encoder check).
+inline std::string CheckPublishCodecMatchesURL(const std::string &url, const char *streamCodec, bool multitrack,
+					       bool singleCodecTransport)
 {
 	const std::string urlCodec = PublishCodecFromURL(url);
-	if (urlCodec.empty())
-		return std::string();
-
 	const std::string codec = streamCodec ? streamCodec : "";
 
-	// Multitrack puts both codecs' ladders on one output, which a
-	// codec-pinned path rejects whichever way it's pinned: it carries the
-	// wrong codec's layers either way, and the layer count doubles.
-	// Publishing both codecs needs one output per codec path.
-	if (multitrack) {
+	// Multitrack builds an H264 ladder and a HEVC ladder. Both end up on
+	// one connection here, which a single-codec transport rejects outright
+	// and a codec-pinned path can only half-satisfy - either way the
+	// publish can't succeed. Publishing both codecs needs one output per
+	// codec path, which this output model doesn't do yet.
+	if (multitrack && singleCodecTransport) {
+		return "HEVC/H264 multitrack publishes two codecs, but this stream's transport carries only one "
+		       "video codec per connection. Turn multitrack off, or publish over WHIP.";
+	}
+
+	if (multitrack && !urlCodec.empty()) {
 		return "The stream URL is pinned to " + urlCodec +
 		       " but HEVC/H264 multitrack is enabled, which publishes both codecs on one connection. "
 		       "Turn multitrack off, or remove the /" +
 		       urlCodec + " segment from the URL.";
 	}
 
-	if (codec != urlCodec) {
+	if (!urlCodec.empty() && codec != urlCodec) {
 		return "The stream URL is pinned to " + urlCodec + " but the stream encoder is " +
 		       (codec.empty() ? std::string("not set") : codec) + ". Pick a " + urlCodec +
 		       " encoder, or change the /" + urlCodec + " segment in the URL.";
