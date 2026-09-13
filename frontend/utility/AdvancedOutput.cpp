@@ -745,21 +745,37 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 			outputType = type;
 		}
 
+		// Multitrack over a transport that carries one video codec per
+		// connection needs a second publish for the HEVC ladder - see
+		// BasicOutputHandler::hevcStreamOutput. WHIP negotiates both
+		// codecs within one session and needs none of this.
+		SetupCompanionStream(type.c_str());
+
 		obs_output_set_video_encoder(streamOutput, videoStreaming);
 		if (whipSimulcastEncoders != nullptr) {
 			whipSimulcastEncoders->SetStreamOutput(streamOutput);
 		}
 		if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
-			// HEVC's ladder starts right after H264's own slots (main +
-			// its Simulcast layers) - see collectVideoLayers() in
-			// whip-output.cpp, which tells the two codecs' layers apart
-			// purely by obs_encoder_get_codec(), not by slot range, so
-			// the exact boundary here only has to avoid colliding with
-			// H264's slots, not match any fixed convention.
-			uint32_t h264SlotCount = whipSimulcastEncoders ? (uint32_t)config_get_int(main->Config(), "Stream1",
-												  "WHIPSimulcastTotalLayers")
-									: 1;
-			whipHevcEncoders->SetStreamOutput(streamOutput, h264SlotCount);
+			if (hevcStreamOutput) {
+				// Single-codec transport: the HEVC ladder goes on
+				// its own output/connection, starting at slot 0
+				// since it shares nothing with the H264 one.
+				whipHevcEncoders->SetStreamOutput(hevcStreamOutput, 0);
+				obs_output_set_audio_encoder(hevcStreamOutput, streamAudioEnc, 0);
+			} else {
+				// HEVC's ladder starts right after H264's own slots (main +
+				// its Simulcast layers) - see collectVideoLayers() in
+				// whip-output.cpp, which tells the two codecs' layers apart
+				// purely by obs_encoder_get_codec(), not by slot range, so
+				// the exact boundary here only has to avoid colliding with
+				// H264's slots, not match any fixed convention.
+				uint32_t h264SlotCount =
+					whipSimulcastEncoders
+						? (uint32_t)config_get_int(main->Config(), "Stream1",
+									   "WHIPSimulcastTotalLayers")
+						: 1;
+				whipHevcEncoders->SetStreamOutput(streamOutput, h264SlotCount);
+			}
 		}
 		if (whipH264Base) {
 			// Placed after the Simulcast/HEVC ladders so it cannot
@@ -797,12 +813,10 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	// connection is up - OBS would otherwise see a working connection drop
 	// and retry forever, with no local explanation. Fail here instead.
 	const char *serverURL = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
-	const char *streamProtocol = obs_service_get_protocol(service);
-	const bool singleCodecTransport = !streamProtocol || astrcmpi(streamProtocol, "WHIP") != 0;
 	if (std::string err = CheckPublishCodecMatchesURL(
 		    serverURL ? serverURL : "",
 		    obs_get_encoder_codec(config_get_string(main->Config(), "AdvOut", "Encoder")),
-		    whipHevcEncoders != nullptr, singleCodecTransport);
+		    whipHevcEncoders != nullptr, StreamTransportIsSingleCodec(service));
 	    !err.empty()) {
 		lastError = err;
 		blog(LOG_ERROR, "%s", err.c_str());
@@ -891,11 +905,20 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	obs_queue_task(
 		OBS_TASK_GRAPHICS, [](void *) {}, nullptr, true);
 
+	// Strong-consistency start (design §4.1): the HEVC publish goes up
+	// first, so a failure there costs nothing visible. If the H264 half
+	// then fails, the HEVC half is torn back down rather than left
+	// publishing a stream no H264 player can use.
+	if (!StartCompanionStream())
+		return false;
+
 	if (obs_output_start(streamOutput)) {
 		if (multitrackVideo && multitrackVideoActive)
 			multitrackVideo->StartedStreaming();
 		return true;
 	}
+
+	StopCompanionStream(true);
 
 	if (multitrackVideo && multitrackVideoActive)
 		multitrackVideoActive = false;
@@ -1056,6 +1079,8 @@ bool AdvancedOutput::StartReplayBuffer()
 
 void AdvancedOutput::StopStreaming(bool force)
 {
+	StopCompanionStream(force);
+
 	auto output = StreamingOutput();
 	if (force && output)
 		obs_output_force_stop(output);

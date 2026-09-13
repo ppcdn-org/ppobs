@@ -52,6 +52,37 @@ struct BasicOutputHandler {
 	// AdvancedOutput.cpp/SimpleOutput.cpp.
 	std::unique_ptr<WHIPHevcEncoders> whipHevcEncoders;
 
+	// Second publish of the same scene carrying the HEVC ladder, used when
+	// multitrack is on and the transport can only carry one video codec per
+	// connection (SRT/MPEG-TS). streamOutput keeps the H264 ladder and
+	// stays the "primary" one that the status bar, frontend API and stats
+	// all follow, so none of them need to learn about a second output; this
+	// one is started and stopped alongside it.
+	//
+	// It needs its own service because the mpegts output reads its URL from
+	// whatever service is attached (see fetch_service_info in
+	// obs-ffmpeg-mpegts.c), and the two publishes differ precisely in that
+	// URL's codec segment.
+	OBSOutputAutoRelease hevcStreamOutput;
+	OBSServiceAutoRelease hevcStreamService;
+	OBSSignal hevcStopStreaming;
+	// Set while StopStreaming is tearing the pair down on purpose, so the
+	// companion's own "stop" signal isn't mistaken for a failure that
+	// should stop the primary too.
+	bool stoppingStreamPair = false;
+
+	// Creates (or tears down) the companion publish to match the current
+	// configuration. Safe to call repeatedly; outputType is the output id
+	// the primary publish uses, which the companion shares.
+	void SetupCompanionStream(const char *outputType);
+
+	// Starts the companion publish, if one is configured. Returns false
+	// only when a companion was wanted but couldn't be started - the caller
+	// must then abandon the whole publish rather than go on air with half
+	// of it (design §4.1's strong-consistency start).
+	bool StartCompanionStream();
+	void StopCompanionStream(bool force);
+
 	std::string outputType;
 	std::string lastError;
 

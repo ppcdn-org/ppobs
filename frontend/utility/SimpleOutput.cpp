@@ -729,11 +729,10 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 	// See AdvancedOutput::StartStreaming for why this is checked here
 	// rather than left to the server to reject mid-connection.
 	const char *serverURL = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
-	const char *streamProtocol = obs_service_get_protocol(service);
-	const bool singleCodecTransport = !streamProtocol || astrcmpi(streamProtocol, "WHIP") != 0;
 	if (std::string err = CheckPublishCodecMatchesURL(serverURL ? serverURL : "",
 							  obs_encoder_get_codec(videoStreaming),
-							  whipHevcEncoders != nullptr, singleCodecTransport);
+							  whipHevcEncoders != nullptr,
+							  StreamTransportIsSingleCodec(service));
 	    !err.empty()) {
 		lastError = err;
 		blog(LOG_ERROR, "%s", err.c_str());

@@ -3,6 +3,7 @@
 #include "SimpleOutput.hpp"
 
 #include <utility/MultitrackVideoError.hpp>
+#include <utility/PublishCodecCheck.hpp>
 #include <utility/StartMultiTrackVideoStreamingGuard.hpp>
 #include <utility/VCamConfig.hpp>
 #include <widgets/OBSBasic.hpp>
@@ -61,6 +62,11 @@ void OBSStopStreaming(void *data, calldata_t *params)
 	const char *last_error = calldata_string(params, "last_error");
 
 	QString arg_last_error = QString::fromUtf8(last_error);
+
+	// However the primary publish ended - user stop, reconnects exhausted,
+	// a frontend API call - the companion must not be left publishing on
+	// its own. StopCompanionStream is a no-op once it has already stopped.
+	output->StopCompanionStream(false);
 
 	output->streamingActive = false;
 	output->delayActive = false;
@@ -215,6 +221,140 @@ const char *GetStreamOutputType(const obs_service_t *service)
 	blog(LOG_WARNING, "No output compatible with the service '%s' is registered", obs_service_get_id(service));
 
 	return nullptr;
+}
+
+// OBSCompanionStopStreaming fires when the HEVC publish stops on its own.
+// During a deliberate teardown that's expected and already handled; outside
+// one it means the HEVC half died while the H264 half is still on air, which
+// leaves HEVC viewers with nothing and no indication why - so stop the pair
+// and report it through the primary output's normal failure path.
+static void OBSCompanionStopStreaming(void *data, calldata_t *params)
+{
+	BasicOutputHandler *output = static_cast<BasicOutputHandler *>(data);
+	if (output->stoppingStreamPair)
+		return;
+
+	const char *last_error = calldata_string(params, "last_error");
+	blog(LOG_WARNING, "HEVC publish stopped on its own (%s); stopping the H264 publish too",
+	     (last_error && *last_error) ? last_error : "no error given");
+
+	if (output->streamOutput)
+		obs_output_stop(output->streamOutput);
+}
+
+// BuildCompanionServiceSettings copies the primary service's settings and
+// rewrites the publish URL's codec segment, which is the only thing that
+// differs between the two publishes.
+static OBSDataAutoRelease BuildCompanionServiceSettings(obs_service_t *primary, const char *codec)
+{
+	OBSDataAutoRelease settings = obs_service_get_settings(primary);
+	if (!settings)
+		return nullptr;
+
+	// Re-derive from the *configured* server string rather than the
+	// resolved URL, so a placeholder like {ppcenter_appid} is expanded once
+	// by the service itself instead of being baked in here.
+	const char *server = obs_data_get_string(settings, "server");
+	if (!server || !*server)
+		return nullptr;
+
+	std::string url = server;
+	const std::string existing = PublishCodecFromURL(url);
+	if (existing.empty()) {
+		// The publish path has to already name a codec for the two
+		// connections to land on different paths. For SRT the path
+		// lives inside the streamid, so there is no reliable place to
+		// append one here - a naive insert before the query string
+		// lands in the host part instead.
+		blog(LOG_ERROR,
+		     "HEVC multitrack: the stream URL has no /h264 or /hevc segment, so the HEVC publish would "
+		     "collide with the H264 one. Add /h264 to the stream URL.");
+		return nullptr;
+	}
+
+	// Replace the trailing codec segment, keeping anything after it
+	// (a token in the streamid's third field, query parameters, ...).
+	const size_t at = url.rfind("/" + existing);
+	url = url.substr(0, at) + "/" + codec + url.substr(at + 1 + existing.size());
+
+	obs_data_set_string(settings, "server", url.c_str());
+	return settings;
+}
+
+void BasicOutputHandler::SetupCompanionStream(const char *outputType)
+{
+	const bool wanted = whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder() &&
+			    StreamTransportIsSingleCodec(main->GetService());
+
+	if (!wanted) {
+		// Configuration changed since the last publish (multitrack
+		// turned off, or the service switched to WHIP): drop the
+		// companion rather than leave a stale one attached.
+		hevcStopStreaming.Disconnect();
+		hevcStreamOutput = nullptr;
+		hevcStreamService = nullptr;
+		return;
+	}
+
+	if (hevcStreamOutput)
+		return;
+
+	obs_service_t *primary = main->GetService();
+	OBSDataAutoRelease settings = BuildCompanionServiceSettings(primary, "hevc");
+	if (!settings) {
+		blog(LOG_ERROR, "HEVC multitrack: could not derive the HEVC publish URL from the service");
+		return;
+	}
+
+	hevcStreamService = obs_service_create(obs_service_get_id(primary), "hevc_stream_service", settings, nullptr);
+	if (!hevcStreamService) {
+		blog(LOG_ERROR, "HEVC multitrack: failed to create the HEVC publish service");
+		return;
+	}
+
+	hevcStreamOutput = obs_output_create(outputType, "hevc_stream", nullptr, nullptr);
+	if (!hevcStreamOutput) {
+		blog(LOG_ERROR, "HEVC multitrack: failed to create the HEVC publish output");
+		hevcStreamService = nullptr;
+		return;
+	}
+
+	obs_output_set_service(hevcStreamOutput, hevcStreamService);
+	hevcStopStreaming.Connect(obs_output_get_signal_handler(hevcStreamOutput), "stop", OBSCompanionStopStreaming,
+				  this);
+
+	blog(LOG_INFO, "HEVC multitrack: publishing HEVC separately to %s",
+	     obs_service_get_connect_info(hevcStreamService, OBS_SERVICE_CONNECT_INFO_SERVER_URL));
+}
+
+bool BasicOutputHandler::StartCompanionStream()
+{
+	if (!hevcStreamOutput)
+		return true;
+
+	stoppingStreamPair = false;
+
+	if (obs_output_start(hevcStreamOutput))
+		return true;
+
+	const char *error = obs_output_get_last_error(hevcStreamOutput);
+	lastError = (error && *error) ? error
+				      : "The HEVC publish failed to start. Both codecs must be publishing before "
+					"streaming begins, so the H264 publish was not started either.";
+	blog(LOG_WARNING, "HEVC publish failed to start: %s", (error && *error) ? error : "no error given");
+	return false;
+}
+
+void BasicOutputHandler::StopCompanionStream(bool force)
+{
+	if (!hevcStreamOutput)
+		return;
+
+	stoppingStreamPair = true;
+	if (force)
+		obs_output_force_stop(hevcStreamOutput);
+	else
+		obs_output_stop(hevcStreamOutput);
 }
 
 BasicOutputHandler::BasicOutputHandler(OBSBasic *main_) : main(main_)
