@@ -229,12 +229,26 @@ private:
 	int prevLangIndex;
 	bool prevBrowserAccel;
 
-	// Custom and WHIP share the same endpoint widget, but each service type
-	// must retain its own endpoint when switching between them.
+	// Custom and WHIP share the same endpoint and key/token widgets, but
+	// each service type must retain its own values when switching between
+	// them - a Custom (SRT/RTMP) stream key and a WHIP bearer token are
+	// different secrets with different meanings, not the same field.
 	enum class StreamDestinationField { Common, Custom, WHIP };
 	StreamDestinationField lastStreamDestinationField = StreamDestinationField::Common;
 	QString customServiceEndpoint;
 	QString whipServiceEndpoint;
+	QString customServiceKey;
+	QString whipServiceKey;
+	// Custom's auth sub-fields are exclusive to it (WHIP never shows or
+	// uses them), so they don't need swap-on-dropdown-change treatment -
+	// just the same "remember across a closed Settings dialog, or after
+	// applying a different service in between" persistence, restored
+	// whenever Custom becomes selected. See SaveStream1Settings/
+	// LoadStream1Settings for where "Custom*"/"WHIP*" config keys are
+	// written/read.
+	bool customServiceUseAuth = false;
+	QString customServiceUsername;
+	QString customServicePassword;
 	void SwapStreamDestinationField();
 
 	/* WHIP Simulcast per-layer resolution/bitrate settings (Settings >

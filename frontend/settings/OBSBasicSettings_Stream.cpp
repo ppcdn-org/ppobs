@@ -167,11 +167,33 @@ void OBSBasicSettings::LoadStream1Settings()
 	if (is_rtmp_custom || is_whip)
 		ui->customServer->setText(server);
 
+	// Seed every service type's remembered endpoint/key from its own
+	// persisted config first (see SaveStream1Settings). obs_service_t
+	// only ever holds the one currently-*active* service, so without
+	// this, whichever service isn't active right now would have nothing
+	// to restore - this is what lets switching the Service dropdown
+	// bring back each one's last-used values even across closing and
+	// reopening Settings, or actually applying a different service in
+	// between, not just while flipping the dropdown within one already-
+	// open dialog (that part alone was last time's incomplete fix).
+	customServiceEndpoint = QT_UTF8(config_get_string(main->Config(), "Stream1", "CustomServerEndpoint"));
+	customServiceKey = QT_UTF8(config_get_string(main->Config(), "Stream1", "CustomServerKey"));
+	customServiceUseAuth = config_get_bool(main->Config(), "Stream1", "CustomUseAuth");
+	customServiceUsername = QT_UTF8(config_get_string(main->Config(), "Stream1", "CustomUsername"));
+	customServicePassword = QT_UTF8(config_get_string(main->Config(), "Stream1", "CustomPassword"));
+	whipServiceEndpoint = QT_UTF8(config_get_string(main->Config(), "Stream1", "WHIPServerEndpoint"));
+	whipServiceKey = QT_UTF8(config_get_string(main->Config(), "Stream1", "WHIPBearerToken"));
+
 	if (is_rtmp_custom) {
+		// The actually-active service is the authoritative source for
+		// its own values, overriding the persisted shadow copy above
+		// in case they've ever drifted apart.
 		customServiceEndpoint = QT_UTF8(server);
+		customServiceKey = QT_UTF8(key);
 		lastStreamDestinationField = StreamDestinationField::Custom;
 	} else if (is_whip) {
 		whipServiceEndpoint = QT_UTF8(server);
+		whipServiceKey = QT_UTF8(bearer_token);
 		lastStreamDestinationField = StreamDestinationField::WHIP;
 	} else {
 		lastStreamDestinationField = StreamDestinationField::Common;
@@ -346,6 +368,27 @@ void OBSBasicSettings::SaveStream1Settings()
 {
 	bool customServer = IsCustomService();
 	bool whip = IsWHIP();
+
+	// Persist this service type's own endpoint/key (and Custom's auth
+	// fields) independently of which service ends up active below - see
+	// LoadStream1Settings. obs_service_t/SetService further down replaces
+	// the *one* active service wholesale, so without this, applying WHIP
+	// after having applied Custom (or vice versa) would silently lose
+	// whichever one just stopped being active instead of merely switching
+	// away from it.
+	if (customServer) {
+		config_set_string(main->Config(), "Stream1", "CustomServerEndpoint",
+				   QT_TO_UTF8(ui->customServer->text().trimmed()));
+		config_set_string(main->Config(), "Stream1", "CustomServerKey", QT_TO_UTF8(ui->key->text()));
+		config_set_bool(main->Config(), "Stream1", "CustomUseAuth", ui->useAuth->isChecked());
+		config_set_string(main->Config(), "Stream1", "CustomUsername", QT_TO_UTF8(ui->authUsername->text()));
+		config_set_string(main->Config(), "Stream1", "CustomPassword", QT_TO_UTF8(ui->authPw->text()));
+	} else if (whip) {
+		config_set_string(main->Config(), "Stream1", "WHIPServerEndpoint",
+				   QT_TO_UTF8(ui->customServer->text().trimmed()));
+		config_set_string(main->Config(), "Stream1", "WHIPBearerToken", QT_TO_UTF8(ui->key->text()));
+	}
+
 	const char *service_id = "rtmp_common";
 
 	if (customServer) {
@@ -949,9 +992,14 @@ void OBSBasicSettings::SwapStreamDestinationField()
 	switch (lastStreamDestinationField) {
 	case StreamDestinationField::Custom:
 		customServiceEndpoint = ui->customServer->text();
+		customServiceKey = ui->key->text();
+		customServiceUseAuth = ui->useAuth->isChecked();
+		customServiceUsername = ui->authUsername->text();
+		customServicePassword = ui->authPw->text();
 		break;
 	case StreamDestinationField::WHIP:
 		whipServiceEndpoint = ui->customServer->text();
+		whipServiceKey = ui->key->text();
 		break;
 	case StreamDestinationField::Common:
 		break;
@@ -959,9 +1007,14 @@ void OBSBasicSettings::SwapStreamDestinationField()
 
 	if (IsCustomService()) {
 		ui->customServer->setText(customServiceEndpoint);
+		ui->key->setText(customServiceKey);
+		ui->useAuth->setChecked(customServiceUseAuth);
+		ui->authUsername->setText(customServiceUsername);
+		ui->authPw->setText(customServicePassword);
 		lastStreamDestinationField = StreamDestinationField::Custom;
 	} else if (IsWHIP()) {
 		ui->customServer->setText(whipServiceEndpoint);
+		ui->key->setText(whipServiceKey);
 		lastStreamDestinationField = StreamDestinationField::WHIP;
 	} else {
 		lastStreamDestinationField = StreamDestinationField::Common;

@@ -1287,6 +1287,10 @@ static uint64_t ffmpeg_mpegts_total_bytes(void *data)
 
 static inline int64_t rescale_ts2(AVStream *stream, AVRational codec_time_base, int64_t val)
 {
+	if (!stream || codec_time_base.num <= 0 || codec_time_base.den <= 0 || stream->time_base.num <= 0 ||
+	    stream->time_base.den <= 0)
+		return AV_NOPTS_VALUE;
+
 	return av_rescale_q_rnd(val / codec_time_base.num, codec_time_base, stream->time_base,
 				AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
 }
@@ -1389,6 +1393,11 @@ void mpegts_write_packet(struct ffmpeg_output *stream, struct encoder_packet *en
 	packet->stream_index = avstream->id;
 	packet->pts = rescale_ts2(avstream, codec_time_base, encpacket->pts);
 	packet->dts = rescale_ts2(avstream, codec_time_base, encpacket->dts);
+	if (packet->pts == AV_NOPTS_VALUE || packet->dts == AV_NOPTS_VALUE) {
+		error("Invalid time base for MPEG-TS packet (stream=%d codec=%d/%d output=%d/%d)", packet->stream_index,
+		      codec_time_base.num, codec_time_base.den, avstream->time_base.num, avstream->time_base.den);
+		goto fail;
+	}
 
 	if (encpacket->keyframe)
 		packet->flags = AV_PKT_FLAG_KEY;

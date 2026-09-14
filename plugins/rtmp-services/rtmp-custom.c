@@ -17,7 +17,12 @@ static char *expand_ppcenter_appid(const char *server, const char *app_id)
 	if (app_id && *app_id)
 		dstr_replace(&url, placeholder, app_id);
 
-	return url.array;
+	/* dstr_copy() frees and leaves .array NULL for an empty/NULL input
+	 * (e.g. switching the service to Custom before typing a URL) - every
+	 * other rtmp_custom field is a bstrdup() that's never NULL, and
+	 * rtmp_custom_get_protocol() dereferences service->server directly
+	 * with no NULL check, so an empty server crashes it. */
+	return url.array ? url.array : bstrdup("");
 }
 
 static const char *rtmp_custom_name(void *unused)
