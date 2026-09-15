@@ -2,6 +2,7 @@
 #include "AdvancedOutput.hpp"
 #include "SimpleOutput.hpp"
 
+#include <abs-ts.h>
 #include <utility/MultitrackVideoError.hpp>
 #include <utility/PublishCodecCheck.hpp>
 #include <utility/StartMultiTrackVideoStreamingGuard.hpp>
@@ -318,6 +319,12 @@ void BasicOutputHandler::SetupCompanionStream(const char *outputType)
 		h264StreamService = nullptr;
 		return;
 	}
+
+	// Without this, the HEVC connection never carries the SEI timestamp
+	// abs_ts_sei_inject stamps into every frame (see AdvancedOutput.cpp's
+	// identical registration on streamOutput), so mmx never forwards an
+	// OBS_TIMESTAMP for HEVC viewers and pplayer's P2P Delay reads N/A.
+	obs_output_add_packet_callback(hevcStreamOutput, abs_ts_sei_inject, nullptr);
 
 	obs_output_set_service(hevcStreamOutput, hevcStreamService);
 	hevcStopStreaming.Connect(obs_output_get_signal_handler(hevcStreamOutput), "stop", OBSCompanionStopStreaming,
