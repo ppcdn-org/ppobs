@@ -98,11 +98,18 @@ void SimpleOutput::LoadStreamingPreset_Lossy(const char *encoderId)
 			blog(LOG_ERROR,
 			     "HEVC/H264 multitrack is enabled but no HEVC encoder is available - HEVC WHIP session will fail to start");
 		} else {
+			// See AdvancedOutput's identical comment: when videoStreaming
+			// is already HEVC, hand it to the ladder as its base layer
+			// instead of creating a second full-resolution HEVC encoder.
+			const char *streamCodec = obs_get_encoder_codec(encoderId);
+			obs_encoder_t *hevcBase =
+				(streamCodec && strcmp(streamCodec, "hevc") == 0) ? videoStreaming : nullptr;
+
 			whipHevcEncoders->Create(hevcEncoderId, nullptr,
 						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 						 video_output_get_width(obs_get_video()),
-						 video_output_get_height(obs_get_video()), main->Config());
+						 video_output_get_height(obs_get_video()), main->Config(), hevcBase);
 		}
 	}
 }
@@ -681,12 +688,14 @@ std::shared_future<void> SimpleOutput::SetupStreaming(obs_service_t *service, Se
 			whipSimulcastEncoders->SetStreamOutput(streamOutput);
 		}
 		if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
-			// See AdvancedOutput.cpp's identical comment on why the
-			// exact slot boundary only needs to avoid colliding with
-			// H264's own slots.
-			uint32_t h264SlotCount = whipSimulcastEncoders ? (uint32_t)config_get_int(main->Config(), "Stream1",
-												  "WHIPSimulcastTotalLayers")
-									: 1;
+			// See AdvancedOutput.cpp's identical comment: this has to be
+			// how many slots H264's ladder actually filled, not
+			// WHIPSimulcastTotalLayers - when videoStreaming is HEVC,
+			// slot 0 holds an HEVC encoder rather than an H264 one, so
+			// the config value overshoots and leaves collectVideoLayers()
+			// (whip-output.cpp) a hole to stop at.
+			uint32_t h264SlotCount =
+				whipSimulcastEncoders ? (uint32_t)whipSimulcastEncoders->SlotCount() : 1;
 			whipHevcEncoders->SetStreamOutput(streamOutput, h264SlotCount);
 		}
 		obs_output_set_audio_encoder(streamOutput, audioStreaming, 0);

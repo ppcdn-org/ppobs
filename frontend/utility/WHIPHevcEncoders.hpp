@@ -113,8 +113,16 @@ public:
 	// available HEVC encoder (see ResolveWHIPHevcEncoderId) - this
 	// struct does not fall back to H264 on failure, matching the
 	// strong-consistency start requirement.
+	// existingMain, when non-null, is an already-created HEVC encoder the
+	// caller publishes as its main stream track; the ladder adopts it as
+	// its base layer instead of creating its own. Creating a second one
+	// would put two full-resolution HEVC tracks on the output, so
+	// collectVideoLayers() (whip-output.cpp) would count one layer more
+	// than the user configured and the server would reject the offer.
+	// Mirrors how WHIPSimulcastEncoders reuses the main encoder for H264.
 	void Create(const std::string &hevcEncoderId, obs_data_t *videoSettings, int rescaleFilter,
-		    int requestedTotalLayers, uint32_t outputWidth, uint32_t outputHeight, config_t *config = nullptr)
+		    int requestedTotalLayers, uint32_t outputWidth, uint32_t outputHeight, config_t *config = nullptr,
+		    obs_encoder_t *existingMain = nullptr)
 	{
 		if (rescaleFilter == OBS_SCALE_DISABLE)
 			rescaleFilter = OBS_SCALE_BICUBIC;
@@ -123,16 +131,31 @@ public:
 		if (totalLayers < 1)
 			totalLayers = 1;
 
-		OBSDataAutoRelease mainSettings =
-			videoSettings ? obs_data_create_from_json(obs_data_get_json(videoSettings)) : nullptr;
-		mainEncoder = obs_video_encoder_create(hevcEncoderId.c_str(), "whip_hevc_main", mainSettings, nullptr);
-		if (!mainEncoder) {
-			blog(LOG_ERROR, "Failed to create main HEVC encoder '%s' for WHIP HEVC/H264 multitrack",
-			     hevcEncoderId.c_str());
-			return;
+		if (existingMain) {
+			// OBSEncoder (OBSSafeRef) takes its own reference on
+			// assignment, so sharing this encoder with the caller's
+			// videoStreaming is safe without any extra bookkeeping for
+			// its lifetime. ownsMainEncoder below is a separate concern
+			// from that safety: SetStreamOutput() still needs to know
+			// the caller already placed this exact encoder at its own
+			// output slot, so it doesn't register the same pointer at
+			// a second slot too (see that method's comment).
+			mainEncoder = existingMain;
+			ownsMainEncoder = false;
+		} else {
+			OBSDataAutoRelease mainSettings =
+				videoSettings ? obs_data_create_from_json(obs_data_get_json(videoSettings)) : nullptr;
+			mainEncoder =
+				obs_video_encoder_create(hevcEncoderId.c_str(), "whip_hevc_main", mainSettings, nullptr);
+			if (!mainEncoder) {
+				blog(LOG_ERROR, "Failed to create main HEVC encoder '%s' for WHIP HEVC/H264 multitrack",
+				     hevcEncoderId.c_str());
+				return;
+			}
+			obs_encoder_set_video(mainEncoder, obs_get_video());
+			obs_encoder_release(mainEncoder);
+			ownsMainEncoder = true;
 		}
-		obs_encoder_set_video(mainEncoder, obs_get_video());
-		obs_encoder_release(mainEncoder);
 
 		if (totalLayers <= 1)
 			return;
@@ -256,21 +279,48 @@ public:
 	// can tell the two codecs' layers apart purely by
 	// obs_encoder_get_codec() (see whip-output.cpp), without needing to
 	// know slot ranges itself.
+	//
+	// When mainEncoder is borrowed (existingMain, !ownsMainEncoder), the
+	// caller has already placed it at its own slot (videoStreaming's slot
+	// 0) - re-placing the same encoder pointer at firstSlot here would
+	// register it under two slot indices, and collectVideoLayers() (which
+	// scans by slot, not by distinct encoder) would then count it twice,
+	// reporting one HEVC layer more than actually exists and pushing the
+	// offer over mmx's Simulcast cap. Only place mainEncoder here - and
+	// only then advance where the additional layers start - when this
+	// ladder created it itself.
 	void SetStreamOutput(obs_output_t *streamOutput, uint32_t firstSlot)
 	{
 		if (!mainEncoder)
 			return;
-		obs_output_set_video_encoder2(streamOutput, mainEncoder, firstSlot);
+		uint32_t layerStart = firstSlot;
+		if (ownsMainEncoder) {
+			obs_output_set_video_encoder2(streamOutput, mainEncoder, firstSlot);
+			layerStart = firstSlot + 1;
+		}
 		for (size_t i = 0; i < hevcLayerEncoders.size(); i++)
 			obs_output_set_video_encoder2(streamOutput, hevcLayerEncoders[i],
-						      firstSlot + 1 + static_cast<uint32_t>(i));
+						      layerStart + static_cast<uint32_t>(i));
 	}
 
 	bool HasMainEncoder() const { return mainEncoder != nullptr; }
 	int LayerCount() const { return mainEncoder ? static_cast<int>(hevcLayerEncoders.size()) + 1 : 0; }
+	// SlotsUsed is LayerCount() minus the borrowed main encoder when this
+	// ladder doesn't own it (see SetStreamOutput) - the number of *new*
+	// output slots SetStreamOutput actually fills, for callers computing
+	// where to place something after this ladder (e.g. whipH264Base in
+	// AdvancedOutput.cpp). Distinct from LayerCount(), which is the
+	// logical layer count regardless of slot sharing.
+	int SlotsUsed() const
+	{
+		if (!mainEncoder)
+			return 0;
+		return ownsMainEncoder ? LayerCount() : LayerCount() - 1;
+	}
 
 private:
 	OBSEncoder mainEncoder;
+	bool ownsMainEncoder = false;
 	std::vector<OBSEncoder> hevcLayerEncoders;
 	std::vector<bool> usingCustomLayer;
 };

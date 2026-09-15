@@ -286,6 +286,14 @@ public:
 			obs_output_set_video_encoder2(streamOutput, whipSimulcastEncoders[i], i + 1);
 	}
 
+	// Number of encoder slots SetStreamOutput() occupies, counting the main
+	// stream encoder this ladder reuses as its base layer in slot 0. Lets
+	// callers place a following ladder in contiguous slots rather than
+	// deriving the boundary from config - collectVideoLayers() in
+	// whip-output.cpp stops at the first empty slot, so a gap silently
+	// drops every track after it.
+	int SlotCount() const { return static_cast<int>(whipSimulcastEncoders.size()) + 1; }
+
 private:
 	std::vector<OBSEncoder> whipSimulcastEncoders;
 	std::vector<bool> usingCustomLayer;

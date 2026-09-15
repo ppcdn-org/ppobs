@@ -209,11 +209,23 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 			blog(LOG_ERROR,
 			     "HEVC/H264 multitrack is enabled but no HEVC encoder is available - HEVC WHIP session will fail to start");
 		} else {
+			// When the user's stream encoder is already HEVC, hand it to
+			// the ladder as its base layer instead of letting the ladder
+			// create a second full-resolution HEVC encoder: both would be
+			// published as HEVC tracks, so collectVideoLayers() would
+			// report one layer more than configured and the server would
+			// reject the offer (mmx allows at most 3 HEVC Simulcast
+			// layers). This mirrors how the H264 ladder has always reused
+			// the main stream encoder as its own base.
+			const char *streamCodec = obs_get_encoder_codec(streamEncoder);
+			obs_encoder_t *hevcBase =
+				(streamCodec && strcmp(streamCodec, "hevc") == 0) ? videoStreaming : nullptr;
+
 			whipHevcEncoders->Create(hevcEncoderId, streamEncSettings,
 						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 						 video_output_get_width(obs_get_video()),
-						 video_output_get_height(obs_get_video()), main->Config());
+						 video_output_get_height(obs_get_video()), main->Config(), hevcBase);
 		}
 	}
 
@@ -766,22 +778,35 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 				// HEVC's ladder starts right after H264's own slots (main +
 				// its Simulcast layers) - see collectVideoLayers() in
 				// whip-output.cpp, which tells the two codecs' layers apart
-				// purely by obs_encoder_get_codec(), not by slot range, so
-				// the exact boundary here only has to avoid colliding with
-				// H264's slots, not match any fixed convention.
-				uint32_t h264SlotCount =
-					whipSimulcastEncoders
-						? (uint32_t)config_get_int(main->Config(), "Stream1",
-									   "WHIPSimulcastTotalLayers")
-						: 1;
+				// purely by obs_encoder_get_codec(), not by slot range.
+				//
+				// The boundary has to come from how many slots the H264 side
+				// actually filled, not from WHIPSimulcastTotalLayers: when the
+				// stream encoder is HEVC, slot 0 holds that HEVC encoder rather
+				// than an H264 one, so the config value overshoots and leaves a
+				// hole. collectVideoLayers() stops at the first empty slot, so a
+				// hole drops every track past it.
+				uint32_t h264SlotCount = whipSimulcastEncoders
+								 ? (uint32_t)whipSimulcastEncoders->SlotCount()
+								 : 1;
 				whipHevcEncoders->SetStreamOutput(streamOutput, h264SlotCount);
 			}
 		}
 		if (whipH264Base) {
-			// Placed after the Simulcast/HEVC ladders so it cannot
-			// overwrite one of their slots; WHIPOutput matches tracks
-			// by codec, so the exact index does not matter.
-			obs_output_set_video_encoder2(streamOutput, whipH264Base, MAX_OUTPUT_VIDEO_ENCODERS - 1);
+			// Placed after the Simulcast/HEVC ladders so it cannot overwrite
+			// one of their slots, but immediately after them rather than at
+			// the end of the slot array: collectVideoLayers() breaks at the
+			// first empty slot, so parking this at MAX_OUTPUT_VIDEO_ENCODERS-1
+			// hid it behind a gap and the publish lost its H264 base track.
+			uint32_t baseSlot = 1;
+			if (whipSimulcastEncoders != nullptr)
+				baseSlot = (uint32_t)whipSimulcastEncoders->SlotCount();
+			if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder())
+				baseSlot += (uint32_t)whipHevcEncoders->SlotsUsed();
+			if (baseSlot < MAX_OUTPUT_VIDEO_ENCODERS)
+				obs_output_set_video_encoder2(streamOutput, whipH264Base, baseSlot);
+			else
+				blog(LOG_ERROR, "WHIP: no encoder slot left for the H264 base track");
 		}
 		obs_output_set_audio_encoder(streamOutput, streamAudioEnc, 0);
 
