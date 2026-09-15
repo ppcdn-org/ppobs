@@ -168,7 +168,18 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	// its base track by codec (see collectVideoLayers() in
 	// whip-output.cpp), so this is what keeps the publish from failing with
 	// "No H264 video encoder assigned".
-	if (strcmp(obs_service_get_id(main->GetService()), "whip_custom") == 0) {
+	//
+	// A single-codec transport (SRT/RTMP) with multitrack on needs one for
+	// the same reason, on its own connection: the H264 half publishes the
+	// Simulcast ladder alone, and WHIPSimulcastEncoders::Create() only
+	// builds the scaled-down layers (slot 0 is by convention the main
+	// encoder it reuses - see its SlotCount()). When the main encoder is
+	// HEVC it goes to the companion output instead, so without a base here
+	// the H264 connection publishes a ladder with no full-resolution layer
+	// - mmx logs "contains 2 h264 video tracks" for a 3-layer config.
+	const bool needsWhipH264Base = strcmp(obs_service_get_id(main->GetService()), "whip_custom") == 0 ||
+				       whipHevcEncoders != nullptr;
+	if (needsWhipH264Base) {
 		const char *streamCodec = obs_get_encoder_codec(streamEncoder);
 		if (!streamCodec || strcmp(streamCodec, "h264") != 0) {
 			std::string h264EncoderId = ResolveWHIPH264EncoderId(streamEncoder);
@@ -810,16 +821,29 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 			}
 		}
 		if (whipH264Base) {
-			// Placed after the Simulcast/HEVC ladders so it cannot overwrite
-			// one of their slots, but immediately after them rather than at
-			// the end of the slot array: collectVideoLayers() breaks at the
-			// first empty slot, so parking this at MAX_OUTPUT_VIDEO_ENCODERS-1
-			// hid it behind a gap and the publish lost its H264 base track.
-			uint32_t baseSlot = 1;
-			if (whipSimulcastEncoders != nullptr)
-				baseSlot = (uint32_t)whipSimulcastEncoders->SlotCount();
-			if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder())
-				baseSlot += (uint32_t)whipHevcEncoders->SlotsUsed();
+			uint32_t baseSlot;
+			if (hevcOnSeparateOutput) {
+				// Single-codec transport: this output carries the H264
+				// half alone, and slot 0 is free because the (HEVC) main
+				// encoder went to the companion output above. The ladder
+				// occupies slots 1..N by convention
+				// (WHIPSimulcastEncoders::SetStreamOutput), so slot 0 is
+				// both where the full-resolution base belongs and the only
+				// slot that keeps the ladder gap-free.
+				baseSlot = 0;
+			} else {
+				// Placed after the Simulcast/HEVC ladders so it cannot
+				// overwrite one of their slots, but immediately after them
+				// rather than at the end of the slot array:
+				// collectVideoLayers() breaks at the first empty slot, so
+				// parking this at MAX_OUTPUT_VIDEO_ENCODERS-1 hid it behind
+				// a gap and the publish lost its H264 base track.
+				baseSlot = 1;
+				if (whipSimulcastEncoders != nullptr)
+					baseSlot = (uint32_t)whipSimulcastEncoders->SlotCount();
+				if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder())
+					baseSlot += (uint32_t)whipHevcEncoders->SlotsUsed();
+			}
 			if (baseSlot < MAX_OUTPUT_VIDEO_ENCODERS)
 				obs_output_set_video_encoder2(streamOutput, whipH264Base, baseSlot);
 			else
