@@ -211,21 +211,27 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		} else {
 			// When the user's stream encoder is already HEVC, hand it to
 			// the ladder as its base layer instead of letting the ladder
-			// create a second full-resolution HEVC encoder: both would be
-			// published as HEVC tracks, so collectVideoLayers() would
-			// report one layer more than configured and the server would
-			// reject the offer (mmx allows at most 3 HEVC Simulcast
-			// layers). This mirrors how the H264 ladder has always reused
-			// the main stream encoder as its own base.
+			// create a second full-resolution HEVC encoder. This avoids
+			// two cases of a duplicate full-res HEVC track:
+			//
+			// WHIP (no hevcStreamOutput): both would go on streamOutput
+			//   and collectVideoLayers() would count one layer too many.
+			// SRT (hevcStreamOutput exists): the HEVC ladder goes on
+			//   its own output so there is no slot collision, but
+			//   encoding the same full-res frame twice wastes GPU.
+			//
+			// For SRT the ladder still needs its own main on the
+			// companion output, so only pass existingMain for WHIP.
 			const char *streamCodec = obs_get_encoder_codec(streamEncoder);
-			obs_encoder_t *hevcBase =
-				(streamCodec && strcmp(streamCodec, "hevc") == 0) ? videoStreaming : nullptr;
+			const bool mainIsHevc = streamCodec && strcmp(streamCodec, "hevc") == 0;
+			const bool useExistingMain = mainIsHevc && !StreamTransportIsSingleCodec(main->GetService());
 
 			whipHevcEncoders->Create(hevcEncoderId, streamEncSettings,
 						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 						 video_output_get_width(obs_get_video()),
-						 video_output_get_height(obs_get_video()), main->Config(), hevcBase);
+						 video_output_get_height(obs_get_video()), main->Config(),
+						 useExistingMain ? videoStreaming : nullptr);
 		}
 	}
 
@@ -763,7 +769,18 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 		// codecs within one session and needs none of this.
 		SetupCompanionStream(type.c_str());
 
-		obs_output_set_video_encoder(streamOutput, videoStreaming);
+		// Single-codec transport (SRT/RTMP) with HEVC/H264 multitrack
+		// publishes the HEVC half on a separate output (hevcStreamOutput).
+		// The main streamOutput must only carry H264 encoders - putting
+		// the HEVC main encoder there alongside H264 simulcast layers
+		// makes the MPEG-TS muxer reject the mix ("encoder 1 is 'h264',
+		// expected 'hevc'").
+		const char *streamCodec = obs_encoder_get_codec(videoStreaming);
+		const bool hevcOnSeparateOutput = hevcStreamOutput != nullptr && streamCodec &&
+						  strcmp(streamCodec, "hevc") == 0;
+		if (!hevcOnSeparateOutput) {
+			obs_output_set_video_encoder(streamOutput, videoStreaming);
+		}
 		if (whipSimulcastEncoders != nullptr) {
 			whipSimulcastEncoders->SetStreamOutput(streamOutput);
 		}
