@@ -8,6 +8,7 @@ struct SimpleOutput : BasicOutputHandler {
 	OBSEncoder audioRecording;
 	OBSEncoder audioArchive;
 	OBSEncoder videoRecording;
+	OBSEncoder whipH264Base;
 	OBSEncoder audioTrack[MAX_AUDIO_MIXES];
 
 	std::string videoEncoder;

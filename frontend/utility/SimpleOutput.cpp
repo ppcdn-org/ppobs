@@ -101,15 +101,41 @@ void SimpleOutput::LoadStreamingPreset_Lossy(const char *encoderId)
 			// See AdvancedOutput's identical comment: when videoStreaming
 			// is already HEVC, hand it to the ladder as its base layer
 			// instead of creating a second full-resolution HEVC encoder.
+			// Only do this for WHIP (single-codec transports publish
+			// the HEVC half on a separate output that needs its own main).
 			const char *streamCodec = obs_get_encoder_codec(encoderId);
-			obs_encoder_t *hevcBase =
-				(streamCodec && strcmp(streamCodec, "hevc") == 0) ? videoStreaming : nullptr;
+			const bool mainIsHevc = streamCodec && strcmp(streamCodec, "hevc") == 0;
+			const bool useExistingMain =
+				mainIsHevc && !StreamTransportIsSingleCodec(main->GetService());
 
 			whipHevcEncoders->Create(hevcEncoderId, nullptr,
 						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 						 video_output_get_width(obs_get_video()),
-						 video_output_get_height(obs_get_video()), main->Config(), hevcBase);
+						 video_output_get_height(obs_get_video()), main->Config(),
+						 useExistingMain ? videoStreaming : nullptr);
+		}
+	}
+
+	// See AdvancedOutput's identical comment: on a single-codec transport
+	// with multitrack on, the H264 half publishes on its own connection and
+	// WHIPSimulcastEncoders only builds the scaled-down layers - slot 0 is
+	// empty (the HEVC main encoder went to the companion output), so a
+	// dedicated H264 base encoder is needed here.
+	if (whipHevcEncoders != nullptr) {
+		const char *streamCodec = obs_get_encoder_codec(encoderId);
+		if (!streamCodec || strcmp(streamCodec, "h264") != 0) {
+			std::string h264EncoderId = ResolveWHIPH264EncoderId(encoderId);
+			whipH264Base = obs_video_encoder_create(h264EncoderId.c_str(), "whip_h264_base",
+								nullptr, nullptr);
+			if (whipH264Base) {
+				obs_encoder_release(whipH264Base);
+				blog(LOG_INFO, "WHIP: added '%s' as the H264 base track for a '%s' stream encoder",
+				     h264EncoderId.c_str(), encoderId);
+			} else {
+				blog(LOG_ERROR, "WHIP: failed to create the H264 base track encoder '%s'",
+				     h264EncoderId.c_str());
+			}
 		}
 	}
 }
@@ -600,6 +626,8 @@ inline void SimpleOutput::SetupOutputs()
 {
 	SimpleOutput::Update();
 	obs_encoder_set_video(videoStreaming, obs_get_video());
+	if (whipH264Base)
+		obs_encoder_set_video(whipH264Base, obs_get_video());
 	if (whipSimulcastEncoders != nullptr)
 		whipSimulcastEncoders->SetVideo();
 	if (whipHevcEncoders != nullptr)
@@ -650,58 +678,88 @@ std::shared_future<void> SimpleOutput::SetupStreaming(obs_service_t *service, Se
 	auto audio_bitrate = GetAudioBitrate();
 	auto vod_track_mixer = IsVodTrackEnabled(service) ? std::optional{1} : std::nullopt;
 
-	auto handle_multitrack_video_result = [this, type = std::string{type},
-					       service](std::optional<bool> multitrackVideoResult) {
-		if (multitrackVideoResult.has_value())
-			return multitrackVideoResult.value();
+		auto handle_multitrack_video_result = [this, type = std::string{type},
+						       service](std::optional<bool> multitrackVideoResult) {
+			if (multitrackVideoResult.has_value())
+				return multitrackVideoResult.value();
 
-		/* XXX: this is messy and disgusting and should be refactored */
-		if (outputType != type) {
-			streamDelayStarting.Disconnect();
-			streamStopping.Disconnect();
-			startStreaming.Disconnect();
-			stopStreaming.Disconnect();
+			/* XXX: this is messy and disgusting and should be refactored */
+			if (outputType != type) {
+				streamDelayStarting.Disconnect();
+				streamStopping.Disconnect();
+				startStreaming.Disconnect();
+				stopStreaming.Disconnect();
 
-			streamOutput = obs_output_create(type.c_str(), "simple_stream", nullptr, nullptr);
-			if (!streamOutput) {
-				blog(LOG_WARNING, "Creation of stream output type '%s' failed!", type.c_str());
-				return false;
+				streamOutput = obs_output_create(type.c_str(), "simple_stream", nullptr, nullptr);
+				if (!streamOutput) {
+					blog(LOG_WARNING, "Creation of stream output type '%s' failed!", type.c_str());
+					return false;
+				}
+
+				obs_output_add_packet_callback(streamOutput, abs_ts_sei_inject, nullptr);
+
+				streamDelayStarting.Connect(obs_output_get_signal_handler(streamOutput), "starting",
+							    OBSStreamStarting, this);
+				streamStopping.Connect(obs_output_get_signal_handler(streamOutput), "stopping",
+						       OBSStreamStopping, this);
+
+				startStreaming.Connect(obs_output_get_signal_handler(streamOutput), "start", OBSStartStreaming,
+						       this);
+				stopStreaming.Connect(obs_output_get_signal_handler(streamOutput), "stop", OBSStopStreaming,
+						      this);
+
+				outputType = type;
 			}
 
-			obs_output_add_packet_callback(streamOutput, abs_ts_sei_inject, nullptr);
+			// Multitrack over a transport that carries one video codec per
+			// connection needs a second publish for the HEVC ladder.
+			SetupCompanionStream(type.c_str());
 
-			streamDelayStarting.Connect(obs_output_get_signal_handler(streamOutput), "starting",
-						    OBSStreamStarting, this);
-			streamStopping.Connect(obs_output_get_signal_handler(streamOutput), "stopping",
-					       OBSStreamStopping, this);
-
-			startStreaming.Connect(obs_output_get_signal_handler(streamOutput), "start", OBSStartStreaming,
-					       this);
-			stopStreaming.Connect(obs_output_get_signal_handler(streamOutput), "stop", OBSStopStreaming,
-					      this);
-
-			outputType = type;
-		}
-
-		obs_output_set_video_encoder(streamOutput, videoStreaming);
-		if (whipSimulcastEncoders != nullptr) {
-			whipSimulcastEncoders->SetStreamOutput(streamOutput);
-		}
-		if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
-			// See AdvancedOutput.cpp's identical comment: this has to be
-			// how many slots H264's ladder actually filled, not
-			// WHIPSimulcastTotalLayers - when videoStreaming is HEVC,
-			// slot 0 holds an HEVC encoder rather than an H264 one, so
-			// the config value overshoots and leaves collectVideoLayers()
-			// (whip-output.cpp) a hole to stop at.
-			uint32_t h264SlotCount =
-				whipSimulcastEncoders ? (uint32_t)whipSimulcastEncoders->SlotCount() : 1;
-			whipHevcEncoders->SetStreamOutput(streamOutput, h264SlotCount);
-		}
-		obs_output_set_audio_encoder(streamOutput, audioStreaming, 0);
-		obs_output_set_service(streamOutput, service);
-		return true;
-	};
+			const char *streamCodec = obs_encoder_get_codec(videoStreaming);
+			const bool hevcOnSeparateOutput = hevcStreamOutput != nullptr && streamCodec &&
+							  strcmp(streamCodec, "hevc") == 0;
+			if (!hevcOnSeparateOutput) {
+				obs_output_set_video_encoder(streamOutput, videoStreaming);
+			}
+			if (whipSimulcastEncoders != nullptr) {
+				whipSimulcastEncoders->SetStreamOutput(streamOutput);
+			}
+			if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
+				if (hevcStreamOutput) {
+					whipHevcEncoders->SetStreamOutput(hevcStreamOutput, 0);
+					obs_output_set_audio_encoder(hevcStreamOutput, audioStreaming, 0);
+				} else {
+					// See AdvancedOutput.cpp's identical comment: this has to be
+					// how many slots H264's ladder actually filled, not
+					// WHIPSimulcastTotalLayers - when videoStreaming is HEVC,
+					// slot 0 holds an HEVC encoder rather than an H264 one, so
+					// the config value overshoots and leaves collectVideoLayers()
+					// (whip-output.cpp) a hole to stop at.
+					uint32_t h264SlotCount =
+						whipSimulcastEncoders ? (uint32_t)whipSimulcastEncoders->SlotCount() : 1;
+					whipHevcEncoders->SetStreamOutput(streamOutput, h264SlotCount);
+				}
+			}
+			if (whipH264Base) {
+				uint32_t baseSlot;
+				if (hevcOnSeparateOutput) {
+					baseSlot = 0;
+				} else {
+					baseSlot = 1;
+					if (whipSimulcastEncoders != nullptr)
+						baseSlot = (uint32_t)whipSimulcastEncoders->SlotCount();
+					if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder())
+						baseSlot += (uint32_t)whipHevcEncoders->SlotsUsed();
+				}
+				if (baseSlot < MAX_OUTPUT_VIDEO_ENCODERS)
+					obs_output_set_video_encoder2(streamOutput, whipH264Base, baseSlot);
+				else
+					blog(LOG_ERROR, "WHIP: no encoder slot left for the H264 base track");
+			}
+			obs_output_set_audio_encoder(streamOutput, audioStreaming, 0);
+			obs_output_set_service(streamOutput, service);
+			return true;
+		};
 
 	return SetupMultitrackVideo(service, GetSimpleAACEncoderForBitrate(audio_bitrate), 0, vod_track_mixer,
 				    [=](std::optional<bool> res) {
