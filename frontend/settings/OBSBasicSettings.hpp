@@ -218,6 +218,7 @@ private:
 	void InitStreamPage();
 	bool IsCustomService() const;
 	inline bool IsWHIP() const;
+	inline bool IsSRT() const;
 	bool IsWHIPSimulcast() const;
 	void UpdateWHIPSimulcastControls();
 	void LoadServices(bool showAll);
