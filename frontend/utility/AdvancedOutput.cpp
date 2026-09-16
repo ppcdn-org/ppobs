@@ -186,13 +186,16 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 			// Load H264-specific settings instead of reusing the HEVC
 			// streamEncSettings: the H264 ladder's bitrate was configured
 			// independently and would be silently overwritten otherwise.
+			// Keep h264Settings alive until after obs_video_encoder_create
+			// below - the OBSData smart pointer must outlive the raw pointer
+			// assignment or the data is freed before the encoder sees it.
+			OBSData h264Settings;
+			if (whipHevcEncoders != nullptr)
+				h264Settings = GetEncoderDataFromJsonFile("streamEncoder",
+									    h264EncoderId.c_str());
 			obs_data_t *h264BaseSettings = streamEncSettings;
-			if (whipHevcEncoders != nullptr) {
-				OBSData h264Settings = GetEncoderDataFromJsonFile("streamEncoder",
-										h264EncoderId.c_str());
-				if (h264Settings)
-					h264BaseSettings = h264Settings;
-			}
+			if (h264Settings)
+				h264BaseSettings = h264Settings.Get();
 			whipH264Base = obs_video_encoder_create(h264EncoderId.c_str(), "whip_h264_base",
 								h264BaseSettings, nullptr);
 			if (whipH264Base) {
