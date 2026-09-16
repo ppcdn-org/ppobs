@@ -227,9 +227,12 @@ void OBSBasicSettings::LoadStream1Settings()
 	} else {
 		int idx = ui->service->findText(service);
 		if (idx == -1) {
+			// Past the three special entries (SRT, WHIP, Custom...) -
+			// this is a saved rtmp_common service name no longer in the
+			// list (e.g. a platform that's since been removed).
 			if (service && *service)
-				ui->service->insertItem(1, service);
-			idx = 1;
+				ui->service->insertItem(3, service);
+			idx = 3;
 		}
 		ui->service->setCurrentIndex(idx);
 		lastServiceIdx = idx;
@@ -924,17 +927,18 @@ void OBSBasicSettings::LoadServices(bool showAll)
 	for (QString &name : names)
 		ui->service->addItem(name);
 
-	if (obs_is_output_protocol_registered("WHIP")) {
-		ui->service->addItem(QTStr("WHIP"), QVariant((int)ListOpt::WHIP));
-	}
-
 	if (!showAll) {
 		ui->service->addItem(QTStr("Basic.AutoConfig.StreamPage.Service.ShowAll"),
 				     QVariant((int)ListOpt::ShowAll));
 	}
 
+	// Ordered SRT, WHIP, Custom... - inserted back-to-front so each
+	// insertItem(0, ...) doesn't have to account for the ones before it.
+	ui->service->insertItem(0, QTStr("Basic.AutoConfig.StreamPage.Service.Custom"), QVariant((int)ListOpt::Custom));
+	if (obs_is_output_protocol_registered("WHIP")) {
+		ui->service->insertItem(0, QTStr("WHIP"), QVariant((int)ListOpt::WHIP));
+	}
 	ui->service->insertItem(0, QTStr("SRT"), QVariant((int)ListOpt::SRT));
-	ui->service->insertItem(1, QTStr("Basic.AutoConfig.StreamPage.Service.Custom"), QVariant((int)ListOpt::Custom));
 
 	if (!lastService.isEmpty()) {
 		int idx = ui->service->findText(lastService);
