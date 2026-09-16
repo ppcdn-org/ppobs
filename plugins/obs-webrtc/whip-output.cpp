@@ -4,6 +4,7 @@
 #include "ppcenter-client.h"
 #include "ppcenter-signal.h"
 #include "nat-probe.h"
+#include "device-registration.h"
 #include "uplink-qos-policy.h"
 
 #include <obs.hpp>
@@ -327,7 +328,22 @@ bool WHIPOutput::Setup(uint64_t generation)
 				       obs_data_get_string(service_settings, "ppcenter_secret"),
 				       obs_data_get_string(service_settings, "ppcenter_stream"),
 				       obs_data_get_string(service_settings, "ppcenter_region")};
-	request.device_id = GetOrCreateP2PClientId();
+	// Register this device's hardware identity with ppcenter before
+	// publishing. The server enforces a per-user device binding limit and
+	// rejects publishes from unregistered devices (HTTP 403). Registration
+	// is best-effort: if it fails, we still attempt to publish with the
+	// best deviceId we have, and the server will reject the publish if
+	// device binding is required for this account.
+	std::string deviceId = RegisterPpobsDevice(request.url, request.app_id, request.app_secret);
+	if (deviceId.empty()) {
+		deviceId = GetOrCreateP2PClientId();
+		do_log(LOG_WARNING,
+		       "device registration failed; falling back to generated deviceId=%s",
+		       deviceId.c_str());
+	} else {
+		do_log(LOG_INFO, "device registered: deviceId=%s", deviceId.c_str());
+	}
+	request.device_id = deviceId;
 	const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name);
 	if (probe.succeeded) {
 		request.nat_probe_id = probe.probe_id;
