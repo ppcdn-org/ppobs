@@ -183,8 +183,18 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		const char *streamCodec = obs_get_encoder_codec(streamEncoder);
 		if (!streamCodec || strcmp(streamCodec, "h264") != 0) {
 			std::string h264EncoderId = ResolveWHIPH264EncoderId(streamEncoder);
+			// Load H264-specific settings instead of reusing the HEVC
+			// streamEncSettings: the H264 ladder's bitrate was configured
+			// independently and would be silently overwritten otherwise.
+			obs_data_t *h264BaseSettings = streamEncSettings;
+			if (whipHevcEncoders != nullptr) {
+				OBSData h264Settings = GetEncoderDataFromJsonFile("streamEncoder",
+										h264EncoderId.c_str());
+				if (h264Settings)
+					h264BaseSettings = h264Settings;
+			}
 			whipH264Base = obs_video_encoder_create(h264EncoderId.c_str(), "whip_h264_base",
-								streamEncSettings, nullptr);
+								h264BaseSettings, nullptr);
 			if (whipH264Base) {
 				obs_encoder_release(whipH264Base);
 				blog(LOG_INFO, "WHIP: added '%s' as the H264 base track for a '%s' stream encoder",
@@ -208,7 +218,13 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		if (whipHevcEncoders != nullptr)
 			simulcastEncoder = ResolveWHIPH264EncoderId(streamEncoder);
 
-		whipSimulcastEncoders->Create(simulcastEncoder.c_str(), streamEncSettings,
+		OBSData simulcastSettings = streamEncSettings;
+		if (whipHevcEncoders != nullptr) {
+			OBSData h264Settings = GetEncoderDataFromJsonFile("streamEncoder", simulcastEncoder.c_str());
+			if (h264Settings)
+				simulcastSettings = h264Settings;
+		}
+		whipSimulcastEncoders->Create(simulcastEncoder.c_str(), simulcastSettings,
 					      config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 					      config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 					      video_output_get_width(obs_get_video()),
