@@ -46,7 +46,14 @@ class OBSBasicStats : public QFrame {
 		int first_total = 0;
 		int first_dropped = 0;
 
-		void Update(obs_output_t *output, bool rec);
+		// totalBytesOverride, when nonzero, is used for the sent/bitrate
+		// figures instead of obs_output_get_total_bytes(output) - status,
+		// active/reconnecting state, and dropped frames still come from
+		// output itself. Lets the streaming row reflect combined bytes
+		// across the HEVC/H264 multitrack companion output (see
+		// BasicOutputHandler::TotalStreamingBytes()), which is a second,
+		// separate obs_output_t that output alone can't see.
+		void Update(obs_output_t *output, bool rec, uint64_t totalBytesOverride = 0);
 		void Reset(obs_output_t *output);
 
 		long double kbps = 0.0l;

@@ -407,7 +407,12 @@ void OBSBasicStats::Update()
 	/* ------------------------------------------- */
 	/* recording/streaming stats                   */
 
-	outputLabels[0].Update(strOutput, false);
+	// Not just obs_output_get_total_bytes(strOutput): that only sees the
+	// H264 half once HEVC/H264 multitrack is publishing a second
+	// obs_output_t over SRT/MPEG-TS (see
+	// BasicOutputHandler::TotalStreamingBytes()).
+	BasicOutputHandler *handler = main ? main->GetOutputHandler() : nullptr;
+	outputLabels[0].Update(strOutput, false, handler ? handler->TotalStreamingBytes() : 0);
 	outputLabels[1].Update(recOutput, true);
 
 	if (obs_output_active(recOutput)) {
@@ -474,9 +479,10 @@ void OBSBasicStats::Reset()
 	Update();
 }
 
-void OBSBasicStats::OutputLabels::Update(obs_output_t *output, bool rec)
+void OBSBasicStats::OutputLabels::Update(obs_output_t *output, bool rec, uint64_t totalBytesOverride)
 {
-	uint64_t totalBytes = output ? obs_output_get_total_bytes(output) : 0;
+	uint64_t totalBytes = totalBytesOverride ? totalBytesOverride
+						  : (output ? obs_output_get_total_bytes(output) : 0);
 	uint64_t curTime = os_gettime_ns();
 	uint64_t bytesSent = totalBytes;
 

@@ -364,6 +364,14 @@ void BasicOutputHandler::StopCompanionStream(bool force)
 		obs_output_stop(hevcStreamOutput);
 }
 
+uint64_t BasicOutputHandler::TotalStreamingBytes() const
+{
+	uint64_t total = obs_output_get_total_bytes(StreamingOutput());
+	if (hevcStreamOutput)
+		total += obs_output_get_total_bytes(hevcStreamOutput);
+	return total;
+}
+
 BasicOutputHandler::BasicOutputHandler(OBSBasic *main_) : main(main_)
 {
 	if (main->vcamEnabled) {

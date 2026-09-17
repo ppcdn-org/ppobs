@@ -87,6 +87,20 @@ struct BasicOutputHandler {
 	bool StartCompanionStream();
 	void StopCompanionStream(bool force);
 
+	// Bytes actually sent, combined across the primary streaming output
+	// and - when HEVC/H264 multitrack is publishing over SRT/MPEG-TS,
+	// where each codec is a separate obs_output_t - its hevcStreamOutput
+	// companion. Despite the comment above on hevcStreamOutput ("none of
+	// them need to learn about a second output"), callers that report
+	// "how much has this stream sent" (the status bar's live kbps, the
+	// Stats window) do need to: querying only StreamingOutput() undercounts
+	// by exactly the HEVC ladder's bytes whenever the companion is active.
+	// WHIP multitrack doesn't have this problem - WHIPOutput is a single
+	// obs_output_t that already sums both codec sessions internally (see
+	// WHIPOutput::GetTotalBytes in plugins/obs-webrtc/whip-output.h) - so
+	// this only ever adds anything for the SRT/MPEG-TS companion case.
+	uint64_t TotalStreamingBytes() const;
+
 	std::string outputType;
 	std::string lastError;
 

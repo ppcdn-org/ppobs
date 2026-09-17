@@ -755,6 +755,12 @@ private:
 public:
 	bool Active() const;
 	void ResetOutputs();
+	// Read-only access for widgets that aren't OBSBasic itself (status bar,
+	// Stats window) but need more than a single obs_output_t* can tell them
+	// - e.g. BasicOutputHandler::TotalStreamingBytes(), which accounts for
+	// the HEVC/H264 multitrack companion output that
+	// obs_frontend_get_streaming_output() alone doesn't know about.
+	BasicOutputHandler *GetOutputHandler() const { return outputHandler.get(); }
 
 	inline void EnableOutputs(bool enable)
 	{

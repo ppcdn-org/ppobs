@@ -171,7 +171,12 @@ void OBSBasicStatusBar::UpdateBandwidth()
 	if (!output)
 		return;
 
-	uint64_t bytesSent = obs_output_get_total_bytes(output);
+	// Not obs_output_get_total_bytes(output): that only ever sees the H264
+	// half once HEVC/H264 multitrack is publishing a second obs_output_t
+	// over SRT/MPEG-TS (see BasicOutputHandler::TotalStreamingBytes()).
+	OBSBasic *main = qobject_cast<OBSBasic *>(parent());
+	BasicOutputHandler *handler = main ? main->GetOutputHandler() : nullptr;
+	uint64_t bytesSent = handler ? handler->TotalStreamingBytes() : obs_output_get_total_bytes(output);
 	uint64_t bytesSentTime = os_gettime_ns();
 
 	if (bytesSent < lastBytesSent)
