@@ -13,6 +13,13 @@ OBS Studio <https://obsproject.com>
    :alt: OBS Studio Discord Server
    :target: https://obsproject.com/discord
 
+PPCDN 官方链接
+--------------
+
+- 官方在线 demo: https://www.pp-cdn.org/
+
+- 官方 TG 运营群: https://t.me/+oEpcmaGXdihjMzY1
+
 What is OBS Studio?
 -------------------
 
