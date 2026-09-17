@@ -251,16 +251,20 @@ static void maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
 	    encoder->preferred_space == VIDEO_CS_DEFAULT && encoder->preferred_range == VIDEO_RANGE_DEFAULT)
 		return;
 
+	/* Resolve the mix before dereferencing encoder->media: on an output
+	 * reconnect the media can still reference a mix that is no longer in
+	 * the active list (get_mix_for_video() returns NULL), and reading its
+	 * video info below would be a use-after-free. */
+	current_mix = get_mix_for_video(encoder->media);
+	if (!current_mix)
+		return;
+
 	info = video_output_get_info(encoder->media);
 	width = encoder->scaled_width ? encoder->scaled_width : info->width;
 	height = encoder->scaled_height ? encoder->scaled_height : info->height;
 	format = encoder->preferred_format != VIDEO_FORMAT_NONE ? encoder->preferred_format : info->format;
 	space = encoder->preferred_space != VIDEO_CS_DEFAULT ? encoder->preferred_space : info->colorspace;
 	range = encoder->preferred_range != VIDEO_RANGE_DEFAULT ? encoder->preferred_range : info->range;
-
-	current_mix = get_mix_for_video(encoder->media);
-	if (!current_mix)
-		return;
 
 	/* Store original video_t so it can be restored if scaling is disabled. */
 	if (!current_mix->encoder_only_mix)
@@ -608,6 +612,33 @@ static void intitialize_audio_encoder(struct obs_encoder *encoder)
 
 static THREAD_LOCAL bool can_reroute = false;
 
+/* On an output reconnect the encoder is re-initialized, but its media can
+ * still reference a mix that is no longer in the active list (for example an
+ * encoder-only GPU-scaling mix that was freed after the previous shutdown).
+ * get_mix_for_video() then returns NULL and any later media dereference
+ * (video_output_get_info, gpu_encode_available, add_connection, the NVENC
+ * texture check, ...) touches freed memory. Rebind to a known-live video so
+ * the encoder stays usable instead of dangling. */
+static void maybe_restore_encoder_video(struct obs_encoder *encoder)
+{
+	video_t *fallback = NULL;
+
+	/* encoder->media is an audio_t for audio encoders - only video
+	 * encoders reference a video mix here. */
+	if (encoder->orig_info.type != OBS_ENCODER_VIDEO)
+		return;
+	if (!encoder->media || get_mix_for_video(encoder->media))
+		return;
+
+	if (encoder->original_video && get_mix_for_video(encoder->original_video))
+		fallback = encoder->original_video;
+	else if (obs->data.main_canvas && obs->data.main_canvas->mix)
+		fallback = obs->data.main_canvas->mix->video;
+
+	if (fallback)
+		encoder_set_video(encoder, fallback);
+}
+
 static inline bool obs_encoder_initialize_internal(obs_encoder_t *encoder)
 {
 	if (!encoder->media) {
@@ -615,6 +646,8 @@ static inline bool obs_encoder_initialize_internal(obs_encoder_t *encoder)
 		     encoder->context.name);
 		return false;
 	}
+
+	maybe_restore_encoder_video(encoder);
 
 	if (encoder_active(encoder))
 		return true;
@@ -2157,6 +2190,14 @@ void obs_encoder_group_destroy(obs_encoder_group_t *group)
 bool obs_encoder_video_tex_active(const obs_encoder_t *encoder, enum video_format format)
 {
 	struct obs_core_video_mix *mix = get_mix_for_video(encoder->media);
+
+	/* The encoder can be re-initialized (e.g. an output reconnect) while
+	 * its media is bound to a mix that is no longer in the active list -
+	 * get_mix_for_video() then returns NULL. Report no texture support in
+	 * that case instead of dereferencing NULL; callers fall back to a
+	 * non-texture encoder. */
+	if (!mix)
+		return false;
 
 	if (format == VIDEO_FORMAT_NV12)
 		return mix->using_nv12_tex;
