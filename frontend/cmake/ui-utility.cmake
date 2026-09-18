@@ -37,6 +37,8 @@ target_sources(
     utility/OBSThemeVariable.hpp
     utility/OBSTranslator.cpp
     utility/OBSTranslator.hpp
+    utility/PPCDNPublishEndpoint.cpp
+    utility/PPCDNPublishEndpoint.hpp
     utility/PreviewProgramSizeObserver.cpp
     utility/PreviewProgramSizeObserver.hpp
     utility/QuickTransition.cpp

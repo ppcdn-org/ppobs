@@ -25,6 +25,8 @@
 #include <utility/YoutubeApiWrappers.hpp>
 #endif
 
+#include <utility/PPCDNPublishEndpoint.hpp>
+
 #include <qt-wrappers.hpp>
 
 #define STREAMING_START "==== Streaming Start ==============================================="
@@ -82,6 +84,21 @@ void OBSBasic::StartStreaming()
 	if (sysTrayStream) {
 		sysTrayStream->setEnabled(false);
 		sysTrayStream->setText("Basic.Main.PreparingStream");
+	}
+
+	// An SRT Server URL may carry the "{ppcdn_publish_endpoint}" placeholder:
+	// ask PPCenter which Origin to push to and fold the answer into the
+	// service before the output is created. A no-op for every other service.
+	// See utility/PPCDNPublishEndpoint.hpp.
+	{
+		std::string endpointError;
+		if (!ResolvePPCDNPublishEndpoint(service, endpointError)) {
+			outputHandler->lastError = endpointError.empty()
+							   ? std::string("Failed to resolve the PPCenter SRT publish node")
+							   : endpointError;
+			DisplayStreamStartError();
+			return;
+		}
 	}
 
 	auto finish_stream_setup = [&](bool setupStreamingResult) {

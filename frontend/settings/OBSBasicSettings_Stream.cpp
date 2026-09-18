@@ -8,6 +8,7 @@
 #include <utility/YoutubeApiWrappers.hpp>
 #endif
 #include <widgets/OBSBasic.hpp>
+#include <utility/PPCDNPublishEndpoint.hpp>
 #include <utility/platform.hpp>
 #include <utility/WHIPSimulcastEncoders.hpp>
 
@@ -386,6 +387,15 @@ void OBSBasicSettings::SaveStream1Settings()
 	bool customServer = IsCustomService() || IsSRT();
 	bool whip = IsWHIP();
 
+	// An empty SRT Server URL is filled with the PPCenter template that asks
+	// for the Origin address at stream start (utility/PPCDNPublishEndpoint.hpp)
+	// rather than saved as an unusable empty/loose URL.
+	QString customEndpoint = ui->customServer->text().trimmed();
+	if (IsSRT() && customEndpoint.isEmpty()) {
+		customEndpoint = PPCDN_SRT_DEFAULT_PUBLISH_URL;
+		ui->customServer->setText(customEndpoint);
+	}
+
 	// Persist this service type's own endpoint/key (and Custom's auth
 	// fields) independently of which service ends up active below - see
 	// LoadStream1Settings. obs_service_t/SetService further down replaces
@@ -394,8 +404,7 @@ void OBSBasicSettings::SaveStream1Settings()
 	// whichever one just stopped being active instead of merely switching
 	// away from it.
 	if (customServer) {
-		config_set_string(main->Config(), "Stream1", "CustomServerEndpoint",
-				   QT_TO_UTF8(ui->customServer->text().trimmed()));
+		config_set_string(main->Config(), "Stream1", "CustomServerEndpoint", QT_TO_UTF8(customEndpoint));
 		config_set_string(main->Config(), "Stream1", "CustomServerKey", QT_TO_UTF8(ui->key->text()));
 		config_set_bool(main->Config(), "Stream1", "CustomUseAuth", ui->useAuth->isChecked());
 		config_set_string(main->Config(), "Stream1", "CustomUsername", QT_TO_UTF8(ui->authUsername->text()));
@@ -430,7 +439,7 @@ void OBSBasicSettings::SaveStream1Settings()
 			obs_data_set_string(settings, "server", QT_TO_UTF8(ui->server->currentData().toString()));
 		}
 	} else {
-		obs_data_set_string(settings, "server", QT_TO_UTF8(ui->customServer->text().trimmed()));
+		obs_data_set_string(settings, "server", QT_TO_UTF8(customEndpoint));
 		obs_data_set_bool(settings, "use_auth", ui->useAuth->isChecked());
 		if (ui->useAuth->isChecked()) {
 			obs_data_set_string(settings, "username", QT_TO_UTF8(ui->authUsername->text()));
@@ -471,7 +480,7 @@ void OBSBasicSettings::SaveStream1Settings()
 		obs_data_set_string(settings, "ppcenter_appid", QT_TO_UTF8(ui->ppcenterAppId->text().trimmed()));
 		obs_data_set_string(settings, "ppcenter_secret", QT_TO_UTF8(ui->ppcenterSecret->text()));
 		obs_data_set_string(settings, "ppcenter_stream",
-				    QT_TO_UTF8(ParseWHIPStreamNameFromServerUrl(ui->customServer->text())));
+				    QT_TO_UTF8(ParseWHIPStreamNameFromServerUrl(customEndpoint)));
 		obs_data_set_string(settings, "ppcenter_region", QT_TO_UTF8(ui->ppcenterRegion->text().trimmed()));
 	}
 

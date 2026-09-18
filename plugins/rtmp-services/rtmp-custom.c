@@ -4,6 +4,7 @@
 struct rtmp_custom {
 	char *server, *key;
 	char *ppcenter_appid;
+	char *ppcdn_publish_endpoint;
 	bool use_auth;
 	char *username, *password;
 };
@@ -25,6 +26,26 @@ static char *expand_ppcenter_appid(const char *server, const char *app_id)
 	return url.array ? url.array : bstrdup("");
 }
 
+/* {ppcdn_publish_endpoint} is the Origin's SRT ingest address, chosen by
+ * ppcenter and written into the "ppcdn_publish_endpoint" service setting by
+ * the frontend just before streaming starts (see
+ * frontend/utility/PPCDNPublishEndpoint.cpp). Expanding it here, alongside
+ * {ppcenter_appid}, keeps every reader of OBS_SERVICE_CONNECT_INFO_SERVER_URL
+ * on the one resolved address. With no resolved value the literal placeholder
+ * is left in place, mirroring expand_ppcenter_appid(), so a misconfiguration
+ * is obvious in the connection log rather than silently connecting to "". */
+static char *expand_ppcdn_publish_endpoint(const char *server, const char *endpoint)
+{
+	static const char placeholder[] = "{ppcdn_publish_endpoint}";
+	struct dstr url = {0};
+
+	dstr_copy(&url, server ? server : "");
+	if (endpoint && *endpoint)
+		dstr_replace(&url, placeholder, endpoint);
+
+	return url.array ? url.array : bstrdup("");
+}
+
 static const char *rtmp_custom_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -38,11 +59,18 @@ static void rtmp_custom_update(void *data, obs_data_t *settings)
 	bfree(service->server);
 	bfree(service->key);
 	bfree(service->ppcenter_appid);
+	bfree(service->ppcdn_publish_endpoint);
 	bfree(service->username);
 	bfree(service->password);
 
 	service->ppcenter_appid = bstrdup(obs_data_get_string(settings, "ppcenter_appid"));
-	service->server = expand_ppcenter_appid(obs_data_get_string(settings, "server"), service->ppcenter_appid);
+	service->ppcdn_publish_endpoint = bstrdup(obs_data_get_string(settings, "ppcdn_publish_endpoint"));
+	{
+		char *with_appid = expand_ppcenter_appid(obs_data_get_string(settings, "server"),
+							 service->ppcenter_appid);
+		service->server = expand_ppcdn_publish_endpoint(with_appid, service->ppcdn_publish_endpoint);
+		bfree(with_appid);
+	}
 	service->key = bstrdup(obs_data_get_string(settings, "key"));
 	service->use_auth = obs_data_get_bool(settings, "use_auth");
 	service->username = bstrdup(obs_data_get_string(settings, "username"));
@@ -56,6 +84,7 @@ static void rtmp_custom_destroy(void *data)
 	bfree(service->server);
 	bfree(service->key);
 	bfree(service->ppcenter_appid);
+	bfree(service->ppcdn_publish_endpoint);
 	bfree(service->username);
 	bfree(service->password);
 	bfree(service);
