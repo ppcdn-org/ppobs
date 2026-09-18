@@ -5,6 +5,7 @@
 #include "ppcenter-signal.h"
 #include "nat-probe.h"
 #include "device-registration.h"
+#include "encoder-report.h"
 #include "uplink-qos-policy.h"
 
 #include <obs.hpp>
@@ -294,8 +295,126 @@ bool checkStreamLimits(const std::vector<obs_encoder_t *> &layers, std::string &
 }
 } // namespace
 
+// ── Encoder-parameter report collection ──────────────────────────────
+// Reads the actual configuration off the encoders already assigned to this
+// output. These are cheap, local reads done on the start/stop thread; only
+// the HTTP POST itself is moved off-thread (see ReportEncoderConfigAsync).
+namespace {
+
+bool encoderLooksHardware(const std::string &id)
+{
+	static const char *needles[] = {"nvenc", "qsv", "amf", "videotoolbox", "vaapi", "mf_", "mediafoundation"};
+	for (const char *needle : needles) {
+		if (id.find(needle) != std::string::npos)
+			return true;
+	}
+	return false;
+}
+
+int encoderBitrateKbps(obs_data_t *settings)
+{
+	if (!settings)
+		return 0;
+	const long long bitrate = (long long)obs_data_get_int(settings, "bitrate");
+	return bitrate > 0 ? (int)bitrate : 0;
+}
+
+// keyint_sec is the OBS-standard seconds knob; some encoders persist only the
+// frame-count "keyint", which is converted with the layer's own FPS.
+int encoderKeyframeSeconds(obs_data_t *settings, int fps)
+{
+	if (!settings)
+		return 0;
+	const double keyint_sec = obs_data_get_double(settings, "keyint_sec");
+	if (keyint_sec > 0)
+		return (int)(keyint_sec + 0.5);
+	const long long keyint = (long long)obs_data_get_int(settings, "keyint");
+	if (keyint > 0 && fps > 0) {
+		const int seconds = (int)((keyint + fps / 2) / fps);
+		return seconds > 0 ? seconds : 0;
+	}
+	return 0;
+}
+
+std::string encoderSettingString(obs_data_t *settings, const char *key)
+{
+	if (!settings)
+		return "";
+	const char *value = obs_data_get_string(settings, key);
+	return value ? std::string(value) : std::string();
+}
+
+ObsEncoderLayer encoderToLayer(obs_encoder_t *encoder, size_t index)
+{
+	ObsEncoderLayer layer;
+	layer.rid = std::to_string(index);
+	layer.width = (int)obs_encoder_get_width(encoder);
+	layer.height = (int)obs_encoder_get_height(encoder);
+	if (video_t *video = obs_encoder_video(encoder))
+		layer.fps = (int)(video_output_get_frame_rate(video) + 0.5);
+	obs_data_t *settings = obs_encoder_get_settings(encoder);
+	layer.bitrate_kbps = encoderBitrateKbps(settings);
+	if (settings)
+		obs_data_release(settings);
+	return layer;
+}
+
+void fillVideoFromEncoder(ObsEncoderConfig &config, obs_encoder_t *encoder)
+{
+	const char *id = obs_encoder_get_id(encoder);
+	config.encoder_id = id ? id : "";
+	config.hardware = encoderLooksHardware(config.encoder_id);
+	config.width = (int)obs_encoder_get_width(encoder);
+	config.height = (int)obs_encoder_get_height(encoder);
+	if (video_t *video = obs_encoder_video(encoder))
+		config.fps = (int)(video_output_get_frame_rate(video) + 0.5);
+	obs_data_t *settings = obs_encoder_get_settings(encoder);
+	if (settings) {
+		config.video_bitrate_kbps = encoderBitrateKbps(settings);
+		config.keyframe_interval_sec = encoderKeyframeSeconds(settings, config.fps);
+		config.preset = encoderSettingString(settings, "preset");
+		config.profile = encoderSettingString(settings, "profile");
+		config.rate_control = encoderSettingString(settings, "rate_control");
+		obs_data_release(settings);
+	}
+}
+
+ObsEncoderConfig buildEncoderConfig(obs_output_t *output, const std::vector<obs_encoder_t *> &h264_layers,
+				    const std::vector<obs_encoder_t *> &hevc_layers, bool multitrack)
+{
+	ObsEncoderConfig config;
+	config.protocol = "whip";
+	config.multitrack = multitrack;
+	config.video_codec = "h264";
+	config.video_codecs.push_back("h264");
+	if (multitrack && !hevc_layers.empty())
+		config.video_codecs.push_back("hevc");
+
+	if (!h264_layers.empty()) {
+		// The primary (highest) H264 layer is the source feed's own
+		// resolution/fps/bitrate; lower layers are its scaled ladder.
+		fillVideoFromEncoder(config, h264_layers[0]);
+		for (size_t i = 0; i < h264_layers.size(); ++i)
+			config.simulcast_layers.push_back(encoderToLayer(h264_layers[i], i));
+	}
+
+	if (obs_encoder_t *audio = obs_output_get_audio_encoder(output, 0)) {
+		const char *codec = obs_encoder_get_codec(audio);
+		config.audio_codec = codec ? codec : "";
+		obs_data_t *settings = obs_encoder_get_settings(audio);
+		config.audio_bitrate_kbps = encoderBitrateKbps(settings);
+		if (settings)
+			obs_data_release(settings);
+		config.audio_sample_rate = (int)obs_encoder_get_sample_rate(audio);
+	}
+	return config;
+}
+
+} // namespace
+
 bool WHIPOutput::Setup(uint64_t generation)
 {
+	encoder_report_pending = false;
 	if (!Init())
 		return false;
 	if (!IsActiveGeneration(generation))
@@ -437,6 +556,21 @@ bool WHIPOutput::Setup(uint64_t generation)
 		hevcToken = hevcTrack->second.bearer_token;
 	}
 
+	// Capture the actual encoder configuration now that every requested layer
+	// is assigned. It is only *sent* once the output is truly running (see
+	// StartThread), so a failed start never publishes a config for a stream
+	// that never went live. Best-effort: the report degrades to missing
+	// evidence if this fails, but never blocks or fails the publish.
+	{
+		ObsEncoderConfig encoderConfig =
+			buildEncoderConfig(output, h264Layers, hevcLayers, wantMultitrack);
+		encoder_report_url = DeriveEncoderReportUrl(ppcenter_url);
+		encoder_report_body = BuildEncoderReportJson(request.app_id, request.app_secret,
+							     request.stream_name, deviceId,
+							     EncoderReportNowUtc(), encoderConfig);
+		encoder_report_pending = !encoder_report_url.empty() && !encoder_report_body.empty();
+	}
+
 	WHIPCodecSession::Config h264Cfg;
 	h264Cfg.endpoint_url = h264Url;
 	h264Cfg.bearer_token = h264Token;
@@ -566,6 +700,12 @@ void WHIPOutput::StartThread(uint64_t generation)
 	}
 
 	do_log(LOG_INFO, "WHIPOutput: Started (%s)", hevcSession ? "H264+HEVC multitrack" : "H264 only");
+
+	if (encoder_report_pending) {
+		ReportEncoderConfigAsync(encoder_report_url, encoder_report_body);
+		encoder_report_pending = false;
+	}
+
 	StartP2PSignal();
 
 	WHIPCodecSession::Callbacks cb;

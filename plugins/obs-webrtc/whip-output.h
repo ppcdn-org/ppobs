@@ -99,6 +99,13 @@ private:
 	std::unique_ptr<UplinkQosPolicy> qosPolicy;
 	int64_t lastQosCheckMs = 0;
 
+	// Encoder-parameter report (see encoder-report.h): the actual encoder
+	// config is captured in Setup() and sent once the output is running in
+	// StartThread(), so a start that never goes live reports nothing.
+	std::string encoder_report_url;
+	std::string encoder_report_body;
+	bool encoder_report_pending = false;
+
 	// Full-reference quality score (program feed = 100) for the top
 	// layer; started from Start() based on the service's "quality_score"
 	// setting, fed from Data(). Always scored against the H264 top

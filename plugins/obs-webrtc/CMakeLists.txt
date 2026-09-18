@@ -20,7 +20,7 @@ add_library(OBS::webrtc ALIAS obs-webrtc)
 
 target_sources(
   obs-webrtc
-  PRIVATE obs-webrtc.cpp nat-probe.cpp nat-probe.h ppcenter-client.cpp ppcenter-client.h ppcenter-signal-message.cpp ppcenter-signal-message.h ppcenter-signal-outgoing.cpp ppcenter-signal-outgoing.h ppcenter-websocket-frame.cpp ppcenter-websocket-frame.h ppcenter-websocket-utils.cpp ppcenter-websocket-utils.h ppcenter-signal.cpp ppcenter-signal.h device-registration.cpp device-registration.h uplink-qos-policy.cpp uplink-qos-policy.h whip-output.cpp whip-output.h whip-codec-session.cpp whip-codec-session.h whip-service.cpp whip-service.h whip-utils.h degrade-client.cpp degrade-client.h quality-score.cpp quality-score.h
+  PRIVATE obs-webrtc.cpp nat-probe.cpp nat-probe.h ppcenter-client.cpp ppcenter-client.h ppcenter-signal-message.cpp ppcenter-signal-message.h ppcenter-signal-outgoing.cpp ppcenter-signal-outgoing.h ppcenter-websocket-frame.cpp ppcenter-websocket-frame.h ppcenter-websocket-utils.cpp ppcenter-websocket-utils.h ppcenter-signal.cpp ppcenter-signal.h device-registration.cpp device-registration.h encoder-report.cpp encoder-report.h uplink-qos-policy.cpp uplink-qos-policy.h whip-output.cpp whip-output.h whip-codec-session.cpp whip-codec-session.h whip-service.cpp whip-service.h whip-utils.h degrade-client.cpp degrade-client.h quality-score.cpp quality-score.h
 )
 
 target_compile_definitions(
@@ -66,3 +66,7 @@ target_include_directories(obs-webrtc-uplink-qos-policy-test PRIVATE ${CMAKE_CUR
 add_executable(obs-webrtc-ppcenter-publish-request-test EXCLUDE_FROM_ALL tests/ppcenter-publish-request-test.cpp ppcenter-client.cpp ppcenter-client.h)
 target_include_directories(obs-webrtc-ppcenter-publish-request-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(obs-webrtc-ppcenter-publish-request-test PRIVATE OBS::libobs CURL::libcurl)
+
+add_executable(obs-webrtc-encoder-report-test EXCLUDE_FROM_ALL tests/encoder-report-test.cpp encoder-report.cpp encoder-report.h)
+target_include_directories(obs-webrtc-encoder-report-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(obs-webrtc-encoder-report-test PRIVATE OBS::libobs CURL::libcurl)
