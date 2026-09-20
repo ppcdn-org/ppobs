@@ -212,12 +212,30 @@ bool WHIPOutput::Init()
 
 // Builds the video layer list (in rid order) for one codec from the
 // output's assigned video encoders: encoders whose obs_encoder_get_codec()
-// matches wantCodec, in slot order. H264 (or the sole codec, when
-// multitrack is off) reads every video encoder slot 0..N; HEVC in
-// multitrack mode reads its own separately-created ladder (see
+// matches wantCodec, sorted highest-resolution-first. H264 (or the sole
+// codec, when multitrack is off) reads every video encoder slot 0..N; HEVC
+// in multitrack mode reads its own separately-created ladder (see
 // OBSBasicSettings_Stream.cpp's HEVC encoder creation, mirroring
 // WHIPSimulcastEncoders) which the frontend assigns to distinct encoder
 // slots from the H264 ladder.
+//
+// Collected in slot order first, then explicitly re-sorted by actual pixel
+// area (descending) rather than trusting slot order to already be quality
+// order: AdvancedOutput.cpp/SimpleOutput.cpp's SetupOutputs() cannot always
+// put a codec's full-resolution base encoder in the slot right before its
+// scaled layers. When H264+HEVC multitrack is on and the user's Stream
+// Encoder (slot 0) is HEVC, whipH264Base has nowhere to go but *after* both
+// the H264 Simulcast ladder and the HEVC ladder ("Placed after the
+// Simulcast/HEVC ladders so it cannot overwrite one of their slots" - see
+// the baseSlot comment there) - so by pure slot order, H264's base ends up
+// last, not first, and every downstream consumer that assigns rid=index
+// into this vector (WHIPCodecSession::SetVideoLayers) would label the
+// highest-quality layer as the lowest-priority rid instead of rid 0. This
+// was confirmed in production: mmx's receive-side pointer tracing showed
+// rid "0" consistently resolving to the 720p Simulcast layer, never the
+// 1080p base, for exactly this multitrack configuration. Sorting by actual
+// encoder resolution here fixes rid order regardless of which slot layout
+// SetupOutputs() had to use to avoid collisions.
 static std::vector<obs_encoder_t *> collectVideoLayers(obs_output_t *output, const char *wantCodec)
 {
 	std::vector<obs_encoder_t *> layers;
@@ -229,6 +247,16 @@ static std::vector<obs_encoder_t *> collectVideoLayers(obs_output_t *output, con
 		if (codec && strcmp(codec, wantCodec) == 0)
 			layers.push_back(encoder);
 	}
+
+	// Stable so two layers configured at the exact same resolution (unusual,
+	// but not disallowed) keep their original slot-order relative to each
+	// other instead of shuffling on every call.
+	std::stable_sort(layers.begin(), layers.end(), [](obs_encoder_t *a, obs_encoder_t *b) {
+		const uint64_t areaA = (uint64_t)obs_encoder_get_width(a) * obs_encoder_get_height(a);
+		const uint64_t areaB = (uint64_t)obs_encoder_get_width(b) * obs_encoder_get_height(b);
+		return areaA > areaB;
+	});
+
 	return layers;
 }
 
