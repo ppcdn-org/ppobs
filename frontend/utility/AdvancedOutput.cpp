@@ -380,7 +380,26 @@ void AdvancedOutput::UpdateStreamSettings()
 
 	obs_encoder_update(videoStreaming, settings);
 	if (whipSimulcastEncoders != nullptr) {
-		whipSimulcastEncoders->Update(settings, obs_data_get_int(settings, "bitrate"), main->Config());
+		// With HEVC/H264 multitrack on and an HEVC stream encoder,
+		// `settings` above is the HEVC encoder's configuration, but the
+		// H264 Simulcast ladder was created from the separately-saved
+		// H264 encoder config and sizes every scaled layer proportionally
+		// to the H264 base's own bitrate (see SetupOutputs). Fetch that
+		// config here too - feeding it the HEVC settings re-sizes each
+		// scaled H264 layer off the HEVC main bitrate instead (e.g. a
+		// 3.0M H264 base gets 0.67M/0.17M layers instead of 1.33M/0.33M),
+		// so the H264 half silently runs well below its configured
+		// bitrate and both the status bar and the wire total come out
+		// low.
+		OBSData simulcastSettings = settings;
+		if (whipHevcEncoders != nullptr) {
+			std::string h264EncoderId = ResolveWHIPH264EncoderId(streamEncoder);
+			OBSData h264Settings = GetEncoderDataFromJsonFile("streamEncoder", h264EncoderId.c_str());
+			if (h264Settings)
+				simulcastSettings = h264Settings;
+		}
+		whipSimulcastEncoders->Update(simulcastSettings, obs_data_get_int(simulcastSettings, "bitrate"),
+					      main->Config());
 	}
 	if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
 		whipHevcEncoders->Update(settings, obs_data_get_int(settings, "bitrate"), main->Config());
