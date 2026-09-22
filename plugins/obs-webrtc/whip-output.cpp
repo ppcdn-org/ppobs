@@ -847,7 +847,24 @@ constexpr int64_t NAT_PROBE_REFRESH_INTERVAL_MS = 4 * 60 * 1000;
 
 void WHIPOutput::CheckNatProbeRefresh()
 {
-	auto now_ms = (int64_t)(obs_get_video_frame_time() / 1000);
+	// obs_get_video_frame_time() returns nanoseconds (obs-video.c:
+	// obs->video.video_time = os_gettime_ns()), so this needs /1,000,000 to
+	// land in milliseconds - not /1000, which is only microseconds. Caught
+	// in production 2026-09-22: with /1000, NAT_PROBE_REFRESH_INTERVAL_MS
+	// (240000, intended as 240000ms = 4min) was being compared against a
+	// microsecond counter, so the "4 minute" throttle was actually a 240ms
+	// one - Data() runs per encoder packet, so this fired on nearly every
+	// packet and spawned a probe-submission thread each time (654 publisher
+	// /v1/nat/probe submissions in 3 minutes were observed on ppcenter
+	// before this fix). See docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
+	//
+	// CheckUplinkQos() above uses this same obs_get_video_frame_time()/1000
+	// pattern and very likely has the identical bug (its "2000" threshold is
+	// probably 2ms of real time, not 2s) - not fixed here since it's a
+	// separate subsystem (uplink congestion policy) this session never
+	// otherwise touched, and changing its actual behavioral cadence deserves
+	// its own review rather than a drive-by fix alongside this one.
+	auto now_ms = (int64_t)(obs_get_video_frame_time() / 1000000);
 	if (now_ms - lastNatProbeRefreshMs < NAT_PROBE_REFRESH_INTERVAL_MS)
 		return;
 	lastNatProbeRefreshMs = now_ms;
