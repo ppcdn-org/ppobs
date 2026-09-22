@@ -104,6 +104,7 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 	}
 
 	CheckUplinkQos();
+	CheckNatProbeRefresh();
 
 	if (packet->type == OBS_ENCODER_AUDIO) {
 		// Shared Opus output: both codec sessions send the same
@@ -491,6 +492,11 @@ bool WHIPOutput::Setup(uint64_t generation)
 		do_log(LOG_INFO, "device registered: deviceId=%s", deviceId.c_str());
 	}
 	request.device_id = deviceId;
+	natProbeUrl = request.url;
+	natProbeAppId = request.app_id;
+	natProbeAppSecret = request.app_secret;
+	natProbeStreamName = request.stream_name;
+	lastNatProbeRefreshMs = (int64_t)(obs_get_video_frame_time() / 1000);
 	const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name);
 	if (probe.succeeded) {
 		request.nat_probe_id = probe.probe_id;
@@ -815,6 +821,60 @@ void WHIPOutput::CheckUplinkQos()
 		for (const auto &sid : decision.sessionsToClose)
 			p2pSignal->SendClose(sid, "uplink_congested");
 	}
+}
+
+// ppcenter's publisher-side NAT observation (submitted once, in Setup(),
+// before this session ever starts publishing) expires 5 minutes after that
+// single submission (nat_probe_v1.go: ExpiresAt = now+5min). A live stream
+// routinely runs far longer than that, and Coordinator.AllocateEligible
+// fails every play attempt closed with missing_publisher_probe once it's
+// gone stale - not "P2P tried and lost", P2P is never even offered to any
+// viewer who joins more than ~5 minutes after the stream started. Confirmed
+// in production 2026-09-22: a publisher probe from 11:37 was still the only
+// one on record when viewers tried to play at 12:04/12:06, over 25 minutes
+// later - see docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
+//
+// Refreshed here every 4 minutes (comfortably inside the 5-minute TTL) by
+// resubmitting the exact same probe. This is safe to repeat: probeIDFor()
+// is deterministic from (appId, clientId), and clientId itself is a stable
+// per-installation UUID (GetOrCreateP2PClientId()), so every resubmission
+// lands on the same ppcenter-side observation slot as an upsert
+// (Save()/RegisterTrustedObservation()) rather than creating a new one -
+// nothing downstream of the original /v1/publish/requests call (the
+// natProbeId already handed to ppcenter, or this session's P2P signaling)
+// needs to change when a refresh succeeds.
+constexpr int64_t NAT_PROBE_REFRESH_INTERVAL_MS = 4 * 60 * 1000;
+
+void WHIPOutput::CheckNatProbeRefresh()
+{
+	auto now_ms = (int64_t)(obs_get_video_frame_time() / 1000);
+	if (now_ms - lastNatProbeRefreshMs < NAT_PROBE_REFRESH_INTERVAL_MS)
+		return;
+	lastNatProbeRefreshMs = now_ms;
+	if (natProbeUrl.empty() || natProbeAppId.empty() || natProbeAppSecret.empty() || natProbeStreamName.empty())
+		return;
+
+	// ProbePublisherNAT does its own blocking curl call (up to ~9s worst
+	// case: 4s ICE gather + 5s HTTP) - Data() runs on the active encoder's
+	// hot path, so this must never run inline there. Detached and
+	// fire-and-forget, matching ProbePublisherNAT's existing "must never
+	// block or abort the publish attempt" contract (nat-probe.h); the
+	// thread only touches copies of plain strings, never `this`, so it's
+	// safe even if this WHIPOutput is destroyed while a refresh is still
+	// in flight.
+	// blog() directly, not the do_log() macro used elsewhere in this file -
+	// do_log implicitly references the `output` member (via
+	// obs_output_get_name(output)), which this lambda deliberately does not
+	// capture.
+	std::thread([url = natProbeUrl, appId = natProbeAppId, appSecret = natProbeAppSecret,
+		     streamName = natProbeStreamName]() {
+		const auto probe = ProbePublisherNAT(url, appId, appSecret, streamName);
+		if (probe.succeeded)
+			blog(LOG_DEBUG, "[obs-webrtc] [nat-probe-refresh] P2P publisher NAT probe refreshed");
+		else
+			blog(LOG_DEBUG,
+			     "[obs-webrtc] [nat-probe-refresh] P2P publisher NAT probe refresh failed; will retry next interval");
+	}).detach();
 }
 
 void register_whip_output()

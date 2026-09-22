@@ -71,6 +71,9 @@ private:
 	void OnSessionPermanentFailure(const std::string &codecLabel, const std::string &reason);
 	bool StartP2PSignal();
 	void CheckUplinkQos();
+	// Keeps ppcenter's publisher-side NAT observation from going stale over
+	// a long stream - see CheckNatProbeRefresh()'s own comment.
+	void CheckNatProbeRefresh();
 
 	obs_output_t *output;
 
@@ -98,6 +101,15 @@ private:
 	std::vector<std::string> p2pStunServers;
 	std::unique_ptr<UplinkQosPolicy> qosPolicy;
 	int64_t lastQosCheckMs = 0;
+
+	// Cached from Setup()'s PPCenterPublishRequest so CheckNatProbeRefresh()
+	// (called repeatedly from Data(), long after Setup() has returned) can
+	// resubmit the same probe without re-reading service settings.
+	std::string natProbeUrl;
+	std::string natProbeAppId;
+	std::string natProbeAppSecret;
+	std::string natProbeStreamName;
+	int64_t lastNatProbeRefreshMs = 0;
 
 	// Encoder-parameter report (see encoder-report.h): the actual encoder
 	// config is captured in Setup() and sent once the output is running in
