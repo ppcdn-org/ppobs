@@ -71,6 +71,7 @@ size_t write_response(char *ptr, size_t size, size_t nmemb, void *userdata)
 struct GatheredCandidate {
 	bool found = false;
 	bool isSrflx = false;
+	bool isIPv4 = false;
 	std::string address;
 	uint16_t port = 0;
 };
@@ -106,6 +107,26 @@ bool IsPublicIPAddress(const std::string &address)
 	return !unspecifiedOrLoopback && !linkLocal && !uniqueLocal && !multicast;
 }
 
+bool IsIPv4Address(const std::string &address)
+{
+	in_addr ipv4{};
+	return inet_pton(AF_INET, address.c_str(), &ipv4) == 1;
+}
+
+// Ranks candidates the same way ppplayer's nat-probe.mjs pickProbeCandidate
+// does: IPv4 server-reflexive best, then any server-reflexive, then an IPv4
+// host address, then an IPv6 host address. Lower is better.
+int CandidateRank(bool isSrflx, bool isIPv4)
+{
+	if (isSrflx && isIPv4)
+		return 0;
+	if (isSrflx)
+		return 1;
+	if (isIPv4)
+		return 2;
+	return 3;
+}
+
 // ppcenter runs its own STUN server (internal/stun) on the same host as the
 // API, conventionally at port 3478. Mirrors pplayer's nat-probe.mjs
 // deriveStunIceServers(), string-sliced instead of URL-parsed to match this
@@ -124,23 +145,32 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 	try {
 
 	rtc::Configuration cfg;
-	// ppcenter's own STUN, and deliberately the *only* one - not raced
-	// against a public fallback (Google's was here until 2026-09-22).
-	// api.pp-cdn.org has no AAAA record, so ppcenter's STUN can only ever
-	// answer IPv4; a public provider typically also answers IPv6, so racing
-	// both let this probe and a player's own probe (pplayer's
+	// ppcenter's own STUN, tried first, with Google's public STUN restored
+	// as a reachability fallback (removed for one deploy on 2026-09-22,
+	// then restored the same day): some networks can't reach ppcenter's own
+	// STUN at all - confirmed in production when this publisher's network,
+	// which had been reaching Google's STUN reliably every 4 minutes via
+	// CheckNatProbeRefresh(), got zero responses from ppcenter's own the
+	// moment Google was removed. A failed probe here means the whole
+	// attempt falls back to edge-only, so reachability matters more than
+	// which server answers.
+	//
+	// Racing two servers can make this probe and a player's own (pplayer's
 	// nat-probe.mjs, same change made there) each win against a *different*
-	// server and come back with different address families - which
-	// ppcenter's eligibility check rejects outright as
-	// address_family_mismatch. Confirmed in production 2026-09-22 as the
-	// failure mode right after every earlier one got fixed. A failed/slow
-	// probe against ppcenter's STUN alone still falls back to edge-only
-	// exactly like today; this isn't a new failure mode, just no longer
-	// papered over by a second server that could disagree with the first.
-	// See docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
+	// one and disagree on address family (api.pp-cdn.org has no AAAA
+	// record, so ppcenter's own can only ever answer IPv4; Google's
+	// typically answers whichever family the network prefers) -
+	// ppcenter's eligibility check rejects that pairing outright as
+	// address_family_mismatch (also confirmed in production 2026-09-22,
+	// right after identity_mismatch got fixed). Handled below by only
+	// waking the waiter early on an IPv4 srflx candidate specifically, from
+	// either server, rather than on whichever answers first - see
+	// CandidateRank() and the wait_for predicate below. See
+	// docs/test/ppcdn-debug-log.md's 2026-09-22 entry for the full trail.
 	const std::string stunHost = DeriveStunHost(ppcenterUrl);
 	if (!stunHost.empty())
 		cfg.iceServers.emplace_back("stun:" + stunHost + ":3478");
+	cfg.iceServers.emplace_back("stun:stun.l.google.com:19302");
 
 	auto pc = std::make_shared<rtc::PeerConnection>(cfg);
 	// A PeerConnection with no track/channel has nothing to negotiate,
@@ -173,25 +203,30 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 			return;
 		if (isHost && !IsPublicIPAddress(*address))
 			return;
+		const bool isIPv4 = IsIPv4Address(*address);
 
 		std::lock_guard<std::mutex> lock(state->mutex);
-		// Prefer srflx (actual public address) over host; keep the
-		// first candidate of the winning kind rather than the last.
-		if (state->best.found && (state->best.isSrflx || !isSrflx))
+		// Keep the better-ranked candidate; on a tie, keep the first
+		// seen rather than the last. See CandidateRank().
+		if (state->best.found && CandidateRank(isSrflx, isIPv4) >= CandidateRank(state->best.isSrflx, state->best.isIPv4))
 			return;
 		state->best.found = true;
 		state->best.isSrflx = isSrflx;
+		state->best.isIPv4 = isIPv4;
 		state->best.address = *address;
 		state->best.port = *port;
-		// Wake the waiter as soon as a usable srflx candidate shows up
-		// rather than only on full gathering completion - srflx is
-		// already the top-ranked type below, so nothing is gained by
-		// continuing to wait once one has been seen, and waiting for
-		// `done` means one slow/unreachable configured ICE server (the
-		// Google fallback above, on a network where it's throttled)
-		// still holds up the whole probe even though another one already
-		// answered. Same fix as pplayer's nat-probe.mjs.
-		if (isSrflx) state->cv.notify_all();
+		// Wake the waiter as soon as an IPv4 srflx candidate shows up -
+		// the top rank - rather than only on full gathering completion.
+		// Specifically IPv4, not "any srflx": with two STUN servers
+		// racing, an IPv6 srflx from whichever server answers first must
+		// not short-circuit gathering before an IPv4 one (from either
+		// server) has a chance to arrive, or this probe and a player's
+		// own could disagree on address family (see this function's
+		// iceServers comment on address_family_mismatch). If IPv4 never
+		// shows up, the wait_for below still falls back to the best
+		// candidate found by the time gathering completes or the
+		// timeout elapses. Same fix as pplayer's nat-probe.mjs.
+		if (isSrflx && isIPv4) state->cv.notify_all();
 	});
 
 	try {
@@ -204,7 +239,7 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 	{
 		std::unique_lock<std::mutex> lock(state->mutex);
 		state->cv.wait_for(lock, std::chrono::milliseconds(ICE_GATHER_TIMEOUT_MS),
-				    [&] { return state->done || (state->best.found && state->best.isSrflx); });
+				    [&] { return state->done || (state->best.found && state->best.isSrflx && state->best.isIPv4); });
 	}
 
 	pc->resetCallbacks();
