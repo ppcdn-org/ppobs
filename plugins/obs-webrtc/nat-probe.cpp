@@ -106,17 +106,37 @@ bool IsPublicIPAddress(const std::string &address)
 	return !unspecifiedOrLoopback && !linkLocal && !uniqueLocal && !multicast;
 }
 
-GatheredCandidate GatherBestLocalCandidate()
+// ppcenter runs its own STUN server (internal/stun) on the same host as the
+// API, conventionally at port 3478. Mirrors pplayer's nat-probe.mjs
+// deriveStunIceServers(), string-sliced instead of URL-parsed to match this
+// file's own DeriveNatProbeUrl() style rather than pulling in a URL library
+// for one host extraction.
+std::string DeriveStunHost(const std::string &ppcenterUrl)
+{
+	auto schemeEnd = ppcenterUrl.find("://");
+	const std::string rest = schemeEnd == std::string::npos ? ppcenterUrl : ppcenterUrl.substr(schemeEnd + 3);
+	const auto hostEnd = rest.find_first_of(":/");
+	return hostEnd == std::string::npos ? rest : rest.substr(0, hostEnd);
+}
+
+GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 {
 	try {
 
 	rtc::Configuration cfg;
-	// A public STUN server here is only ever used to learn this
-	// machine's own reflexive address for the probe report - unrelated
-	// to which STUN server the eventual P2P PeerConnection uses (see
-	// docs/design/ppobs-p2p-nat-probe-gap.zh-CN.md R2, and its note on
-	// pplayer's nat-probe.mjs using the same public STUN for the same
-	// probe-only reason).
+	// ppcenter's own STUN tried first - it shares this publisher's network
+	// path to ppcenter itself, so it isn't subject to a public STUN
+	// provider being slow or blocked on networks where reaching it is
+	// unreliable. Google kept as a fallback. Confirmed in production
+	// 2026-09-22: with Google STUN alone, this probe routinely failed to
+	// find any candidate inside ICE_GATHER_TIMEOUT_MS, leaving the
+	// publisher's natProbeId permanently empty for the whole stream (see
+	// docs/test/ppcdn-debug-log.md's 2026-09-22 entry - the same root
+	// cause already fixed on the pplayer side, nat-probe.mjs's
+	// deriveStunIceServers(), just not yet here).
+	const std::string stunHost = DeriveStunHost(ppcenterUrl);
+	if (!stunHost.empty())
+		cfg.iceServers.emplace_back("stun:" + stunHost + ":3478");
 	cfg.iceServers.emplace_back("stun:stun.l.google.com:19302");
 
 	auto pc = std::make_shared<rtc::PeerConnection>(cfg);
@@ -160,6 +180,15 @@ GatheredCandidate GatherBestLocalCandidate()
 		state->best.isSrflx = isSrflx;
 		state->best.address = *address;
 		state->best.port = *port;
+		// Wake the waiter as soon as a usable srflx candidate shows up
+		// rather than only on full gathering completion - srflx is
+		// already the top-ranked type below, so nothing is gained by
+		// continuing to wait once one has been seen, and waiting for
+		// `done` means one slow/unreachable configured ICE server (the
+		// Google fallback above, on a network where it's throttled)
+		// still holds up the whole probe even though another one already
+		// answered. Same fix as pplayer's nat-probe.mjs.
+		if (isSrflx) state->cv.notify_all();
 	});
 
 	try {
@@ -171,7 +200,8 @@ GatheredCandidate GatherBestLocalCandidate()
 
 	{
 		std::unique_lock<std::mutex> lock(state->mutex);
-		state->cv.wait_for(lock, std::chrono::milliseconds(ICE_GATHER_TIMEOUT_MS), [&] { return state->done; });
+		state->cv.wait_for(lock, std::chrono::milliseconds(ICE_GATHER_TIMEOUT_MS),
+				    [&] { return state->done || (state->best.found && state->best.isSrflx); });
 	}
 
 	pc->resetCallbacks();
@@ -232,7 +262,7 @@ NATProbeResult ProbePublisherNAT(const std::string &ppcenterUrl, const std::stri
 	if (clientId.empty())
 		return result;
 
-	auto candidate = GatherBestLocalCandidate();
+	auto candidate = GatherBestLocalCandidate(ppcenterUrl);
 	if (!candidate.found)
 		return result;
 
