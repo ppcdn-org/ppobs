@@ -496,6 +496,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 	natProbeAppId = request.app_id;
 	natProbeAppSecret = request.app_secret;
 	natProbeStreamName = request.stream_name;
+	natProbeClientId = deviceId;
 	// /1,000,000 to match CheckNatProbeRefresh()'s own conversion (ns -> ms) -
 	// this baseline and that function's now_ms must be in the same unit or
 	// the first comparison is meaningless. Originally written with the same
@@ -506,7 +507,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 	// (and therefore "under the throttle") for longer than any real stream
 	// runs - the periodic refresh would never fire in practice.
 	lastNatProbeRefreshMs = (int64_t)(obs_get_video_frame_time() / 1000000);
-	const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name, deviceId);
+	const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name, natProbeClientId);
 	if (probe.succeeded) {
 		request.nat_probe_id = probe.probe_id;
 		do_log(LOG_INFO, "P2P publisher NAT probe registered");
@@ -893,8 +894,8 @@ void WHIPOutput::CheckNatProbeRefresh()
 	// obs_output_get_name(output)), which this lambda deliberately does not
 	// capture.
 	std::thread([url = natProbeUrl, appId = natProbeAppId, appSecret = natProbeAppSecret,
-		     streamName = natProbeStreamName]() {
-		const auto probe = ProbePublisherNAT(url, appId, appSecret, streamName);
+		     streamName = natProbeStreamName, clientId = natProbeClientId]() {
+		const auto probe = ProbePublisherNAT(url, appId, appSecret, streamName, clientId);
 		if (probe.succeeded)
 			blog(LOG_DEBUG, "[obs-webrtc] [nat-probe-refresh] P2P publisher NAT probe refreshed");
 		else

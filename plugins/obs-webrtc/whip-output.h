@@ -109,6 +109,11 @@ private:
 	std::string natProbeAppId;
 	std::string natProbeAppSecret;
 	std::string natProbeStreamName;
+	// The deviceId Setup() resolved and sent to /v1/publish/requests - must
+	// be reused verbatim as every NAT probe's clientId (initial and
+	// refreshed alike), or ppcenter's identity check rejects the pair as
+	// identity_mismatch. See ProbePublisherNAT's doc comment.
+	std::string natProbeClientId;
 	int64_t lastNatProbeRefreshMs = 0;
 
 	// Encoder-parameter report (see encoder-report.h): the actual encoder
