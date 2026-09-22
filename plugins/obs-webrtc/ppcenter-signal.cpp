@@ -1,161 +1,26 @@
 #include "ppcenter-signal.h"
 #include "ppcenter-signal-message.h"
 #include "ppcenter-signal-outgoing.h"
-#include "ppcenter-websocket-frame.h"
 #include "ppcenter-websocket-utils.h"
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#undef send
-#pragma comment(lib, "ws2_32.lib")
-typedef SOCKET sock_t;
-#define SOCK_INVALID INVALID_SOCKET
-#define SOCK_ERR SOCKET_ERROR
-#define SOCK_CLOSE(s) closesocket(s)
-#define SOCK_RECV(s,b,l) recv(s,b,l,0)
-#define SOCK_SEND(s,b,l) send(s,b,l,0)
-#else
-#include <sys/socket.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <unistd.h>
-typedef int sock_t;
-#define SOCK_INVALID (-1)
-#define SOCK_ERR (-1)
-#define SOCK_CLOSE(s) close(s)
-#define SOCK_RECV(s,b,l) (int)recv(s,b,l,0)
-#define SOCK_SEND(s,b,l) (int)send(s,b,l,0)
-#endif
+#include <rtc/websocket.hpp>
 
 #include <obs.h>
-#include <curl/curl.h>
 
-#include <sstream>
-#include <cstring>
-#include <vector>
-#include <cstdio>
-#include <algorithm>
 #include <chrono>
-#include <random>
+#include <condition_variable>
+#include <cstring>
+#include <future>
+#include <memory>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 const int MAX_VIDEO_FRAGMENT_SIZE = 1200;
 const int VIDEO_NACK_BUFFER_SIZE = 512;
-const size_t MAX_WS_HANDSHAKE_BYTES = 16384;
-const size_t MAX_WS_PAYLOAD_BYTES = 1024 * 1024;
-const int WS_SOCKET_TIMEOUT_MS = 5000;
 const std::string VIDEO_MID = "0";
 const std::string AUDIO_MID = "1";
-
-std::vector<unsigned char> RandomBytes(size_t count)
-{
-	std::vector<unsigned char> bytes(count);
-	std::random_device rd;
-	for (auto &byte : bytes)
-		byte = static_cast<unsigned char>(rd());
-	return bytes;
-}
-
-std::string Base64Encode(const unsigned char *data, size_t len)
-{
-	static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-	std::string out;
-	out.reserve(((len + 2) / 3) * 4);
-	for (size_t i = 0; i < len; i += 3) {
-		const uint32_t b0 = data[i];
-		const uint32_t b1 = (i + 1 < len) ? data[i + 1] : 0;
-		const uint32_t b2 = (i + 2 < len) ? data[i + 2] : 0;
-		const uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
-		out.push_back(table[(triple >> 18) & 0x3F]);
-		out.push_back(table[(triple >> 12) & 0x3F]);
-		out.push_back((i + 1 < len) ? table[(triple >> 6) & 0x3F] : '=');
-		out.push_back((i + 2 < len) ? table[triple & 0x3F] : '=');
-	}
-	return out;
-}
-
-bool SetSocketTimeouts(sock_t socket)
-{
-#ifdef _WIN32
-	DWORD timeoutMs = WS_SOCKET_TIMEOUT_MS;
-	return setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&timeoutMs), sizeof(timeoutMs)) != SOCK_ERR &&
-	       setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&timeoutMs), sizeof(timeoutMs)) != SOCK_ERR;
-#else
-	timeval timeout{};
-	timeout.tv_sec = WS_SOCKET_TIMEOUT_MS / 1000;
-	timeout.tv_usec = (WS_SOCKET_TIMEOUT_MS % 1000) * 1000;
-	return setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != SOCK_ERR &&
-	       setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != SOCK_ERR;
-#endif
-}
-
-bool SetSocketBlocking(sock_t socket, bool blocking)
-{
-#ifdef _WIN32
-	u_long mode = blocking ? 0 : 1;
-	return ioctlsocket(socket, FIONBIO, &mode) == 0;
-#else
-	int flags = fcntl(socket, F_GETFL, 0);
-	if (flags < 0)
-		return false;
-	if (blocking)
-		flags &= ~O_NONBLOCK;
-	else
-		flags |= O_NONBLOCK;
-	return fcntl(socket, F_SETFL, flags) == 0;
-#endif
-}
-
-bool ConnectWithTimeout(sock_t socket, const sockaddr *addr, socklen_t addrLen)
-{
-	if (!SetSocketBlocking(socket, false))
-		return false;
-
-	int rc = ::connect(socket, addr, (int)addrLen);
-	if (rc == SOCK_ERR) {
-#ifdef _WIN32
-		const int err = WSAGetLastError();
-		if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS && err != WSAEINVAL)
-			return false;
-#else
-		if (errno != EINPROGRESS)
-			return false;
-#endif
-	}
-
-	fd_set writeSet;
-	FD_ZERO(&writeSet);
-	FD_SET(socket, &writeSet);
-	timeval timeout{};
-	timeout.tv_sec = WS_SOCKET_TIMEOUT_MS / 1000;
-	timeout.tv_usec = (WS_SOCKET_TIMEOUT_MS % 1000) * 1000;
-	const int ready = select((int)socket + 1, nullptr, &writeSet, nullptr, &timeout);
-	if (ready <= 0 || !FD_ISSET(socket, &writeSet))
-		return false;
-
-	int socketError = 0;
-#ifdef _WIN32
-	int optLen = sizeof(socketError);
-#else
-	socklen_t optLen = sizeof(socketError);
-#endif
-	if (getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&socketError), &optLen) == SOCK_ERR)
-		return false;
-	if (socketError != 0)
-		return false;
-
-	return SetSocketBlocking(socket, true);
-}
-
 } // namespace
 
 class P2PSignalImpl {
@@ -163,11 +28,7 @@ public:
 	P2PSignalImpl(const std::string &url, const std::string &token)
 		: signalUrl(url), signalToken(token)
 	{
-		auto parsed = ParseWebSocketSignalURL(signalUrl);
-		validEndpoint = parsed.valid;
-		tls = parsed.tls;
-		host = std::move(parsed.host);
-		path = std::move(parsed.path);
+		validEndpoint = ParseWebSocketSignalURL(signalUrl).valid;
 	}
 
 	~P2PSignalImpl() { stop(); }
@@ -192,271 +53,167 @@ public:
 	void stop()
 	{
 		if (!running.exchange(false)) return;
+		std::shared_ptr<rtc::WebSocket> sock;
 		{
-			std::lock_guard<std::mutex> lock(sendMutex);
-			closeTransport();
-			sock = SOCK_INVALID;
+			std::lock_guard<std::mutex> lock(wsMutex);
+			sock = ws;
+			ws.reset();
+			wsConnected = false;
+		}
+		wsCv.notify_all();
+		if (sock) {
+			try {
+				sock->close();
+			} catch (...) {
+			}
 		}
 		if (thread.joinable()) thread.join();
 	}
 
 	bool wsSend(const std::string &data)
 	{
-		std::lock_guard<std::mutex> lock(sendMutex);
-		if (!isTransportConnected()) return false;
-		return sendMaskedFrame(0x01, data);
+		std::lock_guard<std::mutex> lock(wsMutex);
+		return ws && ws->isOpen() && ws->send(data);
 	}
 
 private:
-	bool transportSend(const char *data, size_t length)
-	{
-		size_t sent = 0;
-		while (sent < length) {
-			size_t n = 0;
-			if (curl) {
-				CURLcode rc = curl_easy_send(curl, data + sent, length - sent, &n);
-				if (rc != CURLE_OK || n == 0) return false;
-			} else {
-				const int rc = SOCK_SEND(sock, data + sent, (int)(length - sent));
-				if (rc <= 0) return false;
-				n = static_cast<size_t>(rc);
-			}
-			sent += n;
-		}
-		return true;
-	}
-
-	int transportRecv(char *buffer, size_t length)
-	{
-		if (curl) {
-			size_t n = 0;
-			CURLcode rc = curl_easy_recv(curl, buffer, length, &n);
-			if (rc != CURLE_OK || n == 0) return -1;
-			return static_cast<int>(n);
-		}
-		return SOCK_RECV(sock, buffer, (int)length);
-	}
-
-	bool isTransportConnected() const { return curl != nullptr || sock != SOCK_INVALID; }
-
-	void closeTransport()
-	{
-		if (curl) {
-			curl_easy_cleanup(curl);
-			curl = nullptr;
-		}
-		if (sock != SOCK_INVALID) {
-			SOCK_CLOSE(sock);
-			sock = SOCK_INVALID;
-		}
-	}
-
-	bool sendMaskedFrame(unsigned char opcode, const std::string &data)
-	{
-		auto maskKey = RandomBytes(4);
-		std::array<unsigned char, 4> mask = {maskKey[0], maskKey[1], maskKey[2], maskKey[3]};
-		auto frame = BuildClientWebSocketFrame(opcode, data, mask);
-		return transportSend(frame.data(), frame.size());
-	}
-
-	bool readExact(char *buffer, size_t length)
-	{
-		size_t copied = 0;
-		if (!pendingRead.empty()) {
-			copied = std::min(length, pendingRead.size());
-			memcpy(buffer, pendingRead.data(), copied);
-			pendingRead.erase(pendingRead.begin(), pendingRead.begin() + copied);
-		}
-		while (copied < length) {
-			const int n = transportRecv(buffer + copied, length - copied);
-			if (n <= 0)
-				return false;
-			copied += n;
-		}
-		return true;
-	}
-
 	void run()
 	{
 		while (running) {
-			if (!connectWS()) { if (!running) return; std::this_thread::sleep_for(std::chrono::seconds(5)); continue; }
+			if (!connectWS()) {
+				blog(LOG_WARNING, "[ppobs P2P] signal connect failed; retrying in 5s");
+				if (!running) return;
+				waitFor(std::chrono::seconds(5));
+				continue;
+			}
 			blog(LOG_INFO, "[ppobs P2P] signaling connected");
-			processMessages();
 			{
-				std::lock_guard<std::mutex> lock(sendMutex);
-				closeTransport();
+				std::unique_lock<std::mutex> lock(wsMutex);
+				wsCv.wait(lock, [this] { return !running.load() || !wsConnected; });
 			}
 			if (!running) return;
-			std::this_thread::sleep_for(std::chrono::seconds(2));
+			blog(LOG_WARNING, "[ppobs P2P] signal connection closed; reconnecting");
+			std::shared_ptr<rtc::WebSocket> sock;
+			{
+				std::lock_guard<std::mutex> lock(wsMutex);
+				sock = ws;
+				ws.reset();
+				wsConnected = false;
+			}
+			if (sock) {
+				try {
+					sock->close();
+				} catch (...) {
+				}
+			}
+			waitFor(std::chrono::seconds(2));
 		}
+	}
+
+	void waitFor(std::chrono::milliseconds delay)
+	{
+		std::unique_lock<std::mutex> lock(wsMutex);
+		wsCv.wait_for(lock, delay, [this] { return !running.load(); });
 	}
 
 	bool connectWS()
 	{
-		pendingRead.clear();
-		if (tls) return connectWSS();
-		struct addrinfo hints = {}, *result = nullptr;
-		hints.ai_family = AF_UNSPEC;
-		hints.ai_socktype = SOCK_STREAM;
-		std::string h = host;
-		std::string port = "80";
-		if (!host.empty() && host.front() == '[') {
-			auto close = host.find(']');
-			if (close == std::string::npos)
-				return false;
-			h = host.substr(1, close - 1);
-			if (close + 1 < host.size()) {
-				if (host[close + 1] != ':' || close + 2 >= host.size())
-					return false;
-				port = host.substr(close + 2);
+		auto sock = std::make_shared<rtc::WebSocket>(makeWebSocketConfig());
+		auto opened = std::make_shared<std::promise<bool>>();
+		auto openedFuture = opened->get_future();
+
+		sock->onOpen([this, opened]() {
+			{
+				std::lock_guard<std::mutex> lock(wsMutex);
+				wsConnected = true;
 			}
-		} else {
-			auto portPos = host.find(':');
-			if (portPos != std::string::npos) {
-				h = host.substr(0, portPos);
-				port = host.substr(portPos + 1);
+			try {
+				opened->set_value(true);
+			} catch (...) {
 			}
+			wsCv.notify_all();
+		});
+		sock->onError([this, opened](rtc::string err) {
+			blog(LOG_WARNING, "[ppobs P2P] signal error: %s", err.c_str());
+			try {
+				opened->set_value(false);
+			} catch (...) {
+			}
+		});
+		sock->onClosed([this, opened]() {
+			{
+				std::lock_guard<std::mutex> lock(wsMutex);
+				wsConnected = false;
+			}
+			// Resolve a still-pending handshake so connectWS() (and therefore
+			// stop()'s join) does not block for the full 10s timeout when the
+			// socket is closed without an error.
+			try {
+				opened->set_value(false);
+			} catch (...) {
+			}
+			wsCv.notify_all();
+		});
+		sock->onMessage([](rtc::binary) {}, [this](rtc::string text) {
+			if (onMessage) onMessage(text);
+		});
+
+		{
+			std::lock_guard<std::mutex> lock(wsMutex);
+			ws = sock;
 		}
-
-		if (getaddrinfo(h.c_str(), port.c_str(), &hints, &result) != 0) return false;
-
-		sock = SOCK_INVALID;
-		for (auto rp = result; rp; rp = rp->ai_next) {
-			sock = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-			if (sock == SOCK_INVALID) continue;
-			if (!SetSocketTimeouts(sock)) { SOCK_CLOSE(sock); sock = SOCK_INVALID; continue; }
-			if (ConnectWithTimeout(sock, rp->ai_addr, (socklen_t)rp->ai_addrlen)) break;
-			SOCK_CLOSE(sock);
-			sock = SOCK_INVALID;
-		}
-		freeaddrinfo(result);
-		if (sock == SOCK_INVALID) return false;
-
-		return completeWebSocketHandshake();
-	}
-
-	bool connectWSS()
-	{
-		curl = curl_easy_init();
-		if (!curl) return false;
-		std::string httpsUrl = "https://" + host + path;
-		char curlError[CURL_ERROR_SIZE] = {};
-		curl_easy_setopt(curl, CURLOPT_URL, httpsUrl.c_str());
-		curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
-		curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, WS_SOCKET_TIMEOUT_MS / 1000L);
-		curl_easy_setopt(curl, CURLOPT_TIMEOUT, WS_SOCKET_TIMEOUT_MS / 1000L);
-		curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curlError);
-		CURLcode rc = curl_easy_perform(curl);
-		if (rc != CURLE_OK) {
-			blog(LOG_WARNING, "[ppobs P2P] wss TLS connect failed: %s", curlError[0] ? curlError : curl_easy_strerror(rc));
-			closeTransport();
+		try {
+			sock->open(signalUrl);
+		} catch (const std::exception &e) {
+			blog(LOG_WARNING, "[ppobs P2P] signal open failed: %s", e.what());
+			std::lock_guard<std::mutex> lock(wsMutex);
+			if (ws == sock) ws.reset();
 			return false;
 		}
-		return completeWebSocketHandshake();
-	}
-
-	bool completeWebSocketHandshake()
-	{
-		auto nonce = RandomBytes(16);
-		const auto websocketKey = Base64Encode(nonce.data(), nonce.size());
-
-		std::ostringstream wsReq;
-		wsReq << "GET " << path << " HTTP/1.1\r\n"
-		      << "Host: " << host << "\r\n"
-		      << "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-		      << "Sec-WebSocket-Key: " << websocketKey << "\r\n"
-		      << "Sec-WebSocket-Version: 13\r\n"
-		      << "Sec-WebSocket-Protocol: ppcdn-p2p-v1, ppcdn-token." << signalToken << "\r\n\r\n";
-		std::string reqStr = wsReq.str();
-
-		if (!transportSend(reqStr.data(), reqStr.size())) { closeTransport(); return false; }
-
-		std::string response;
-		while (response.find("\r\n\r\n") == std::string::npos) {
-			char buf[1024];
-			const int n = transportRecv(buf, sizeof(buf));
-			if (n <= 0) { closeTransport(); return false; }
-			response.append(buf, n);
-			if (response.size() > MAX_WS_HANDSHAKE_BYTES) { closeTransport(); return false; }
-		}
-		const auto headerEnd = response.find("\r\n\r\n") + 4;
-		pendingRead.assign(response.begin() + headerEnd, response.end());
-		response.resize(headerEnd);
-		if (!WebSocketHandshakeAccepted(response) || !HasP2PSubprotocol(response) || !HasExpectedAccept(response, websocketKey)) {
-			closeTransport();
-			pendingRead.clear();
+		if (openedFuture.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
 			return false;
 		}
-		return true;
+		return openedFuture.get();
 	}
 
-	void processMessages()
+	rtc::WebSocketConfiguration makeWebSocketConfig() const
 	{
-		while (running && isTransportConnected()) {
-			unsigned char header[2];
-			if (!readExact((char *)header, 2)) return;
-
-			bool fin = (header[0] & 0x80) != 0;
-			int opcode = header[0] & 0x0F;
-			bool masked = (header[1] & 0x80) != 0;
-			size_t payloadLen = header[1] & 0x7F;
-			if (masked) {
-				blog(LOG_WARNING, "[ppobs P2P] refusing masked server WebSocket frame");
-				return;
-			}
-			if (opcode == 0x00 || (opcode == 0x01 && !fin)) {
-				blog(LOG_WARNING, "[ppobs P2P] refusing fragmented signaling frame");
-				return;
-			}
-			if (opcode >= 0x08 && !fin) {
-				blog(LOG_WARNING, "[ppobs P2P] refusing fragmented WebSocket control frame");
-				return;
-			}
-			if ((opcode >= 0x03 && opcode <= 0x07) || opcode > 0x0A) {
-				blog(LOG_WARNING, "[ppobs P2P] refusing unsupported WebSocket opcode: %d", opcode);
-				return;
-			}
-
-			if (payloadLen == 126) { unsigned char ext[2]; if (!readExact((char *)ext, 2)) return; payloadLen = ((size_t)ext[0] << 8) | ext[1]; }
-			else if (payloadLen == 127) { unsigned char ext[8]; if (!readExact((char *)ext, 8)) return; payloadLen = 0; for (int i = 0; i < 8; i++) payloadLen = (payloadLen << 8) | ext[i]; }
-			if (opcode >= 0x08 && payloadLen > 125) {
-				blog(LOG_WARNING, "[ppobs P2P] refusing oversized WebSocket control frame");
-				return;
-			}
-			if (payloadLen > MAX_WS_PAYLOAD_BYTES) {
-				blog(LOG_WARNING, "[ppobs P2P] signaling frame too large: %zu bytes", payloadLen);
-				return;
-			}
-
-			std::vector<char> payload(payloadLen);
-			if (payloadLen > 0 && !readExact(payload.data(), payloadLen)) return;
-
-			if (opcode == 0x08) { closeTransport(); return; }
-			if (opcode == 0x09) {
-				std::lock_guard<std::mutex> lock(sendMutex);
-				sendMaskedFrame(0x0A, std::string(payload.data(), payloadLen));
-				continue;
-			}
-			if (opcode == 0x01) {
-				std::string msg(payload.data(), payloadLen);
-				if (onMessage) onMessage(msg);
-			}
-		}
+		rtc::WebSocketConfiguration config;
+		// ppcenter reads the P2P token from the Sec-WebSocket-Protocol header
+		// (ppcdn-token.<token>) and echoes back ppcdn-p2p-v1. libdatachannel
+		// sends/validates exactly these subprotocols, so no server change is
+		// needed.
+		config.protocols = {"ppcdn-p2p-v1", "ppcdn-token." + signalToken};
+		// Explicitly disabled ("zero to disable", rtc/configuration.hpp), not
+		// left unset. A prior non-zero value here (15000ms) reproduced a
+		// signaling reconnect every ~15.0-15.05s for the entire life of a
+		// stream (confirmed identically in this plugin's own log output and
+		// in ppcenter's access log - GET /v1/p2p/signal living exactly
+		// ~15.03-15.05s per connection) with nginx (proxy_read_timeout 3600s
+		// on this route) and the server's own ping/pong (30s ping, 90s read
+		// deadline) both ruled out as the cause - the period tracked this
+		// setting too precisely to be anything else. ppcenter already pings
+		// every 30s server->client with a 90s read deadline
+		// (ws/p2p_signal.go), so there is nothing this client-side ping was
+		// adding except the outage: every reconnect makes the coordinator
+		// drop every one of this publisher's active P2P sessions
+		// (Attach()->releasePublisherLocked in coordinator.go).
+		config.pingInterval = std::chrono::milliseconds(0);
+		config.connectionTimeout = std::chrono::milliseconds(10000);
+		return config;
 	}
 
 	std::string signalUrl;
 	std::string signalToken;
-	std::string host;
-	std::string path;
 	bool validEndpoint = false;
-	bool tls = false;
-	std::vector<char> pendingRead;
-	sock_t sock = SOCK_INVALID;
-	CURL *curl = nullptr;
-	std::mutex sendMutex;
 	std::thread thread;
 	std::atomic<bool> running{false};
 	std::function<void(const std::string &)> onMessage;
+
+	std::shared_ptr<rtc::WebSocket> ws;
+	std::mutex wsMutex;
+	std::condition_variable wsCv;
+	bool wsConnected = false;
 };
 
 P2PSignalClient::P2PSignalClient(const std::string &url, const std::string &token, const std::string &streamPath,
