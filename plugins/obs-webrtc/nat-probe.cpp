@@ -124,20 +124,23 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 	try {
 
 	rtc::Configuration cfg;
-	// ppcenter's own STUN tried first - it shares this publisher's network
-	// path to ppcenter itself, so it isn't subject to a public STUN
-	// provider being slow or blocked on networks where reaching it is
-	// unreliable. Google kept as a fallback. Confirmed in production
-	// 2026-09-22: with Google STUN alone, this probe routinely failed to
-	// find any candidate inside ICE_GATHER_TIMEOUT_MS, leaving the
-	// publisher's natProbeId permanently empty for the whole stream (see
-	// docs/test/ppcdn-debug-log.md's 2026-09-22 entry - the same root
-	// cause already fixed on the pplayer side, nat-probe.mjs's
-	// deriveStunIceServers(), just not yet here).
+	// ppcenter's own STUN, and deliberately the *only* one - not raced
+	// against a public fallback (Google's was here until 2026-09-22).
+	// api.pp-cdn.org has no AAAA record, so ppcenter's STUN can only ever
+	// answer IPv4; a public provider typically also answers IPv6, so racing
+	// both let this probe and a player's own probe (pplayer's
+	// nat-probe.mjs, same change made there) each win against a *different*
+	// server and come back with different address families - which
+	// ppcenter's eligibility check rejects outright as
+	// address_family_mismatch. Confirmed in production 2026-09-22 as the
+	// failure mode right after every earlier one got fixed. A failed/slow
+	// probe against ppcenter's STUN alone still falls back to edge-only
+	// exactly like today; this isn't a new failure mode, just no longer
+	// papered over by a second server that could disagree with the first.
+	// See docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
 	const std::string stunHost = DeriveStunHost(ppcenterUrl);
 	if (!stunHost.empty())
 		cfg.iceServers.emplace_back("stun:" + stunHost + ":3478");
-	cfg.iceServers.emplace_back("stun:stun.l.google.com:19302");
 
 	auto pc = std::make_shared<rtc::PeerConnection>(cfg);
 	// A PeerConnection with no track/channel has nothing to negotiate,
