@@ -496,8 +496,17 @@ bool WHIPOutput::Setup(uint64_t generation)
 	natProbeAppId = request.app_id;
 	natProbeAppSecret = request.app_secret;
 	natProbeStreamName = request.stream_name;
-	lastNatProbeRefreshMs = (int64_t)(obs_get_video_frame_time() / 1000);
-	const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name);
+	// /1,000,000 to match CheckNatProbeRefresh()'s own conversion (ns -> ms) -
+	// this baseline and that function's now_ms must be in the same unit or
+	// the first comparison is meaningless. Originally written with the same
+	// /1000 bug CheckNatProbeRefresh() itself had (see that function's
+	// comment): left as microseconds here while the other site got fixed
+	// would have made this baseline ~1000x larger than any real ms
+	// timestamp, so now_ms - lastNatProbeRefreshMs stays deeply negative
+	// (and therefore "under the throttle") for longer than any real stream
+	// runs - the periodic refresh would never fire in practice.
+	lastNatProbeRefreshMs = (int64_t)(obs_get_video_frame_time() / 1000000);
+	const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name, deviceId);
 	if (probe.succeeded) {
 		request.nat_probe_id = probe.probe_id;
 		do_log(LOG_INFO, "P2P publisher NAT probe registered");

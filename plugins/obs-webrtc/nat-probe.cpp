@@ -250,7 +250,8 @@ std::string GetOrCreateP2PClientId()
 }
 
 NATProbeResult ProbePublisherNAT(const std::string &ppcenterUrl, const std::string &appId,
-				 const std::string &appSecret, const std::string &streamName)
+				 const std::string &appSecret, const std::string &streamName,
+				 const std::string &clientId)
 {
 	NATProbeResult result;
 
@@ -258,7 +259,6 @@ NATProbeResult ProbePublisherNAT(const std::string &ppcenterUrl, const std::stri
 	if (probeUrl.empty() || appId.empty() || appSecret.empty() || streamName.empty())
 		return result;
 
-	const std::string clientId = GetOrCreateP2PClientId();
 	if (clientId.empty())
 		return result;
 

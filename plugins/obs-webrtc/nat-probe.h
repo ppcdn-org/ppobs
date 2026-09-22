@@ -28,5 +28,21 @@ std::string GetOrCreateP2PClientId();
 // result with `succeeded == false` (and an empty probe_id) on any failure
 // or timeout - by design this must never block or abort the publish
 // attempt itself (see R1 §2.3 "不需要因为探测失败就中止推流").
+//
+// `clientId` must be the exact same value passed as `deviceId` to the
+// subsequent /v1/publish/requests call. ppcenter's eligibility check
+// (p2p.EvaluateDirectEligibility) compares the NAT observation's
+// ParticipantID (= whatever this probe submits as `clientId`) against the
+// publisher's claims.ObservationID (= /v1/publish/requests's `deviceId`,
+// see IssuePublisherWithProbe's call site in ppcenter/internal/apis
+// publish_v1.go) and rejects the pair as identity_mismatch on any
+// difference. Before 2026-09-22 this function generated its own identifier
+// via GetOrCreateP2PClientId() independently of whatever deviceId the
+// caller ended up using for publish - the two essentially never matched,
+// so P2P eligibility failed shut on identity_mismatch for every ppobs
+// publisher, unconditionally, even once every other precondition (fresh
+// probes on both sides, matching stream path, compatible NAT types) was
+// satisfied. See docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
 NATProbeResult ProbePublisherNAT(const std::string &ppcenterUrl, const std::string &appId,
-				 const std::string &appSecret, const std::string &streamName);
+				 const std::string &appSecret, const std::string &streamName,
+				 const std::string &clientId);
