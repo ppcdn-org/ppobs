@@ -70,6 +70,13 @@ struct BasicOutputHandler {
 	// codec path without the user having to spell either one out.
 	OBSServiceAutoRelease h264StreamService;
 	OBSSignal hevcStopStreaming;
+
+	// P2P companion output (ppcenter_p2p_output): started alongside a non-WHIP
+	// (e.g. SRT) primary publish so that publish can still join the P2P mesh -
+	// a WHIP publish runs P2P inside its own whip_output and needs none of
+	// this. Shares the primary's service and its H264/audio encoders. See
+	// docs/design/ppobs-p2p-srt-publish-support.zh-CN.md.
+	OBSOutputAutoRelease p2pOutput;
 	// Set while StopStreaming is tearing the pair down on purpose, so the
 	// companion's own "stop" signal isn't mistaken for a failure that
 	// should stop the primary too.
@@ -86,6 +93,22 @@ struct BasicOutputHandler {
 	// of it (design §4.1's strong-consistency start).
 	bool StartCompanionStream();
 	void StopCompanionStream(bool force);
+
+	// Forces videoEncoder to bf=0 (no B-frames) for a PPCDN publish. The P2P
+	// WebRTC leg cannot consume B-frames; whip_custom forces this via
+	// apply_encoder_settings but the SRT rtmp_custom path does not, so it is
+	// enforced here for every transport. Returns false and warns the user (a
+	// dialog on the GUI thread) if the encoder will not accept bf=0 - it does
+	// NOT abort the main publish, which works with B-frames; only P2P needs
+	// them off. See docs/design/ppobs-p2p-srt-publish-support.zh-CN.md.
+	bool EnforceNoBFrames(obs_encoder_t *videoEncoder);
+
+	// Starts/stops the P2P companion output (ppcenter_p2p_output) for a
+	// non-WHIP primary publish, sharing videoEnc (must be H264) and audioEnc.
+	// Best-effort: a P2P failure never affects the main publish. See p2pOutput
+	// and docs/design/ppobs-p2p-srt-publish-support.zh-CN.md.
+	void StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_t *audioEnc);
+	void StopP2PCompanion();
 
 	// Bytes actually sent, combined across the primary streaming output
 	// and - when HEVC/H264 multitrack is publishing over SRT/MPEG-TS,

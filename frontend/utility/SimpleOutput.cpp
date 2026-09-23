@@ -423,6 +423,7 @@ void SimpleOutput::Update()
 	}
 
 	obs_encoder_update(videoStreaming, videoSettings);
+	EnforceNoBFrames(videoStreaming);
 	obs_encoder_update(audioStreaming, audioSettings);
 	obs_encoder_update(audioArchive, audioSettings);
 
@@ -868,6 +869,9 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 	if (obs_output_start(streamOutput)) {
 		if (multitrackVideo && multitrackVideoActive)
 			multitrackVideo->StartedStreaming();
+		// SRT (and any non-WHIP) publish joins the P2P mesh via a companion
+		// output sharing the same (bf=0) H264 + audio encoders; no-op for WHIP.
+		StartP2PCompanion(videoStreaming, audioStreaming);
 		return true;
 	}
 

@@ -68,6 +68,9 @@ void OBSStopStreaming(void *data, calldata_t *params)
 	// a frontend API call - the companion must not be left publishing on
 	// its own. StopCompanionStream is a no-op once it has already stopped.
 	output->StopCompanionStream(false);
+	// The P2P companion (if any) is tied to the primary publish's lifetime the
+	// same way - never leave it publishing on its own.
+	output->StopP2PCompanion();
 
 	output->streamingActive = false;
 	output->delayActive = false;
@@ -332,6 +335,108 @@ void BasicOutputHandler::SetupCompanionStream(const char *outputType)
 
 	blog(LOG_INFO, "HEVC multitrack: publishing HEVC separately to %s",
 	     obs_service_get_connect_info(hevcStreamService, OBS_SERVICE_CONNECT_INFO_SERVER_URL));
+}
+
+bool BasicOutputHandler::EnforceNoBFrames(obs_encoder_t *videoEncoder)
+{
+	if (!videoEncoder)
+		return true;
+
+	// WebRTC (the P2P leg) cannot consume B-frames. whip_custom forces this
+	// via apply_encoder_settings, but the SRT rtmp_custom publish path does
+	// not, and Advanced mode can skip service settings entirely - so force
+	// bf=0 here for every PPCDN publish regardless of transport. Merged into
+	// the encoder's existing settings (obs_encoder_update applies on top).
+	OBSDataAutoRelease force = obs_data_create();
+	obs_data_set_int(force, "bf", 0);
+	obs_encoder_update(videoEncoder, force);
+
+	OBSDataAutoRelease applied = obs_encoder_get_settings(videoEncoder);
+	if (obs_data_get_int(applied, "bf") == 0)
+		return true;
+
+	// The encoder clamped or rejected bf=0 (e.g. a preset that mandates
+	// B-frames, or a custom option overriding it). The main SRT/WHIP publish
+	// still works; only P2P will not - tell the user to disable B-frames.
+	blog(LOG_WARNING, "[PPCDN] streaming video encoder did not accept bf=0; P2P needs H.264 without B-frames");
+	OBSBasic *m = main;
+	QMetaObject::invokeMethod(
+		m,
+		[m]() {
+			OBSMessageBox::warning(
+				m, QStringLiteral("P2P 未启用：编码器存在 B 帧"),
+				QStringLiteral(
+					"当前视频编码器无法设置为 0 个 B 帧（bf=0）。P2P 需要无 B 帧的 H.264 编码。\n\n"
+					"请到 设置 → 输出 把该编码器的 “B 帧 / bf” 数量改为 0，否则本次推流不会启用 P2P（仅走 edge）。"));
+		},
+		Qt::QueuedConnection);
+	return false;
+}
+
+void BasicOutputHandler::StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_t *audioEnc)
+{
+	if (p2pOutput)
+		return; // already running
+
+	obs_service_t *primary = main->GetService();
+	if (!primary || !videoEnc)
+		return;
+
+	// A WHIP publish already runs P2P inside its own whip_output; a companion
+	// would register the publisher with ppcenter twice. Only non-WHIP
+	// transports (SRT, ...) need this.
+	const char *serviceId = obs_service_get_id(primary);
+	if (serviceId && strcmp(serviceId, "whip_custom") == 0)
+		return;
+
+	// Only a PPCDN publish (ppcenter configured) has anywhere to signal to.
+	OBSDataAutoRelease serviceSettings = obs_service_get_settings(primary);
+	if (!serviceSettings || !*obs_data_get_string(serviceSettings, "ppcenter_url"))
+		return;
+
+	// P2P broadcasts H264 only (see whip-output.cpp's StartP2PSignal). Feeding
+	// the companion an HEVC encoder's packets would produce an unplayable P2P
+	// track, so leave P2P off rather than serve a broken one.
+	const char *codec = obs_encoder_get_codec(videoEnc);
+	if (!codec || strcmp(codec, "h264") != 0) {
+		blog(LOG_WARNING, "[PPCDN] P2P companion skipped: streaming video codec is '%s', P2P needs h264",
+		     codec ? codec : "?");
+		return;
+	}
+
+	p2pOutput = obs_output_create("ppcenter_p2p_output", "ppcenter_p2p", nullptr, nullptr);
+	if (!p2pOutput) {
+		blog(LOG_WARNING, "[PPCDN] P2P companion: failed to create ppcenter_p2p_output");
+		return;
+	}
+	// Shares the primary's service (carries the ppcenter creds for both WHIP
+	// and SRT) and the same H264/audio encoders the main publish uses - the
+	// P2P output only reads encoded packets, it opens no WHIP media session.
+	obs_output_set_service(p2pOutput, primary);
+	obs_output_set_video_encoder(p2pOutput, videoEnc);
+	if (audioEnc)
+		obs_output_set_audio_encoder(p2pOutput, audioEnc, 0);
+
+	// Best-effort: the main publish is already live by now, so unlike the HEVC
+	// companion's strong-consistency start, a P2P failure is only logged - it
+	// never tears down or blocks the main publish (P2P is an optional
+	// enhancement over the edge path).
+	if (obs_output_start(p2pOutput)) {
+		blog(LOG_INFO, "[PPCDN] P2P companion started alongside the %s publish", serviceId ? serviceId : "");
+	} else {
+		const char *err = obs_output_get_last_error(p2pOutput);
+		blog(LOG_WARNING, "[PPCDN] P2P companion failed to start (%s); main publish continues without P2P",
+		     (err && *err) ? err : "unknown");
+		p2pOutput = nullptr;
+	}
+}
+
+void BasicOutputHandler::StopP2PCompanion()
+{
+	if (!p2pOutput)
+		return;
+	obs_output_stop(p2pOutput);
+	p2pOutput = nullptr;
 }
 
 bool BasicOutputHandler::StartCompanionStream()

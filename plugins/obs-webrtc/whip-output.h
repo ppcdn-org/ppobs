@@ -37,7 +37,12 @@ class UplinkQosPolicy;
 // session behavior - see StartP2PSignal().
 class WHIPOutput {
 public:
-	WHIPOutput(obs_data_t *settings, obs_output_t *output);
+	// p2pOnly runs ONLY the P2P publisher path (NAT probe + signaling +
+	// WebRTC-to-player feed off the shared encoders) and never opens a WHIP
+	// media session - used by the ppcenter_p2p_output so an SRT (or any
+	// non-WHIP) publish can still join the P2P mesh. See
+	// docs/design/ppobs-p2p-srt-publish-support.zh-CN.md.
+	WHIPOutput(obs_data_t *settings, obs_output_t *output, bool p2pOnly = false);
 	~WHIPOutput();
 
 	bool Start();
@@ -76,6 +81,11 @@ private:
 	void CheckNatProbeRefresh();
 
 	obs_output_t *output;
+
+	// When true, Setup() configures the P2P signaling but returns before any
+	// WHIP session is created, and StartThread() starts only the P2P path -
+	// see the ctor comment and register_whip_output()'s ppcenter_p2p_output.
+	bool p2p_only = false;
 
 	std::atomic<uint64_t> active_generation{0};
 	std::atomic<bool> running{false};

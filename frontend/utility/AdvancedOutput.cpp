@@ -379,6 +379,7 @@ void AdvancedOutput::UpdateStreamSettings()
 	}
 
 	obs_encoder_update(videoStreaming, settings);
+	EnforceNoBFrames(videoStreaming);
 	if (whipSimulcastEncoders != nullptr) {
 		// With HEVC/H264 multitrack on and an HEVC stream encoder,
 		// `settings` above is the HEVC encoder's configuration, but the
@@ -468,6 +469,7 @@ inline void AdvancedOutput::SetupStreaming()
 		OBSDataAutoRelease settings = obs_data_create();
 		obs_service_apply_encoder_settings(main->GetService(), settings, nullptr);
 		obs_encoder_update(videoStreaming, settings);
+		EnforceNoBFrames(videoStreaming);
 	}
 }
 
@@ -1022,6 +1024,9 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	if (obs_output_start(streamOutput)) {
 		if (multitrackVideo && multitrackVideoActive)
 			multitrackVideo->StartedStreaming();
+		// SRT (and any non-WHIP) publish joins the P2P mesh via a companion
+		// output sharing the same (bf=0) H264 + audio encoders; no-op for WHIP.
+		StartP2PCompanion(videoStreaming, streamAudioEnc);
 		return true;
 	}
 

@@ -34,7 +34,7 @@ bool multitrackEnabled(obs_output_t *output)
 
 } // namespace
 
-WHIPOutput::WHIPOutput(obs_data_t *, obs_output_t *output_) : output(output_)
+WHIPOutput::WHIPOutput(obs_data_t *, obs_output_t *output_, bool p2pOnly) : output(output_), p2p_only(p2pOnly)
 {
 	// Declared at output creation so the frontend can connect before
 	// streaming starts; emitted per scored sample from the quality
@@ -531,6 +531,18 @@ bool WHIPOutput::Setup(uint64_t generation)
 	if (p2pStunServers.empty())
 		p2pStunServers.emplace_back("stun:stun.l.google.com:19302");
 
+	// A P2P-only output stops here: it never opens a WHIP media session, it
+	// only runs the P2P publisher path (started in StartThread) off the
+	// shared encoders, so an SRT (or any non-WHIP) publish can still join the
+	// mesh. Everything below is WHIP-session setup (codec layers, whip_tracks,
+	// WHIPCodecSession connect). See
+	// docs/design/ppobs-p2p-srt-publish-support.zh-CN.md.
+	if (p2p_only) {
+		do_log(LOG_INFO, "P2P-only output: signaling %s, no WHIP session",
+		       p2pSignalUrl.empty() ? "disabled" : "configured");
+		return true;
+	}
+
 	auto h264Layers = collectVideoLayers(output, "h264");
 	if (h264Layers.empty()) {
 		do_log(LOG_ERROR, "No H264 video encoder assigned");
@@ -752,15 +764,20 @@ void WHIPOutput::StartThread(uint64_t generation)
 
 	StartP2PSignal();
 
-	WHIPCodecSession::Callbacks cb;
-	cb.onPermanentFailure = [this](const std::string &reason) { OnSessionPermanentFailure("h264", reason); };
-	h264Session->Supervise(cb);
-	if (hevcSession) {
-		WHIPCodecSession::Callbacks hevcCb;
-		hevcCb.onPermanentFailure = [this](const std::string &reason) {
-			OnSessionPermanentFailure("hevc", reason);
-		};
-		hevcSession->Supervise(hevcCb);
+	// A P2P-only output has no WHIP sessions to supervise or degrade; it only
+	// feeds the P2P peers from Data() (that feed is already guarded by
+	// h264Session, which stays null here).
+	if (!p2p_only) {
+		WHIPCodecSession::Callbacks cb;
+		cb.onPermanentFailure = [this](const std::string &reason) { OnSessionPermanentFailure("h264", reason); };
+		h264Session->Supervise(cb);
+		if (hevcSession) {
+			WHIPCodecSession::Callbacks hevcCb;
+			hevcCb.onPermanentFailure = [this](const std::string &reason) {
+				OnSessionPermanentFailure("hevc", reason);
+			};
+			hevcSession->Supervise(hevcCb);
+		}
 	}
 
 	obs_output_begin_data_capture(output, 0);
@@ -771,7 +788,8 @@ void WHIPOutput::StartThread(uint64_t generation)
 	// it has never modeled per-codec sessions, and layer degrade
 	// commands apply to the H264 simulcast ladder regardless of
 	// whether HEVC multitrack is also running.
-	WsDegradeClient::Instance().RegisterOutput(output, "");
+	if (!p2p_only)
+		WsDegradeClient::Instance().RegisterOutput(output, "");
 #endif
 }
 
@@ -945,4 +963,32 @@ void register_whip_output()
 	info.encoded_video_codecs = nullptr;
 	info.encoded_audio_codecs = audio_codecs;
 	obs_register_output(&info);
+
+	// ppcenter_p2p_output: the same WHIPOutput class in P2P-only mode. It runs
+	// the P2P publisher path (NAT probe + signaling + WebRTC-to-player feed)
+	// off the shared encoders WITHOUT opening any WHIP media session, so the
+	// frontend can start it alongside a non-WHIP (e.g. SRT) streaming output
+	// and let that stream join the P2P mesh. Created directly by the frontend
+	// (not service-protocol-matched), so it advertises no "protocols". See
+	// docs/design/ppobs-p2p-srt-publish-support.zh-CN.md.
+	struct obs_output_info p2p_info = {};
+	p2p_info.id = "ppcenter_p2p_output";
+	p2p_info.flags = OBS_OUTPUT_AV | base_flags;
+	p2p_info.get_name = [](void *) -> const char * { return "PPCenter P2P"; };
+	p2p_info.create = [](obs_data_t *settings, obs_output_t *output) -> void * {
+		return new WHIPOutput(settings, output, true);
+	};
+	p2p_info.destroy = [](void *data) { delete static_cast<WHIPOutput *>(data); };
+	p2p_info.start = [](void *data) -> bool { return static_cast<WHIPOutput *>(data)->Start(); };
+	p2p_info.stop = [](void *data, uint64_t) { static_cast<WHIPOutput *>(data)->Stop(); };
+	p2p_info.encoded_packet = [](void *data, struct encoder_packet *packet) {
+		static_cast<WHIPOutput *>(data)->Data(packet);
+	};
+	p2p_info.get_defaults = [](obs_data_t *) {};
+	p2p_info.get_properties = [](void *) -> obs_properties_t * { return obs_properties_create(); };
+	p2p_info.get_total_bytes = [](void *data) -> uint64_t { return static_cast<WHIPOutput *>(data)->GetTotalBytes(); };
+	p2p_info.get_connect_time_ms = [](void *data) -> int { return static_cast<WHIPOutput *>(data)->GetConnectTime(); };
+	p2p_info.encoded_audio_codecs = audio_codecs;
+	p2p_info.encoded_video_codecs = video_codecs;
+	obs_register_output(&p2p_info);
 }
