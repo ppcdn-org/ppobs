@@ -138,7 +138,12 @@ try {
         '-S', '.', '-B', 'build_x64', '-A', 'x64'
         '-DBUILD_SHARED_LIBS=ON'
         '-DUSE_MBEDTLS=ON'
-        '-DNO_WEBSOCKET=ON'
+        # ppobs's P2P signaling uses rtc::WebSocket (ppcenter-signal.cpp), so
+        # the bundled libdatachannel must be built with WebSocket enabled -
+        # otherwise the CMake package exports RTC_ENABLE_WEBSOCKET=0 and the
+        # type is not declared. obs-deps' own recipe builds it with
+        # NO_WEBSOCKET=ON, hence this override.
+        '-DNO_WEBSOCKET=OFF'
         '-DNO_TESTS=ON'
         '-DNO_EXAMPLES=ON'
         $policyArg
