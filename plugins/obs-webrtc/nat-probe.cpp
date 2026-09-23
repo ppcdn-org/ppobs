@@ -144,33 +144,54 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 {
 	try {
 
+	// Temporary: route libdatachannel's own (libjuice) internal logging into
+	// the OBS log, so an ICE gathering that yields no candidates at all can
+	// be explained rather than guessed at. Process-global and verbose -
+	// remove alongside the other [diag] logging below once the 2026-09-22
+	// STUN investigation concludes. See docs/test/ppcdn-debug-log.md.
+	static std::once_flag rtcLoggerOnce;
+	std::call_once(rtcLoggerOnce, [] {
+		rtc::InitLogger(rtc::LogLevel::Debug, [](rtc::LogLevel level, std::string message) {
+			probe_log(LOG_INFO, "[diag][rtc:%d] %s", (int)level, message.c_str());
+		});
+	});
+
 	rtc::Configuration cfg;
-	// ppcenter's own STUN, tried first, with Google's public STUN restored
-	// as a reachability fallback (removed for one deploy on 2026-09-22,
-	// then restored the same day): some networks can't reach ppcenter's own
-	// STUN at all - confirmed in production when this publisher's network,
-	// which had been reaching Google's STUN reliably every 4 minutes via
-	// CheckNatProbeRefresh(), got zero responses from ppcenter's own the
-	// moment Google was removed. A failed probe here means the whole
-	// attempt falls back to edge-only, so reachability matters more than
-	// which server answers.
+	// EXACTLY ONE STUN server - do not add a second one as a "fallback".
+	// libdatachannel/libjuice only ever uses the first STUN entry and
+	// silently discards the rest, logging "Only TURN servers are supported
+	// as additional ICE servers" (rtc::impl::IceTransport::addIceServer).
+	// Confirmed from the library's own logs in production 2026-09-22, after
+	// a commit here added Google's public STUN as a second entry believing
+	// it gave reachability insurance: it never ran at all, and the probe
+	// still failed because the only server actually used was ppcenter's.
+	// If a real fallback is ever needed it has to be a *second sequential*
+	// probe with a different single server, not two entries in one
+	// Configuration - note that costs another ICE_GATHER_TIMEOUT_MS on the
+	// publish path, since Setup() calls this synchronously.
 	//
-	// Racing two servers can make this probe and a player's own (pplayer's
-	// nat-probe.mjs, same change made there) each win against a *different*
-	// one and disagree on address family (api.pp-cdn.org has no AAAA
-	// record, so ppcenter's own can only ever answer IPv4; Google's
-	// typically answers whichever family the network prefers) -
-	// ppcenter's eligibility check rejects that pairing outright as
-	// address_family_mismatch (also confirmed in production 2026-09-22,
-	// right after identity_mismatch got fixed). Handled below by only
-	// waking the waiter early on an IPv4 srflx candidate specifically, from
-	// either server, rather than on whichever answers first - see
-	// CandidateRank() and the wait_for predicate below. See
-	// docs/test/ppcdn-debug-log.md's 2026-09-22 entry for the full trail.
+	// ppcenter's own STUN is the deliberate choice here (ppcenter ships one,
+	// internal/stun, on the same host as the API): it shares this
+	// publisher's network path to ppcenter, and using the same server on
+	// both sides keeps the publisher's and a player's observed address
+	// family consistent - api.pp-cdn.org has no AAAA record so it can only
+	// answer IPv4, whereas a public provider often answers IPv6, and
+	// ppcenter's eligibility check rejects a mixed pair outright as
+	// address_family_mismatch. It must be reachable on UDP 3478 for any of
+	// this to work: that means both the cloud security group *and* the
+	// host firewall (ufw on the prod box) - a ufw default-deny with only
+	// 22/80/443 allowed silently blackholed every probe for hours on
+	// 2026-09-22 while the process itself looked healthy in `ss -ulnp`.
+	// See docs/test/ppcdn-debug-log.md's 2026-09-22 entry for the full trail.
 	const std::string stunHost = DeriveStunHost(ppcenterUrl);
 	if (!stunHost.empty())
 		cfg.iceServers.emplace_back("stun:" + stunHost + ":3478");
-	cfg.iceServers.emplace_back("stun:stun.l.google.com:19302");
+	// Temporary diagnostic logging (LOG_INFO, not LOG_DEBUG, so it's
+	// guaranteed to land in the log file) - remove once the 2026-09-22
+	// STUN-reachability investigation concludes. See
+	// docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
+	for (const auto &s : cfg.iceServers)
+		probe_log(LOG_INFO, "[diag] configured ICE server: %s", s.hostname.c_str());
 
 	auto pc = std::make_shared<rtc::PeerConnection>(cfg);
 	// A PeerConnection with no track/channel has nothing to negotiate,
@@ -182,21 +203,32 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 	auto state = std::make_shared<GatheringState>();
 
 	pc->onGatheringStateChange([state](rtc::PeerConnection::GatheringState gatheringState) {
+		probe_log(LOG_INFO, "[diag] gathering state: %d", (int)gatheringState);
 		if (gatheringState == rtc::PeerConnection::GatheringState::Complete) {
 			std::lock_guard<std::mutex> lock(state->mutex);
 			state->done = true;
 			state->cv.notify_all();
 		}
 	});
+	pc->onStateChange([](rtc::PeerConnection::State s) { probe_log(LOG_INFO, "[diag] pc state: %d", (int)s); });
 
 	pc->onLocalCandidate([state](const rtc::Candidate &candidate) {
+		// Temporary diagnostic logging - see this function's iceServers
+		// comment; remove alongside it once the investigation concludes.
+		probe_log(LOG_INFO, "[diag] raw candidate: %s", candidate.candidate().c_str());
 		rtc::Candidate resolved = candidate;
-		if (!resolved.resolve(rtc::Candidate::ResolveMode::Simple))
+		if (!resolved.resolve(rtc::Candidate::ResolveMode::Simple)) {
+			probe_log(LOG_INFO, "[diag] candidate failed to resolve");
 			return;
+		}
 		auto address = resolved.address();
 		auto port = resolved.port();
-		if (!address || !port)
+		if (!address || !port) {
+			probe_log(LOG_INFO, "[diag] resolved candidate has no address/port");
 			return;
+		}
+		probe_log(LOG_INFO, "[diag] resolved candidate: address=%s port=%u type=%d", address->c_str(), *port,
+			  (int)resolved.type());
 		const bool isSrflx = resolved.type() == rtc::Candidate::Type::ServerReflexive;
 		const bool isHost = resolved.type() == rtc::Candidate::Type::Host;
 		if (!isSrflx && !isHost)
@@ -238,8 +270,13 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 
 	{
 		std::unique_lock<std::mutex> lock(state->mutex);
-		state->cv.wait_for(lock, std::chrono::milliseconds(ICE_GATHER_TIMEOUT_MS),
-				    [&] { return state->done || (state->best.found && state->best.isSrflx && state->best.isIPv4); });
+		const bool predicateMet = state->cv.wait_for(
+			lock, std::chrono::milliseconds(ICE_GATHER_TIMEOUT_MS),
+			[&] { return state->done || (state->best.found && state->best.isSrflx && state->best.isIPv4); });
+		probe_log(LOG_INFO,
+			  "[diag] wait finished: predicateMet=%d done=%d best.found=%d best.isSrflx=%d best.isIPv4=%d",
+			  (int)predicateMet, (int)state->done, (int)state->best.found, (int)state->best.isSrflx,
+			  (int)state->best.isIPv4);
 	}
 
 	pc->resetCallbacks();
