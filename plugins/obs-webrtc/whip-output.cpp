@@ -969,8 +969,9 @@ void register_whip_output()
 	// off the shared encoders WITHOUT opening any WHIP media session, so the
 	// frontend can start it alongside a non-WHIP (e.g. SRT) streaming output
 	// and let that stream join the P2P mesh. Created directly by the frontend
-	// (not service-protocol-matched), so it advertises no "protocols". See
-	// docs/design/ppobs-p2p-srt-publish-support.zh-CN.md.
+	// by id (not matched to a service by protocol), but OBS_OUTPUT_SERVICE
+	// still requires a non-empty "protocols" or obs_register_output rejects
+	// it. See docs/design/ppobs-p2p-srt-publish-support.zh-CN.md.
 	struct obs_output_info p2p_info = {};
 	p2p_info.id = "ppcenter_p2p_output";
 	p2p_info.flags = OBS_OUTPUT_AV | base_flags;
@@ -990,5 +991,9 @@ void register_whip_output()
 	p2p_info.get_connect_time_ms = [](void *data) -> int { return static_cast<WHIPOutput *>(data)->GetConnectTime(); };
 	p2p_info.encoded_audio_codecs = audio_codecs;
 	p2p_info.encoded_video_codecs = video_codecs;
+	// Required by OBS_OUTPUT_SERVICE (see the comment above); otherwise unused,
+	// since this output is created by id rather than matched to a service by
+	// protocol. WebRTC/WHIP is what the P2P leg actually speaks.
+	p2p_info.protocols = "WHIP";
 	obs_register_output(&p2p_info);
 }

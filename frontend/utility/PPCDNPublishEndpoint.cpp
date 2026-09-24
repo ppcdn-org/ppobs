@@ -138,6 +138,16 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 	// Write it back into the service settings so rtmp_custom_update expands
 	// the placeholder into the address the output actually connects to.
 	obs_data_set_string(settings, "ppcdn_publish_endpoint", endpoint.c_str());
+	// Persist the resolved stream name for the P2P companion output. The
+	// settings-save path (OBSBasicSettings_Stream.cpp) fills "ppcenter_stream"
+	// with a WHIP URL-*path* parser that returns "" for an SRT
+	// "?streamid=publish:<appId>/<stream>" URL (the name lives in the query,
+	// not the path). That empty value would make the companion's
+	// WHIPOutput::Setup() fail both the NAT probe and ppcenter_resolve_publish
+	// ("stream name required"), leaving the SRT publisher out of the P2P mesh
+	// so every play decision falls back to edge-only. streamName here is parsed
+	// from the *expanded* URL above, so overwrite the empty value with it.
+	obs_data_set_string(settings, "ppcenter_stream", streamName.toStdString().c_str());
 	obs_service_update(service, settings);
 	return true;
 }
