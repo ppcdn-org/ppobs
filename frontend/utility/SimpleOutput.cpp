@@ -241,7 +241,11 @@ SimpleOutput::SimpleOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	const char *encoder = config_get_string(main->Config(), "SimpleOutput", "StreamEncoder");
 	const char *audio_encoder = config_get_string(main->Config(), "SimpleOutput", "StreamAudioEncoder");
 
-	LoadStreamingPreset_Lossy(get_simple_output_encoder(encoder));
+	// With HEVC/H264 multitrack off, a custom SRT publish's codec follows the
+	// Server URL (/hevc, /h264, or none = H264). See AdvancedOutput's
+	// identical comment and urlPublishCodec.
+	std::string urlStreamEncoder = EffectiveStreamEncoderId(get_simple_output_encoder(encoder));
+	LoadStreamingPreset_Lossy(urlStreamEncoder.c_str());
 
 	bool success = false;
 

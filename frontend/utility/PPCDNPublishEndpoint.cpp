@@ -49,6 +49,16 @@ QString ParseSRTStreamName(const QString &url, const QString &appId)
 			value = value.mid(prefix.size());
 	}
 
+	// A publish path may end in a codec segment ("/h264" or "/hevc" - see
+	// PublishCodecCheck.hpp) which selects the codec, not part of the stream
+	// name. PPCenter knows the stream without it, so sending the suffixed
+	// name (e.g. "B01-frontView/h264") is rejected with HTTP 400.
+	for (const char *codec : {"h264", "hevc"}) {
+		const QString suffix = QStringLiteral("/") + codec;
+		if (value.endsWith(suffix))
+			value.chop(suffix.size());
+	}
+
 	return value.trimmed();
 }
 

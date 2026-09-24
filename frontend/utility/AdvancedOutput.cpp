@@ -98,6 +98,13 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	translate_macvth264_encoder(recordEncoder);
 #endif
 
+	// With HEVC/H264 multitrack off, a custom SRT publish's codec follows the
+	// Server URL (/hevc, /h264, or none = H264). Swap in the matching encoder
+	// family so the whole streaming setup - the main encoder and the
+	// Simulcast ladder - uses that codec. See urlPublishCodec.
+	std::string urlStreamEncoder = EffectiveStreamEncoderId(streamEncoder);
+	streamEncoder = urlStreamEncoder.c_str();
+
 	ffmpegOutput = astrcmpi(recType, "FFmpeg") == 0;
 	ffmpegRecording = ffmpegOutput && config_get_bool(main->Config(), "AdvOut", "FFOutputToFile");
 	useStreamEncoder = astrcmpi(recordEncoder, "none") == 0;
@@ -256,7 +263,23 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 			const bool mainIsHevc = streamCodec && strcmp(streamCodec, "hevc") == 0;
 			const bool useExistingMain = mainIsHevc && !StreamTransportIsSingleCodec(main->GetService());
 
-			whipHevcEncoders->Create(hevcEncoderId, streamEncSettings,
+			// The ladder's layer bitrates are derived from these settings.
+			// When the main encoder is H264 (the usual multitrack case),
+			// streamEncSettings is the H264 encoder's config and would size
+			// the HEVC ladder off the H264 bitrate - both ladders then run at
+			// e.g. 5 Mbps and the publish totals ~2x. Use the HEVC encoder's
+			// own saved settings instead, the same way the H264 Simulcast
+			// ladder above loads the H264 config. When the main IS HEVC,
+			// streamEncSettings already is that config.
+			OBSData hevcSettings;
+			obs_data_t *hevcBaseSettings = streamEncSettings;
+			if (!mainIsHevc) {
+				hevcSettings = GetEncoderDataFromJsonFile("streamEncoder", hevcEncoderId.c_str());
+				if (hevcSettings)
+					hevcBaseSettings = hevcSettings.Get();
+			}
+
+			whipHevcEncoders->Create(hevcEncoderId, hevcBaseSettings,
 						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 						 video_output_get_width(obs_get_video()),
@@ -326,7 +349,12 @@ void AdvancedOutput::UpdateStreamSettings()
 	bool applyServiceSettings = config_get_bool(main->Config(), "AdvOut", "ApplyServiceSettings");
 	bool enforceBitrate = !config_get_bool(main->Config(), "Stream1", "IgnoreRecommended");
 	bool dynBitrate = config_get_bool(main->Config(), "Output", "DynamicBitrate");
-	const char *streamEncoder = config_get_string(main->Config(), "AdvOut", "Encoder");
+	// Same URL-driven codec selection as the constructor: apply the matching
+	// encoder's saved settings to videoStreaming, not the configured
+	// encoder's (which may be the other codec). See urlPublishCodec.
+	std::string effectiveStreamEncoder = EffectiveStreamEncoderId(
+		config_get_string(main->Config(), "AdvOut", "Encoder"));
+	const char *streamEncoder = effectiveStreamEncoder.c_str();
 
 	OBSData settings = GetEncoderDataFromJsonFile("streamEncoder", streamEncoder);
 	ApplyEncoderDefaults(settings, videoStreaming);
@@ -403,7 +431,23 @@ void AdvancedOutput::UpdateStreamSettings()
 					      main->Config());
 	}
 	if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
-		whipHevcEncoders->Update(settings, obs_data_get_int(settings, "bitrate"), main->Config());
+		// Mirror the H264 branch above: when the main encoder is H264, the
+		// HEVC ladder has its own encoder and must be updated from the HEVC
+		// encoder's saved config, not from the H264 main's settings (which
+		// would force the HEVC ladder to the H264 bitrate). Only when the
+		// main itself is HEVC do the two share one config.
+		const char *mainCodec = obs_encoder_get_codec(videoStreaming);
+		const bool mainIsHevc = mainCodec && strcmp(mainCodec, "hevc") == 0;
+
+		OBSData hevcSettings;
+		obs_data_t *hevcUpdate = settings;
+		if (!mainIsHevc) {
+			std::string hevcEncoderId = ResolveWHIPHevcEncoderId(streamEncoder);
+			hevcSettings = GetEncoderDataFromJsonFile("streamEncoder", hevcEncoderId.c_str());
+			if (hevcSettings)
+				hevcUpdate = hevcSettings.Get();
+		}
+		whipHevcEncoders->Update(hevcUpdate, obs_data_get_int(hevcUpdate, "bitrate"), main->Config());
 	}
 }
 
@@ -921,7 +965,7 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	const char *serverURL = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
 	if (std::string err = CheckPublishCodecMatchesURL(
 		    serverURL ? serverURL : "",
-		    obs_get_encoder_codec(config_get_string(main->Config(), "AdvOut", "Encoder")),
+		    obs_encoder_get_codec(videoStreaming),
 		    whipHevcEncoders != nullptr, StreamTransportIsSingleCodec(service));
 	    !err.empty()) {
 		lastError = err;

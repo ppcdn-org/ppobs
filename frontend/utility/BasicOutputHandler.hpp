@@ -74,9 +74,20 @@ struct BasicOutputHandler {
 	// P2P companion output (ppcenter_p2p_output): started alongside a non-WHIP
 	// (e.g. SRT) primary publish so that publish can still join the P2P mesh -
 	// a WHIP publish runs P2P inside its own whip_output and needs none of
-	// this. Shares the primary's service and its H264/audio encoders. See
+	// this. Shares the primary's H264/audio encoders (its own service, see
+	// p2pService below). See
 	// docs/design/ppobs-p2p-srt-publish-support.zh-CN.md.
 	OBSOutputAutoRelease p2pOutput;
+	// The P2P companion's own service. A service carries a single output
+	// back-pointer (obs_output_set_service() unhooks whichever output owned
+	// it before, see obs-output.c), so pointing the companion at the primary's
+	// service would steal it from the primary output. The SRT/MPEG-TS output
+	// reads its publish URL from exactly that back-pointer (observe
+	// obs-ffmpeg-mpegts.c's fetch_service_info()), so sharing it makes the
+	// primary start fail with OBS_OUTPUT_ERROR. Create an independent
+	// instance from a copy of the settings instead. obs_output_set_service()
+	// takes no reference, so this member must outlive p2pOutput.
+	OBSServiceAutoRelease p2pService;
 	// Set while StopStreaming is tearing the pair down on purpose, so the
 	// companion's own "stop" signal isn't mistaken for a failure that
 	// should stop the primary too.
@@ -126,6 +137,22 @@ struct BasicOutputHandler {
 
 	std::string outputType;
 	std::string lastError;
+
+	// For a custom SRT publish with HEVC/H264 multitrack off, the Server
+	// URL's codec segment decides the published codec: "/hevc" -> HEVC,
+	// "/h264" or no segment -> H264 (PPCENTER treats a bare stream name as
+	// the H264 stream). "h264"/"hevc", or empty when the URL doesn't apply
+	// (WHIP, or multitrack is on and builds both ladders itself). See
+	// EffectiveStreamEncoderId().
+	std::string urlPublishCodec;
+
+	// Returns the encoder id to publish with: the configured one when the
+	// publish URL doesn't pin a codec (urlPublishCodec empty) or already
+	// matches, otherwise the configured encoder family's counterpart for the
+	// URL's codec (ResolveWHIPH264/HevcEncoderId). Falls back to the
+	// configured id - with a warning - when no encoder for the URL's codec
+	// is available.
+	std::string EffectiveStreamEncoderId(const std::string &configuredId) const;
 
 	std::string lastRecordingPath;
 

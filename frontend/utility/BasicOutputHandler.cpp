@@ -409,10 +409,19 @@ void BasicOutputHandler::StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_
 		blog(LOG_WARNING, "[PPCDN] P2P companion: failed to create ppcenter_p2p_output");
 		return;
 	}
-	// Shares the primary's service (carries the ppcenter creds for both WHIP
-	// and SRT) and the same H264/audio encoders the main publish uses - the
-	// P2P output only reads encoded packets, it opens no WHIP media session.
-	obs_output_set_service(p2pOutput, primary);
+	// Its own service instance, not the primary's: see p2pService's declaration
+	// in the header. A copy of the primary's settings carries the same ppcenter
+	// creds; obs_service_create() does not expand anything the primary's own
+	// update already resolved.
+	p2pService = obs_service_create(serviceId, "ppcenter_p2p_service", serviceSettings, nullptr);
+	if (!p2pService) {
+		blog(LOG_WARNING, "[PPCDN] P2P companion: failed to create its service");
+		p2pOutput = nullptr;
+		return;
+	}
+	// Shares the primary's H264/audio encoders - the P2P output only reads
+	// encoded packets, it opens no WHIP media session.
+	obs_output_set_service(p2pOutput, p2pService);
 	obs_output_set_video_encoder(p2pOutput, videoEnc);
 	if (audioEnc)
 		obs_output_set_audio_encoder(p2pOutput, audioEnc, 0);
@@ -428,6 +437,7 @@ void BasicOutputHandler::StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_
 		blog(LOG_WARNING, "[PPCDN] P2P companion failed to start (%s); main publish continues without P2P",
 		     (err && *err) ? err : "unknown");
 		p2pOutput = nullptr;
+		p2pService = nullptr;
 	}
 }
 
@@ -435,8 +445,21 @@ void BasicOutputHandler::StopP2PCompanion()
 {
 	if (!p2pOutput)
 		return;
-	obs_output_stop(p2pOutput);
+	// force_stop, not stop: WHIPOutput::Start() only spawns its start thread,
+	// so the output is still inactive for a while after obs_output_start()
+	// returned. obs_output_stop() no-ops on an inactive output, and then
+	// dropping the reference below runs obs_output_destroy -> the output's
+	// destructor Stop(), which joins the start thread, signals stop and
+	// spawns an end_data_capture_thread *after* obs_output_destroy's join
+	// check - it then stops the shared encoders against an already-freed
+	// output (crash in obs_encoder_stop). force_stop always runs the output's
+	// stop path first, so that end_data_capture_thread exists before we
+	// release, and obs_output_destroy joins it.
+	obs_output_force_stop(p2pOutput);
 	p2pOutput = nullptr;
+	// After the output, which clears its service->output back-pointer - see
+	// p2pService's declaration.
+	p2pService = nullptr;
 }
 
 bool BasicOutputHandler::StartCompanionStream()
@@ -509,8 +532,40 @@ BasicOutputHandler::BasicOutputHandler(OBSBasic *main_) : main(main_)
 	// custom SRT can carry a second codec's ladder. Without it the HEVC
 	// encoders were created for every service and attached to the output,
 	// which an RTMP/MPEG-TS muxer then rejected outright.
-	if ((is_whip || is_srt_custom) && config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack"))
+	const bool hevc_multitrack = (is_whip || is_srt_custom) &&
+				     config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
+	if (hevc_multitrack)
 		whipHevcEncoders = make_unique<WHIPHevcEncoders>();
+
+	// With multitrack off, a custom SRT publish's codec comes from the
+	// Server URL: /hevc selects HEVC, /h264 or no segment selects H264.
+	// Derived here (rather than per publish) so every output handler picks
+	// the same encoder at construction. See urlPublishCodec's declaration.
+	if (is_srt_custom && !hevc_multitrack) {
+		const char *server = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
+		const std::string codec = PublishCodecFromURL(server ? server : "");
+		urlPublishCodec = codec.empty() ? "h264" : codec;
+	}
+}
+
+std::string BasicOutputHandler::EffectiveStreamEncoderId(const std::string &configuredId) const
+{
+	if (urlPublishCodec.empty())
+		return configuredId;
+
+	const char *configuredCodec = obs_get_encoder_codec(configuredId.c_str());
+	if (configuredCodec && urlPublishCodec == configuredCodec)
+		return configuredId;
+
+	std::string resolved = (urlPublishCodec == "hevc") ? ResolveWHIPHevcEncoderId(configuredId)
+							  : ResolveWHIPH264EncoderId(configuredId);
+	if (!resolved.empty())
+		return resolved;
+
+	blog(LOG_WARNING,
+	     "[PPCDN] publish URL is pinned to %s but no matching encoder is available; publishing with '%s' instead",
+	     urlPublishCodec.c_str(), configuredId.c_str());
+	return configuredId;
 }
 
 extern void log_vcam_changed(const VCamConfig &config, bool starting);
