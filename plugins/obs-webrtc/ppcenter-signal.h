@@ -21,6 +21,16 @@ struct P2PPeer {
 	std::shared_ptr<rtc::RtcpSrReporter> audioSrReporter;
 	uint32_t videoSsrc = 0;
 	uint32_t audioSsrc = 0;
+	// Payload types the browser offered for H264/opus, parsed from the offer in
+	// HandleOffer(). libdatachannel's answer hardcodes 96 (video) / 97 (audio),
+	// but an answer must reuse the offer's payload-type mapping (RFC 3264).
+	// Chrome offers H264 as e.g. 102/108/118 and PT 96 as VP8, so answering
+	// "96=H264" leaves Chrome unable to bind the codec: the RTP still arrives
+	// (packetsReceived climbs) but framesReceived/codecId stay at 0/none.
+	int videoPayloadType = 96;
+	int audioPayloadType = 97;
+	std::string videoFmtp;
+	std::string audioFmtp;
 	uint16_t videoSequenceNumber = 0;
 	uint16_t audioSequenceNumber = 0;
 	uint32_t videoRtpTimestamp = 0;
