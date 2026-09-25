@@ -7,38 +7,56 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
-#include <algorithm>
+#include <memory>
 #include <cstdint>
 
-#define ASIO_STANDALONE 1
-#include <websocketpp/config/asio_client.hpp>
-#include <websocketpp/client.hpp>
-
+// One codec's target state, pushed by mmx as TARGET_STATE. Under HEVC/H264
+// multitrack each codec is a separate publish path (app/stream/h264,
+// app/stream/hevc) with its own FSM, so a target state is per-codec.
 struct TargetState {
 	std::string path;
+	// "h264"/"hevc" - mmx sends it (derived from the path suffix) so the
+	// executor can validate and apply to the right encoder group.
+	std::string codec;
 	int layers = 3;
 	int bitrate_percent = 100;
-	// Server-side receiver latency the mmx node is applying to this path
-	// (see docs/design/publish-degrade-protocol.zh-CN.md §6.3). Informational
-	// only - the client does not act on it, the latency is owned by mmx.
+	// Server-side receiver latency the mmx node is applying to this path.
+	// Informational only - the client does not act on it, mmx owns it.
 	int latency_ms = 0;
 };
 
+// OBS-side executor for the mmx degrade protocol (see
+// docs/design/publish-degrade-protocol.zh-CN.md). Holds one control channel
+// per codec that is actually published (WHIP multitrack publishes two; SRT
+// and non-multitrack WHIP publish one), and applies each channel's target to
+// that codec's encoders only:
+//   * a bitrate-only change is applied live via obs_encoder_update();
+//   * a layer-count change restarts the output, and WHIPOutput::Setup()
+//     reads TargetLayers() to trim that codec's simulcast ladder down to
+//     the lowest-resolution N layers.
+// Layers are never removed by detaching encoders from the output, so the two
+// codecs can't disturb each other's slots (the bug a single flat encoder
+// list caused under multitrack).
 class WsDegradeClient {
-	using client_t = websocketpp::client<websocketpp::config::asio_tls_client>;
-	using handle_t = websocketpp::connection_hdl;
-	using conn_ptr = client_t::connection_ptr;
-	using context_ptr = websocketpp::lib::shared_ptr<websocketpp::lib::asio::ssl::context>;
-
 public:
 	static WsDegradeClient &Instance();
 
-	void RegisterOutput(obs_output_t *output, const std::string &whip_url);
+	// Registers the output together with the per-codec WHIP endpoints the
+	// control channels are derived from. Either URL may be empty (that
+	// codec is not published). Safe to call again after every output
+	// (re)start - an unchanged URL keeps its connection.
+	void RegisterOutput(obs_output_t *output, const std::string &h264_whip_url,
+			    const std::string &hevc_whip_url);
+
 	void UnregisterOutput();
 
-	TargetState currentTarget() const { return target_; }
+	// Number of layers the given codec should publish, or 0 when no target
+	// has been received for it (no trimming). Read from WHIPOutput::Setup().
+	int TargetLayers(const std::string &codec) const;
 
 private:
+	struct Channel;
+
 	WsDegradeClient();
 	~WsDegradeClient();
 
@@ -46,65 +64,23 @@ private:
 	WsDegradeClient &operator=(const WsDegradeClient &) = delete;
 
 	bool ParseTargetState(const std::string &json, TargetState &out);
-	void ApplyIfNeeded(const TargetState &state);
+	void ApplyIfNeeded(Channel &ch, const TargetState &target);
+	void ApplyBitrateLocked(Channel &ch, obs_output_t *out, int bitrate_percent, bool live);
 
-	// Scales the bitrate of encoder slots [0, count) by bitrate_percent.
-	// When live is true each encoder is reconfigured in place via
-	// obs_encoder_update() (safe on an active encoder - the settings are
-	// picked up on the encoder thread rather than dropped); otherwise the
-	// settings object is just updated for the encoder to read when the
-	// output next starts. Assumes mtx is held.
-	void ApplyBitrateLocked(obs_output_t *out, int count, int bitrate_percent, bool live);
+	std::vector<obs_encoder_t *> codecEncoders(const std::string &codec) const;
 
-	// Opens a connection to ws_url. Assumes mtx is held, ws_url and
-	// ws_secret are non-empty, and any existing conn has been reset by the
-	// caller. Shared by RegisterOutput() (first connect / URL change) and
-	// the worker loop's reconnect check (same URL, connection dropped -
-	// see the close/fail handlers and ShouldReconnectLocked).
-	void ConnectLocked();
+	Channel *FindChannel(const std::string &codec);
+	const Channel *FindChannel(const std::string &codec) const;
 
-	// True if we should attempt (re)connecting: we have a URL and secret,
-	// aren't already connected/connecting, and the backoff delay set by
-	// the close/fail handlers has elapsed. Assumes mtx is held.
-	bool ShouldReconnectLocked() const;
-
-	client_t client;
-	conn_ptr conn;
+	void ConfigureChannelLocked(Channel &ch, const std::string &whip_url);
+	void ConnectLocked(Channel &ch);
+	bool ShouldReconnectLocked(const Channel &ch) const;
 
 	obs_output_t *output;
-	std::string whip_url;
-	std::string ws_url;
-
-	// Bearer secret for the control channel, cached from the service
-	// settings at RegisterOutput() time so a reconnect can re-authenticate
-	// without needing the service to still be reachable.
 	std::string ws_secret;
 
-	TargetState target_;
+	std::vector<std::unique_ptr<Channel>> channels;
+
 	mutable std::mutex mtx;
-
 	std::atomic<bool> running;
-	std::thread worker;
-
-	int last_layers;
-	int last_pct;
-
-	// Reconnect backoff state (protected by mtx). The close/fail handlers
-	// reset conn to null and schedule the next retry via these; the worker
-	// loop's idle tick checks ShouldReconnectLocked() and calls
-	// ConnectLocked() once the deadline passes. Doubles on each
-	// consecutive failure, capped, and resets once open_handler fires.
-	uint64_t next_reconnect_attempt_ns = 0;
-	int reconnect_backoff_ms = 2000;
-	static constexpr int kReconnectBackoffMinMs = 2000;
-	static constexpr int kReconnectBackoffMaxMs = 30000;
-
-	// Cached encoder pointers (all slots), saved at RegisterOutput time.
-	// Index 0 is the highest-resolution (full-res) encoder, index
-	// max_layers-1 is the lowest-resolution simulcast layer. We use
-	// obs_output_set_video_encoder2(out, nullptr, idx) to temporarily
-	// remove the highest-resolution layers when degrading (see
-	// docs/obs-mmx-degrade-protocol.md).
-	std::vector<obs_encoder_t *> all_encoders;
-	int max_layers;
 };

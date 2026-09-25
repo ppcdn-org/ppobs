@@ -117,15 +117,16 @@ private:
 	// all rather than an undecodable mix of layers.
 	obs_encoder_t *p2pVideoEncoder = nullptr;
 
-	// The resolved H264 WHIP endpoint Setup() got from ppcenter, reused by
-	// StartThread() to derive the degrade control channel's ws:// URL (the
-	// degrade client manipulates the same video encoders). Must be set even in p2p_only mode: an SRT publish runs the
-	// P2P-only companion, and mmx serves /{path}/ws/whip on the same
-	// WebRTC server as the WHIP endpoint, so deriving it from the resolved
-	// H264 track URL is what lets SRT (and any non-WHIP) publish receive
-	// degrade/recover commands. Empty when ppcenter returned no H264 track,
-	// in which case the client registers but does not connect.
-	std::string degrade_url;
+	// The resolved per-codec WHIP endpoints Setup() got from ppcenter,
+	// reused by StartThread() to derive each codec's degrade control
+	// channel ws:// URL. Both are needed when HEVC/H264 multitrack is on
+	// (two independent publish paths, each with its own FSM). The H264 one
+	// must also be set in p2p_only mode: an SRT publish runs the P2P-only
+	// companion, and mmx serves /{path}/ws/whip on the same WebRTC server,
+	// so the SRT session's degrade channel is derived from the resolved H264
+	// track URL. Empty when that codec isn't published.
+	std::string degrade_url_h264;
+	std::string degrade_url_hevc;
 	std::unique_ptr<UplinkQosPolicy> qosPolicy;
 	int64_t lastQosCheckMs = 0;
 
