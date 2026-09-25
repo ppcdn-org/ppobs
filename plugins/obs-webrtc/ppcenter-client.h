@@ -28,6 +28,10 @@ struct PPCenterPublishResponse {
 	// ppcenter versions omit this field; callers provide a temporary
 	// public-STUN fallback so NAT traversal still works during rollout.
 	std::vector<std::string> stun_servers;
+	// max_sessions is the platform-set cap on simultaneous P2P peers for this
+	// publisher (superadmin play setting). Older ppcenter versions omit it;
+	// the historical default of 3 is used then.
+	int max_sessions = 3;
 	// Keyed "h264"/"hevc" - "h264" is always required, "hevc" only when
 	// HEVC/H264 multitrack is enabled - see the design doc's §3.1/§3.2.
 	std::map<std::string, PPCenterWhipTrack> whip_tracks;

@@ -120,6 +120,12 @@ bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPub
 			}
 		}
 	}
+	response.max_sessions = 3;
+	if (decoded.contains("maxP2PSessions") && decoded["maxP2PSessions"].is_number_integer()) {
+		const int n = decoded["maxP2PSessions"].get<int>();
+		if (n > 0)
+			response.max_sessions = n;
+	}
 	response.whip_tracks.clear();
 	if (decoded.contains("whipTracks") && decoded["whipTracks"].is_object()) {
 		// Keyed "h264"/"hevc" - see the design doc's §3.2 and

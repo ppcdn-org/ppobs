@@ -288,10 +288,10 @@ private:
 
 P2PSignalClient::P2PSignalClient(const std::string &url, const std::string &token, const std::string &streamPath,
 				 const std::string &videoCodec, const std::string &audioCodec, uint32_t baseSsrc,
-				 std::vector<std::string> stunServers)
+				 std::vector<std::string> stunServers, int maxPeers)
 	: impl(std::make_unique<P2PSignalImpl>(url, token)),
 	  streamPath(streamPath), videoCodec(videoCodec), audioCodec(audioCodec), baseSsrc(baseSsrc),
-	  stunServers(std::move(stunServers))
+	  stunServers(std::move(stunServers)), maxPeers(maxPeers > 0 ? maxPeers : 3)
 {
 }
 
@@ -327,7 +327,7 @@ void P2PSignalClient::OnMessage(const std::string &data)
 void P2PSignalClient::HandleAllocated(const std::string &sessionId)
 {
 	std::lock_guard<std::mutex> lock(peersMutex);
-	if (peers.size() >= 3 || peers.count(sessionId)) return;
+	if ((int)peers.size() >= maxPeers || peers.count(sessionId)) return;
 	auto peer = std::make_shared<P2PPeer>();
 	peer->sessionId = sessionId;
 	peer->videoSsrc = baseSsrc + 1 + (uint32_t)(peers.size() * 2);

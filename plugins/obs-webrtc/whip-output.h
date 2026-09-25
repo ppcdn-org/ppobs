@@ -109,6 +109,9 @@ private:
 	std::string p2pSignalUrl;
 	std::string p2pStreamPath;
 	std::vector<std::string> p2pStunServers;
+	// Platform-set cap on simultaneous P2P peers (from the publish response);
+	// forwarded to P2PSignalClient. Defaults to the historical 3.
+	int p2pMaxSessions = 3;
 	// The single video encoder whose packets feed the P2P peers. P2P
 	// announces one H264 m-line per peer (P2PSignalClient::CreatePeerVideo),
 	// so Data() must forward exactly one layer: layers[0], i.e. rid "0" /

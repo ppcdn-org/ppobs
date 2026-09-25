@@ -630,6 +630,10 @@ bool WHIPOutput::Setup(uint64_t generation)
 	p2pStunServers = std::move(resp.stun_servers);
 	if (p2pStunServers.empty())
 		p2pStunServers.emplace_back("stun:stun.l.google.com:19302");
+	// Platform play setting: how many simultaneous P2P peers this publisher
+	// may carry. ppcenter enforces the same number when allocating sessions,
+	// so this is the publisher-side backstop. 0/absent => historical 3.
+	p2pMaxSessions = resp.max_sessions > 0 ? resp.max_sessions : 3;
 
 	// Resolved before the p2p_only early return below: a P2P-only output
 	// never reaches the WHIP layer setup, but its Data() still has to know
@@ -981,7 +985,7 @@ bool WHIPOutput::StartP2PSignal()
 	const char *videoCodec = "h264";
 	const char *audioCodec = "opus";
 	p2pSignal = std::make_unique<P2PSignalClient>(p2pSignalUrl, p2pToken, p2pStreamPath, videoCodec, audioCodec,
-						      generate_random_u32(), p2pStunServers);
+						      generate_random_u32(), p2pStunServers, p2pMaxSessions);
 	p2pSignal->Start();
 	qosPolicy = std::make_unique<UplinkQosPolicy>(UplinkQosConfig{});
 	return true;

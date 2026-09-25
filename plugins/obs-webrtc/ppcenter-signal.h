@@ -54,7 +54,7 @@ class P2PSignalClient {
 public:
 	P2PSignalClient(const std::string &url, const std::string &token, const std::string &streamPath,
 			const std::string &videoCodec, const std::string &audioCodec, uint32_t baseSsrc,
-			std::vector<std::string> stunServers);
+			std::vector<std::string> stunServers, int maxPeers = 3);
 	~P2PSignalClient();
 
 	bool Start();
@@ -84,6 +84,10 @@ private:
 	std::string audioCodec;
 	uint32_t baseSsrc;
 	std::vector<std::string> stunServers;
+	// Platform-set cap on simultaneous P2P peers for one publisher (from the
+	// play settings via the publish response). ppcenter enforces the same
+	// number at allocation time; this is the publisher-side backstop.
+	int maxPeers = 3;
 	std::function<void()> onPeerUpdated;
 	std::mutex peersMutex;
 	std::map<std::string, std::shared_ptr<P2PPeer>> peers;
