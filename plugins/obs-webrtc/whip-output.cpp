@@ -95,6 +95,95 @@ void WHIPOutput::Stop(bool signal)
 	start_stop_thread.join();
 }
 
+// Advances a P2P peer's RTP timestamp by this packet's duration, the same way
+// WHIPCodecSession::Send() does for the WHIP path.
+//
+// libdatachannel's packetizers only ever *read* rtpConfig->timestamp - nothing
+// moves it on its own. The P2P feed below used to just restore the peer's last
+// value and send, so every frame went out stamped with the same RTP timestamp.
+// A receiver groups packets into frames by timestamp, so a browser saw one
+// never-ending access unit: packetsReceived climbed while framesDecoded stayed
+// at 0 forever, which is exactly the "p2p_no_decode" the player reported (and
+// why no P2P session had ever decoded in production before 2026-09-24).
+static uint32_t advanceRtpTimestamp(const std::shared_ptr<rtc::RtpPacketizationConfig> &rtp, uint32_t lastTimestamp,
+				    int64_t durationUsec)
+{
+	if (durationUsec < 0)
+		durationUsec = 0;
+	return lastTimestamp + rtp->secondsToTimestamp(static_cast<double>(durationUsec) / (1000.0 * 1000.0));
+}
+
+// TEMPORARY diagnostic (2026-09-25): the P2P leg still fails to decode in the
+// browser (framesReceived=0) even though the RTP header is well-formed on the
+// wire and the sender setup is correct. The remaining suspect is the NAL
+// bitstream format handed to libdatachannel's H264RtpPacketizer, which is built
+// with Separator::StartSequence and therefore expects Annex-B start codes
+// (00 00 00 01 / 00 00 01). If OBS hands us AVCC (4-byte big-endian length
+// prefixes) in this SRT/rtmp_custom-companion scenario, the packetizer
+// mis-parses and the browser can never assemble a frame. This dumps the first
+// few video AUs' structure so we can see the actual format + NAL types +
+// whether SPS/PPS ride with the keyframe. Remove once P2P decode is fixed.
+static void logP2PVideoNALDiag(const struct encoder_packet *packet)
+{
+	static int logged = 0;
+	if (logged >= 6)
+		return;
+	const uint8_t *d = (const uint8_t *)packet->data;
+	size_t n = packet->size;
+	if (n < 5)
+		return;
+	logged++;
+
+	const bool annexb4 = (d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 1);
+	const bool annexb3 = (d[0] == 0 && d[1] == 0 && d[2] == 1);
+	const char *fmt = annexb4 ? "AnnexB(4)" : (annexb3 ? "AnnexB(3)" : "AVCC?");
+
+	char head[64];
+	snprintf(head, sizeof(head), "%02x %02x %02x %02x %02x %02x %02x %02x", d[0], d[1], d[2], d[3],
+		 d[4], d[5 < n ? 5 : 4], d[6 < n ? 6 : 4], d[7 < n ? 7 : 4]);
+
+	// Walk NAL units and collect their types.
+	char nals[256] = {0};
+	size_t np = 0;
+	if (annexb4 || annexb3) {
+		size_t i = 0;
+		while (i + 3 < n && np < sizeof(nals) - 8) {
+			size_t sc = 0;
+			if (i + 3 < n && d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 0 && d[i + 3] == 1)
+				sc = 4;
+			else if (i + 2 < n && d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1)
+				sc = 3;
+			if (sc == 0) {
+				i++;
+				continue;
+			}
+			size_t nalStart = i + sc;
+			if (nalStart >= n)
+				break;
+			int t = d[nalStart] & 0x1f;
+			np += snprintf(nals + np, sizeof(nals) - np, "%d ", t);
+			i = nalStart + 1;
+		}
+	} else {
+		// Interpret as AVCC: [4-byte len][NAL]...
+		size_t i = 0;
+		while (i + 4 < n && np < sizeof(nals) - 8) {
+			uint32_t len = (uint32_t(d[i]) << 24) | (uint32_t(d[i + 1]) << 16) |
+				       (uint32_t(d[i + 2]) << 8) | uint32_t(d[i + 3]);
+			if (len == 0 || i + 4 + len > n) {
+				np += snprintf(nals + np, sizeof(nals) - np, "(len=%u bad)", len);
+				break;
+			}
+			int t = d[i + 4] & 0x1f;
+			np += snprintf(nals + np, sizeof(nals) - np, "%d ", t);
+			i += 4 + len;
+		}
+	}
+	// NAL types: 7=SPS 8=PPS 5=IDR 1=nonIDR 6=SEI 9=AUD
+	blog(LOG_INFO, "[obs-webrtc] [p2p-naldiag] #%d key=%d size=%zu fmt=%s head=[%s] nalTypes=[%s]", logged,
+	     packet->keyframe ? 1 : 0, n, fmt, head, nals);
+}
+
 void WHIPOutput::Data(struct encoder_packet *packet)
 {
 	if (!packet) {
@@ -117,22 +206,23 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 
 		if (p2pSignal) {
 			p2pSignal->ForEachPeer([&](P2PPeer &peer) {
-				int64_t dur = packet->dts_usec - peer.lastAudioTimestamp;
+				if (!peer.audioTrack || !peer.audioTrack->isOpen())
+					return;
+				int64_t dur = peer.audioStarted ? packet->dts_usec - peer.lastAudioTimestamp : 0;
 				peer.lastAudioTimestamp = packet->dts_usec;
-				if (peer.audioTrack && peer.audioTrack->isOpen()) {
-					std::vector<rtc::byte> sample{(rtc::byte *)packet->data,
-								      (rtc::byte *)packet->data + packet->size};
-					auto rtp = peer.audioSrReporter->rtpConfig;
-					rtp->sequenceNumber = peer.audioSequenceNumber;
-					rtp->timestamp = peer.audioRtpTimestamp;
-					rtp->ssrc = peer.audioSsrc;
-					try {
-						peer.audioTrack->send(sample);
-					} catch (...) {
-					}
-					peer.audioSequenceNumber = rtp->sequenceNumber;
-					peer.audioRtpTimestamp = rtp->timestamp;
+				peer.audioStarted = true;
+				std::vector<rtc::byte> sample{(rtc::byte *)packet->data,
+							      (rtc::byte *)packet->data + packet->size};
+				auto rtp = peer.audioSrReporter->rtpConfig;
+				rtp->sequenceNumber = peer.audioSequenceNumber;
+				rtp->ssrc = peer.audioSsrc;
+				rtp->timestamp = advanceRtpTimestamp(rtp, peer.audioRtpTimestamp, dur);
+				try {
+					peer.audioTrack->send(sample);
+				} catch (...) {
 				}
+				peer.audioSequenceNumber = rtp->sequenceNumber;
+				peer.audioRtpTimestamp = rtp->timestamp;
 			});
 		}
 	} else if (packet->type == OBS_ENCODER_VIDEO) {
@@ -146,25 +236,35 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 		else if (hevcSession && hevcSession->OwnsVideoEncoder(packet->encoder))
 			hevcSession->SendVideo(packet);
 
-		if (p2pSignal) {
+		// P2P carries exactly one video layer (PLY-009; CreatePeerVideo
+		// announces a single H264 m-line), so only that layer's encoder
+		// may feed it. Forwarding every layer here interleaved three
+		// resolutions' NAL units into one SSRC/sequence-number stream,
+		// which no decoder can make sense of.
+		if (p2pSignal && packet->encoder == p2pVideoEncoder) {
+			logP2PVideoNALDiag(packet); // TEMPORARY (2026-09-25) - remove once P2P decode is fixed
 			p2pSignal->ForEachPeer([&](P2PPeer &peer) {
-				int64_t dur = packet->dts_usec - peer.lastVideoTimestamp;
+				if (!peer.videoTrack || !peer.videoTrack->isOpen())
+					return;
+				// Start this peer's feed on a keyframe - see P2PPeer::videoStarted.
+				if (!peer.videoStarted && !packet->keyframe)
+					return;
+				int64_t dur = peer.videoStarted ? packet->dts_usec - peer.lastVideoTimestamp : 0;
 				peer.lastVideoTimestamp = packet->dts_usec;
-				if (peer.videoTrack && peer.videoTrack->isOpen()) {
-					std::vector<rtc::byte> sample{(rtc::byte *)packet->data,
-								      (rtc::byte *)packet->data + packet->size};
-					auto rtp = peer.videoSrReporter->rtpConfig;
-					rtp->sequenceNumber = peer.videoSequenceNumber;
-					rtp->timestamp = peer.videoRtpTimestamp;
-					rtp->ssrc = peer.videoSsrc;
-					rtp->rid = "0";
-					try {
-						peer.videoTrack->send(sample);
-					} catch (...) {
-					}
-					peer.videoSequenceNumber = rtp->sequenceNumber;
-					peer.videoRtpTimestamp = rtp->timestamp;
+				peer.videoStarted = true;
+				std::vector<rtc::byte> sample{(rtc::byte *)packet->data,
+							      (rtc::byte *)packet->data + packet->size};
+				auto rtp = peer.videoSrReporter->rtpConfig;
+				rtp->sequenceNumber = peer.videoSequenceNumber;
+				rtp->ssrc = peer.videoSsrc;
+				rtp->rid = "0";
+				rtp->timestamp = advanceRtpTimestamp(rtp, peer.videoRtpTimestamp, dur);
+				try {
+					peer.videoTrack->send(sample);
+				} catch (...) {
 				}
+				peer.videoSequenceNumber = rtp->sequenceNumber;
+				peer.videoRtpTimestamp = rtp->timestamp;
 			});
 		}
 	}
@@ -531,6 +631,16 @@ bool WHIPOutput::Setup(uint64_t generation)
 	if (p2pStunServers.empty())
 		p2pStunServers.emplace_back("stun:stun.l.google.com:19302");
 
+	// Resolved before the p2p_only early return below: a P2P-only output
+	// never reaches the WHIP layer setup, but its Data() still has to know
+	// which single layer may feed the peers (see p2pVideoEncoder).
+	{
+		const auto p2pLayers = collectVideoLayers(output, "h264");
+		p2pVideoEncoder = p2pLayers.empty() ? nullptr : p2pLayers.front();
+		if (!p2pVideoEncoder && !p2pSignalUrl.empty())
+			do_log(LOG_WARNING, "no H264 layer attached - P2P peers will get audio only");
+	}
+
 	// A P2P-only output stops here: it never opens a WHIP media session, it
 	// only runs the P2P publisher path (started in StartThread) off the
 	// shared encoders, so an SRT (or any non-WHIP) publish can still join the
@@ -538,8 +648,17 @@ bool WHIPOutput::Setup(uint64_t generation)
 	// WHIPCodecSession connect). See
 	// docs/design/ppobs-p2p-srt-publish-support.zh-CN.md.
 	if (p2p_only) {
-		do_log(LOG_INFO, "P2P-only output: signaling %s, no WHIP session",
-		       p2pSignalUrl.empty() ? "disabled" : "configured");
+		// Still capture the resolved H264 WHIP endpoint: the degrade
+		// control channel is derived from it (mmx serves /{path}/ws/whip
+		// on the same WebRTC server), and for an SRT publish the SRT
+		// session's path carries the same codec segment, so mmx keys the
+		// degrade state identically for both transports.
+		auto degradeTrack = resp.whip_tracks.find("h264");
+		if (degradeTrack != resp.whip_tracks.end())
+			degrade_url = degradeTrack->second.url;
+		do_log(LOG_INFO, "P2P-only output: signaling %s, degrade %s, no WHIP session",
+		       p2pSignalUrl.empty() ? "disabled" : "configured",
+		       degrade_url.empty() ? "disabled" : "configured");
 		return true;
 	}
 
@@ -574,6 +693,11 @@ bool WHIPOutput::Setup(uint64_t generation)
 	}
 	std::string h264Url = h264Track->second.url;
 	std::string h264Token = h264Track->second.bearer_token;
+	// Degrade control channel is derived from the H264 endpoint only - it
+	// has never modeled per-codec sessions, and layer degrade commands
+	// apply to the H264 simulcast ladder regardless of whether HEVC
+	// multitrack is also running.
+	degrade_url = h264Url;
 
 	std::vector<obs_encoder_t *> hevcLayers;
 	std::string hevcUrl, hevcToken;
@@ -784,12 +908,11 @@ void WHIPOutput::StartThread(uint64_t generation)
 	running = true;
 
 #ifdef WHIP_DEGRADE_ACTIVE
-	// Degrade control channel is derived from the H264 endpoint only -
-	// it has never modeled per-codec sessions, and layer degrade
-	// commands apply to the H264 simulcast ladder regardless of
-	// whether HEVC multitrack is also running.
-	if (!p2p_only)
-		WsDegradeClient::Instance().RegisterOutput(output, "");
+	// Registered for both the normal WHIP output and the P2P-only
+	// companion that backs an SRT (or any non-WHIP) publish. degrade_url
+	// is the H264 WHIP endpoint Setup() resolved from ppcenter, so the
+	// derived ws:// URL targets the same mmx node receiving the media.
+	WsDegradeClient::Instance().RegisterOutput(output, degrade_url);
 #endif
 }
 

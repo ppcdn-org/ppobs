@@ -357,6 +357,8 @@ bool WsDegradeClient::ParseTargetState(const std::string &json, TargetState &out
 			out.layers = j["layers"];
 		if (j.contains("bitrate_percent"))
 			out.bitrate_percent = j["bitrate_percent"];
+		if (j.contains("latency_ms"))
+			out.latency_ms = j["latency_ms"];
 	} catch (const std::exception &e) {
 		do_log(LOG_DEBUG, "JSON parse error: %s", e.what());
 		return false;
@@ -415,10 +417,11 @@ void WsDegradeClient::ApplyIfNeeded(const TargetState &target)
 			new_layers = 1;
 
 		do_log(LOG_INFO,
-		       "TARGET_STATE layers=%d (clamped %d) bitrate=%d%% | current layers=%d bitrate=%d%%",
+		       "TARGET_STATE layers=%d (clamped %d) bitrate=%d%% latency=%dms | current layers=%d bitrate=%d%%",
 		       target.layers,
 		       new_layers,
 		       target.bitrate_percent,
+		       target.latency_ms,
 		       cur_layers,
 		       last_pct);
 

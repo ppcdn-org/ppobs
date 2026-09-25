@@ -109,6 +109,23 @@ private:
 	std::string p2pSignalUrl;
 	std::string p2pStreamPath;
 	std::vector<std::string> p2pStunServers;
+	// The single video encoder whose packets feed the P2P peers. P2P
+	// announces one H264 m-line per peer (P2PSignalClient::CreatePeerVideo),
+	// so Data() must forward exactly one layer: layers[0], i.e. rid "0" /
+	// highest quality, the same layer the WHIP path labels rid "0". Null
+	// when no H264 layer is attached, in which case P2P carries no video at
+	// all rather than an undecodable mix of layers.
+	obs_encoder_t *p2pVideoEncoder = nullptr;
+
+	// The resolved H264 WHIP endpoint Setup() got from ppcenter, reused by
+	// StartThread() to derive the degrade control channel's ws:// URL (the
+	// degrade client manipulates the same video encoders). Must be set even in p2p_only mode: an SRT publish runs the
+	// P2P-only companion, and mmx serves /{path}/ws/whip on the same
+	// WebRTC server as the WHIP endpoint, so deriving it from the resolved
+	// H264 track URL is what lets SRT (and any non-WHIP) publish receive
+	// degrade/recover commands. Empty when ppcenter returned no H264 track,
+	// in which case the client registers but does not connect.
+	std::string degrade_url;
 	std::unique_ptr<UplinkQosPolicy> qosPolicy;
 	int64_t lastQosCheckMs = 0;
 

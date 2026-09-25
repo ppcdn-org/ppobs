@@ -18,6 +18,10 @@ struct TargetState {
 	std::string path;
 	int layers = 3;
 	int bitrate_percent = 100;
+	// Server-side receiver latency the mmx node is applying to this path
+	// (see docs/design/publish-degrade-protocol.zh-CN.md §6.3). Informational
+	// only - the client does not act on it, the latency is owned by mmx.
+	int latency_ms = 0;
 };
 
 class WsDegradeClient {

@@ -27,6 +27,15 @@ struct P2PPeer {
 	uint32_t audioRtpTimestamp = 0;
 	int64_t lastVideoTimestamp = 0;
 	int64_t lastAudioTimestamp = 0;
+	// A peer joins mid-stream, so the first packet it would see is almost
+	// never a keyframe and carries no SPS/PPS - the browser then has
+	// nothing to initialize its decoder with and drops everything until
+	// the next IDR. Hold the feed until a keyframe arrives so the very
+	// first RTP the peer receives starts a decodable access unit.
+	// (videoStarted also marks "lastVideoTimestamp is meaningful", so the
+	// first duration is 0 instead of the whole stream's elapsed time.)
+	bool videoStarted = false;
+	bool audioStarted = false;
 };
 
 class P2PSignalImpl;
