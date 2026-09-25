@@ -361,22 +361,6 @@ static std::vector<obs_encoder_t *> collectVideoLayers(obs_output_t *output, con
 	return layers;
 }
 
-// Rewrites the codec segment of a resolved WHIP URL (.../h264/whip ->
-// .../hevc/whip). Used by the P2P-only companion, whose single shared encoder
-// can be HEVC while the track it resolved from ppcenter was H264.
-static std::string withCodecSegment(std::string url, const std::string &codec)
-{
-	for (const char *seg : {"/h264/", "/hevc/"}) {
-		const std::string from(seg);
-		auto p = url.rfind(from);
-		if (p != std::string::npos) {
-			url.replace(p, from.size(), "/" + codec + "/");
-			break;
-		}
-	}
-	return url;
-}
-
 // ppobs推流限制 (operator-specified limits, not an upstream OBS thing):
 //   1. resolution no higher than 3840x2160 for landscape (width >= height)
 //      or 2160x3840 for portrait - a single hard ceiling that also covers
@@ -669,14 +653,22 @@ bool WHIPOutput::Setup(uint64_t generation)
 		// endpoint (mmx serves /{path}/ws/whip on the same WebRTC server);
 		// the companion's single shared encoder decides which codec path it
 		// maps to, since the SRT session's path carries that codec segment.
-		auto degradeTrack = resp.whip_tracks.find("h264");
-		if (degradeTrack != resp.whip_tracks.end() && !degradeTrack->second.url.empty()) {
-			const bool hasH264 = !collectVideoLayers(output, "h264").empty();
-			const bool hasHevc = !collectVideoLayers(output, "hevc").empty();
-			if (!hasH264 && hasHevc)
-				degrade_url_hevc = withCodecSegment(degradeTrack->second.url, "hevc");
-			else
-				degrade_url_h264 = degradeTrack->second.url;
+		// The degrade channel is authenticated with the same ppcenter bearer
+		// token as that codec's WHIP publish, and the token is codec-bound,
+		// so a channel is only armed when a track with a matching codec and
+		// a non-empty token exists.
+		const bool hasH264 = !collectVideoLayers(output, "h264").empty();
+		const bool hasHevc = !collectVideoLayers(output, "hevc").empty();
+		auto h264Track = resp.whip_tracks.find("h264");
+		auto hevcTrack = resp.whip_tracks.find("hevc");
+		if (hasH264 && h264Track != resp.whip_tracks.end() && !h264Track->second.url.empty() &&
+		    !h264Track->second.bearer_token.empty()) {
+			degrade_url_h264 = h264Track->second.url;
+			degrade_token_h264 = h264Track->second.bearer_token;
+		} else if (hasHevc && hevcTrack != resp.whip_tracks.end() && !hevcTrack->second.url.empty() &&
+			   !hevcTrack->second.bearer_token.empty()) {
+			degrade_url_hevc = hevcTrack->second.url;
+			degrade_token_hevc = hevcTrack->second.bearer_token;
 		}
 		do_log(LOG_INFO, "P2P-only output: signaling %s, degrade h264=%s hevc=%s, no WHIP session",
 		       p2pSignalUrl.empty() ? "disabled" : "configured",
@@ -729,6 +721,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 	std::string h264Url = h264Track->second.url;
 	std::string h264Token = h264Track->second.bearer_token;
 	degrade_url_h264 = h264Url;
+	degrade_token_h264 = h264Token;
 
 	std::vector<obs_encoder_t *> hevcLayers;
 	std::string hevcUrl, hevcToken;
@@ -774,6 +767,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 		hevcUrl = hevcTrack->second.url;
 		hevcToken = hevcTrack->second.bearer_token;
 		degrade_url_hevc = hevcUrl;
+		degrade_token_hevc = hevcToken;
 	}
 
 	// Capture the actual encoder configuration now that every requested layer
@@ -953,7 +947,8 @@ void WHIPOutput::StartThread(uint64_t generation)
 	// channel per codec published (HEVC/H264 multitrack => two), each
 	// derived from the WHIP endpoint Setup() resolved from ppcenter for
 	// that codec.
-	WsDegradeClient::Instance().RegisterOutput(output, degrade_url_h264, degrade_url_hevc);
+	WsDegradeClient::Instance().RegisterOutput(output, degrade_url_h264, degrade_token_h264,
+						   degrade_url_hevc, degrade_token_hevc);
 #endif
 }
 

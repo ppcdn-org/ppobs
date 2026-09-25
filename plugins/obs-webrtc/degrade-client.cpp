@@ -74,6 +74,10 @@ struct WsDegradeClient::Channel {
 
 	std::string codec;
 	std::string ws_url;
+	// ppcenter publish bearer token for this codec's WHIP path, sent as
+	// "Authorization: Bearer <token>" on the degrade WS. Same credential as
+	// the WHIP publish itself; mmx verifies it with WHIP_AUTH_KEY.
+	std::string token;
 	conn_ptr conn;
 	TargetState target;
 	bool target_set = false;
@@ -92,7 +96,7 @@ WsDegradeClient &WsDegradeClient::Instance()
 }
 
 WsDegradeClient::WsDegradeClient()
-	: output(nullptr), ws_secret(), channels(), mtx(), running(true)
+	: output(nullptr), channels(), mtx(), running(true)
 {
 	for (const char *codec : {"h264", "hevc"}) {
 		auto ch = std::make_unique<Channel>();
@@ -261,7 +265,7 @@ std::vector<obs_encoder_t *> WsDegradeClient::codecEncoders(const std::string &c
 // -------------------------------------------------------------------
 bool WsDegradeClient::ShouldReconnectLocked(const Channel &ch) const
 {
-	return !ch.conn && !ch.ws_url.empty() && !ws_secret.empty() && ch.next_reconnect_attempt_ns != 0 &&
+	return !ch.conn && !ch.ws_url.empty() && !ch.token.empty() && ch.next_reconnect_attempt_ns != 0 &&
 	       os_gettime_ns() >= ch.next_reconnect_attempt_ns;
 }
 
@@ -282,31 +286,39 @@ void WsDegradeClient::ConnectLocked(Channel &ch)
 		return;
 	}
 
-	ch.conn->append_header("Authorization", "Bearer " + ws_secret);
+	ch.conn->append_header("Authorization", "Bearer " + ch.token);
 	ch.client->connect(ch.conn);
 }
 
-void WsDegradeClient::ConfigureChannelLocked(Channel &ch, const std::string &whip_url)
+void WsDegradeClient::ConfigureChannelLocked(Channel &ch, const std::string &whip_url,
+					     const std::string &token)
 {
-	if (whip_url.empty()) {
+	// No endpoint, or no credential to authenticate it with: the channel is
+	// unusable, so make sure any existing connection is dropped.
+	if (whip_url.empty() || token.empty()) {
 		if (ch.conn) {
 			websocketpp::lib::error_code ec;
 			ch.conn->close(websocketpp::close::status::going_away, "unused", ec);
 			ch.conn.reset();
 		}
 		ch.ws_url.clear();
+		ch.token.clear();
 		ch.next_reconnect_attempt_ns = 0;
 		return;
 	}
 
 	std::string new_ws = whip_to_ws(whip_url);
-	if (new_ws == ch.ws_url)
-		return; // same endpoint: keep the live connection
+	// Same endpoint AND same credential: keep the live connection. A changed
+	// token (ppcenter reissues one per publish session, 24h TTL) must force a
+	// reconnect, otherwise the channel would keep presenting the stale token.
+	if (new_ws == ch.ws_url && token == ch.token)
+		return;
 
 	ch.ws_url = new_ws;
+	ch.token = token;
 	if (ch.conn) {
 		websocketpp::lib::error_code ec;
-		ch.conn->close(websocketpp::close::status::going_away, "url-change", ec);
+		ch.conn->close(websocketpp::close::status::going_away, "url-or-token-change", ec);
 		ch.conn.reset();
 	}
 	ch.reconnect_backoff_ms = kReconnectBackoffMinMs;
@@ -317,25 +329,14 @@ void WsDegradeClient::ConfigureChannelLocked(Channel &ch, const std::string &whi
 //  Output registration
 // -------------------------------------------------------------------
 void WsDegradeClient::RegisterOutput(obs_output_t *out, const std::string &h264_whip_url,
-				     const std::string &hevc_whip_url)
+				     const std::string &h264_token, const std::string &hevc_whip_url,
+				     const std::string &hevc_token)
 {
 	if (!out)
 		return;
 
 	std::lock_guard<std::mutex> lk(mtx);
 	output = out;
-
-	obs_service_t *svc = obs_output_get_service(out);
-	if (!svc)
-		return;
-
-	OBSDataAutoRelease service_settings = obs_service_get_settings(svc);
-	std::string secret = obs_data_get_string(service_settings, "ppcenter_secret");
-	if (secret.empty()) {
-		do_log(LOG_DEBUG, "ppcenter_secret not set, degrade channel disabled");
-		return;
-	}
-	ws_secret = secret;
 
 	// Cache each codec's full layer count once; a degrade-triggered restart
 	// re-registers with the same encoders, and re-counting after a trim
@@ -346,9 +347,9 @@ void WsDegradeClient::RegisterOutput(obs_output_t *out, const std::string &h264_
 	}
 
 	if (Channel *h264 = FindChannel("h264"))
-		ConfigureChannelLocked(*h264, h264_whip_url);
+		ConfigureChannelLocked(*h264, h264_whip_url, h264_token);
 	if (Channel *hevc = FindChannel("hevc"))
-		ConfigureChannelLocked(*hevc, hevc_whip_url);
+		ConfigureChannelLocked(*hevc, hevc_whip_url, hevc_token);
 }
 
 void WsDegradeClient::UnregisterOutput()
@@ -363,6 +364,7 @@ void WsDegradeClient::UnregisterOutput()
 			ch->conn.reset();
 		}
 		ch->ws_url.clear();
+		ch->token.clear();
 		ch->next_reconnect_attempt_ns = 0;
 		ch->reconnect_backoff_ms = kReconnectBackoffMinMs;
 	}

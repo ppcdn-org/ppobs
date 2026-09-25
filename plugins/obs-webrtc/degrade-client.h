@@ -41,12 +41,16 @@ class WsDegradeClient {
 public:
 	static WsDegradeClient &Instance();
 
-	// Registers the output together with the per-codec WHIP endpoints the
-	// control channels are derived from. Either URL may be empty (that
-	// codec is not published). Safe to call again after every output
-	// (re)start - an unchanged URL keeps its connection.
+	// Registers the output together with the per-codec WHIP endpoint and its
+	// ppcenter publish bearer token. The control channel URL is derived from
+	// the WHIP URL, and it is authenticated with the same token (mmx verifies
+	// it with WHIP_AUTH_KEY) - there is no separate degrade secret. Either
+	// pair may be empty (that codec is not published). Safe to call again
+	// after every output (re)start - an unchanged URL+token keeps its
+	// connection.
 	void RegisterOutput(obs_output_t *output, const std::string &h264_whip_url,
-			    const std::string &hevc_whip_url);
+			    const std::string &h264_token, const std::string &hevc_whip_url,
+			    const std::string &hevc_token);
 
 	void UnregisterOutput();
 
@@ -72,12 +76,11 @@ private:
 	Channel *FindChannel(const std::string &codec);
 	const Channel *FindChannel(const std::string &codec) const;
 
-	void ConfigureChannelLocked(Channel &ch, const std::string &whip_url);
+	void ConfigureChannelLocked(Channel &ch, const std::string &whip_url, const std::string &token);
 	void ConnectLocked(Channel &ch);
 	bool ShouldReconnectLocked(const Channel &ch) const;
 
 	obs_output_t *output;
-	std::string ws_secret;
 
 	std::vector<std::unique_ptr<Channel>> channels;
 

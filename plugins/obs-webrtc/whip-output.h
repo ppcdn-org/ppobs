@@ -127,6 +127,12 @@ private:
 	// track URL. Empty when that codec isn't published.
 	std::string degrade_url_h264;
 	std::string degrade_url_hevc;
+	// The ppcenter-issued publish bearer token for each codec's WHIP track.
+	// The degrade WS reuses this same credential (verified by mmx with
+	// WHIP_AUTH_KEY), so it must travel with the URL above - there is no
+	// separate degrade secret any more.
+	std::string degrade_token_h264;
+	std::string degrade_token_hevc;
 	std::unique_ptr<UplinkQosPolicy> qosPolicy;
 	int64_t lastQosCheckMs = 0;
 
