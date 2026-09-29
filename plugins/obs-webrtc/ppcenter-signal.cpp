@@ -95,8 +95,8 @@ std::optional<OfferedCodec> FindOfferedCodec(const rtc::Description &offer, cons
 
 class P2PSignalImpl {
 public:
-	P2PSignalImpl(const std::string &url, const std::string &token)
-		: signalUrl(url), signalToken(token)
+	P2PSignalImpl(const std::string &url, const std::string &token, std::function<std::string()> tokenProvider)
+		: signalUrl(url), signalToken(token), tokenProvider(std::move(tokenProvider))
 	{
 		validEndpoint = ParseWebSocketSignalURL(signalUrl).valid;
 	}
@@ -252,8 +252,15 @@ private:
 		// ppcenter reads the P2P token from the Sec-WebSocket-Protocol header
 		// (ppcdn-token.<token>) and echoes back ppcdn-p2p-v1. libdatachannel
 		// sends/validates exactly these subprotocols, so no server change is
-		// needed.
-		config.protocols = {"ppcdn-p2p-v1", "ppcdn-token." + signalToken};
+		// needed. tokenProvider (when set) is the fresh token for THIS attempt
+		// - see WHIPOutput::AcquireP2PToken().
+		std::string token = signalToken;
+		if (tokenProvider) {
+			std::string refreshed = tokenProvider();
+			if (!refreshed.empty())
+				token = std::move(refreshed);
+		}
+		config.protocols = {"ppcdn-p2p-v1", "ppcdn-token." + token};
 		// Explicitly disabled ("zero to disable", rtc/configuration.hpp), not
 		// left unset. A prior non-zero value here (15000ms) reproduced a
 		// signaling reconnect every ~15.0-15.05s for the entire life of a
@@ -275,6 +282,9 @@ private:
 
 	std::string signalUrl;
 	std::string signalToken;
+	// Consulted before each connect attempt to obtain a current token; see the
+	// P2PSignalClient constructor comment. Empty means "always use signalToken".
+	std::function<std::string()> tokenProvider;
 	bool validEndpoint = false;
 	std::thread thread;
 	std::atomic<bool> running{false};
@@ -288,8 +298,9 @@ private:
 
 P2PSignalClient::P2PSignalClient(const std::string &url, const std::string &token, const std::string &streamPath,
 				 const std::string &videoCodec, const std::string &audioCodec, uint32_t baseSsrc,
-				 std::vector<std::string> stunServers, int maxPeers)
-	: impl(std::make_unique<P2PSignalImpl>(url, token)),
+				 std::vector<std::string> stunServers, int maxPeers,
+				 std::function<std::string()> tokenProvider)
+	: impl(std::make_unique<P2PSignalImpl>(url, token, std::move(tokenProvider))),
 	  streamPath(streamPath), videoCodec(videoCodec), audioCodec(audioCodec), baseSsrc(baseSsrc),
 	  stunServers(std::move(stunServers)), maxPeers(maxPeers > 0 ? maxPeers : 3)
 {

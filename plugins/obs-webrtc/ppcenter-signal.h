@@ -52,9 +52,15 @@ class P2PSignalImpl;
 
 class P2PSignalClient {
 public:
+	// tokenProvider, when set, is consulted on every connection attempt and its
+	// return value used as the WebSocket token instead of the `token` argument.
+	// A long stream outlives the ppcenter publisher signal token's TTL, so a
+	// fixed token means every reconnect after it expires is rejected (401) and
+	// the publisher never re-attaches; see WHIPOutput::AcquireP2PToken().
 	P2PSignalClient(const std::string &url, const std::string &token, const std::string &streamPath,
 			const std::string &videoCodec, const std::string &audioCodec, uint32_t baseSsrc,
-			std::vector<std::string> stunServers, int maxPeers = 3);
+			std::vector<std::string> stunServers, int maxPeers = 3,
+			std::function<std::string()> tokenProvider = {});
 	~P2PSignalClient();
 
 	bool Start();

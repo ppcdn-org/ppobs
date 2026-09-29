@@ -79,6 +79,10 @@ private:
 	// Keeps ppcenter's publisher-side NAT observation from going stale over
 	// a long stream - see CheckNatProbeRefresh()'s own comment.
 	void CheckNatProbeRefresh();
+	// Returns a currently-valid publisher signal token, minting a replacement
+	// from ppcenter when the cached one is close to expiring. Called by
+	// P2PSignalClient before each connection attempt - see its own comment.
+	std::string AcquireP2PToken();
 
 	obs_output_t *output;
 
@@ -105,7 +109,14 @@ private:
 	std::atomic<int> connect_time_ms{0};
 
 	std::unique_ptr<P2PSignalClient> p2pSignal;
+	// p2pToken is read by the signaling thread (AcquireP2PToken, via the token
+	// provider) and written by both Setup() and AcquireP2PToken(); guard it
+	// with p2pTokenMutex. lastP2PTokenRefreshMs throttles refresh attempts so a
+	// persistently failing /v1/publish/requests cannot turn the signaling
+	// reconnect loop into a request storm.
+	std::mutex p2pTokenMutex;
 	std::string p2pToken;
+	int64_t lastP2PTokenRefreshMs = 0;
 	std::string p2pSignalUrl;
 	std::string p2pStreamPath;
 	std::vector<std::string> p2pStunServers;
@@ -151,6 +162,10 @@ private:
 	// refreshed alike), or ppcenter's identity check rejects the pair as
 	// identity_mismatch. See ProbePublisherNAT's doc comment.
 	std::string natProbeClientId;
+	// The probe_id the last successful probe registered. Re-sent when
+	// AcquireP2PToken() re-runs /v1/publish/requests, so the fresh publisher
+	// token carries the same natProbeId ppcenter already has on file.
+	std::string natProbeId;
 	int64_t lastNatProbeRefreshMs = 0;
 
 	// Encoder-parameter report (see encoder-report.h): the actual encoder

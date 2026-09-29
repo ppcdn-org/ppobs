@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -40,3 +41,12 @@ struct PPCenterPublishResponse {
 std::string ppcenter_build_publish_json(const PPCenterPublishRequest &request);
 bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPublishResponse &response,
 			      std::string &error);
+
+// ppcenter_publish_token_expiry_unix decodes the `exp` (unix seconds) claim of
+// a ppcenter publisher signal token without verifying it. The token is
+// "<base64url(JSON claims)>.<base64url(HMAC)>" (see
+// ppcenter/internal/p2p/token.go), so the claim is readable with no signing
+// key - enough for a long-running publish to know when it must mint a
+// replacement before the old token stops being accepted. Returns 0 when the
+// token is empty or its shape isn't recognized.
+int64_t ppcenter_publish_token_expiry_unix(const std::string &token);

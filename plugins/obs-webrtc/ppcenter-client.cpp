@@ -26,6 +26,62 @@ size_t write_response(char *ptr, size_t size, size_t nmemb, void *userdata)
 	buffer->data.append(ptr, length);
 	return length;
 }
+
+int base64url_value(char c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return c - 'A';
+	if (c >= 'a' && c <= 'z')
+		return c - 'a' + 26;
+	if (c >= '0' && c <= '9')
+		return c - '0' + 52;
+	if (c == '-')
+		return 62;
+	if (c == '_')
+		return 63;
+	return -1;
+}
+
+// Decodes unpadded base64url (the encoding ppcenter's token.go uses). Trailing
+// '=' padding is tolerated but not required.
+bool base64url_decode(const std::string &input, std::string &output)
+{
+	output.clear();
+	int accum = 0;
+	int bits = 0;
+	for (char c : input) {
+		const int value = base64url_value(c);
+		if (value < 0) {
+			if (c == '=')
+				break;
+			return false;
+		}
+		accum = (accum << 6) | value;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			output.push_back(static_cast<char>((accum >> bits) & 0xFF));
+		}
+	}
+	return true;
+}
+}
+
+int64_t ppcenter_publish_token_expiry_unix(const std::string &token)
+{
+	const size_t dot = token.find('.');
+	if (dot == std::string::npos || dot == 0)
+		return 0;
+	std::string payload;
+	if (!base64url_decode(token.substr(0, dot), payload))
+		return 0;
+	try {
+		const auto claims = nlohmann::json::parse(payload);
+		if (claims.contains("exp") && claims["exp"].is_number())
+			return claims["exp"].get<int64_t>();
+	} catch (const std::exception &) {
+	}
+	return 0;
 }
 
 std::string ppcenter_build_publish_json(const PPCenterPublishRequest &request)

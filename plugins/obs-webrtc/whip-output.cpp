@@ -11,6 +11,7 @@
 #include <obs.hpp>
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 
 #ifdef WHIP_DEGRADE_ACTIVE
 #include "degrade-client.h"
@@ -610,6 +611,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 	const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name, natProbeClientId);
 	if (probe.succeeded) {
 		request.nat_probe_id = probe.probe_id;
+		natProbeId = probe.probe_id;
 		do_log(LOG_INFO, "P2P publisher NAT probe registered");
 	} else {
 		// NAT probing is an optional P2P optimization. Publishing must
@@ -985,7 +987,8 @@ bool WHIPOutput::StartP2PSignal()
 	const char *videoCodec = "h264";
 	const char *audioCodec = "opus";
 	p2pSignal = std::make_unique<P2PSignalClient>(p2pSignalUrl, p2pToken, p2pStreamPath, videoCodec, audioCodec,
-						      generate_random_u32(), p2pStunServers, p2pMaxSessions);
+						      generate_random_u32(), p2pStunServers, p2pMaxSessions,
+						      [this]() { return AcquireP2PToken(); });
 	p2pSignal->Start();
 	qosPolicy = std::make_unique<UplinkQosPolicy>(UplinkQosConfig{});
 	return true;
@@ -1083,6 +1086,66 @@ void WHIPOutput::CheckNatProbeRefresh()
 			blog(LOG_DEBUG,
 			     "[obs-webrtc] [nat-probe-refresh] P2P publisher NAT probe refresh failed; will retry next interval");
 	}).detach();
+}
+
+// Refresh the publisher signal token once it is within this margin of its
+// expiry, so a reconnect never races the expiry.
+constexpr int64_t P2P_TOKEN_REFRESH_MARGIN_SECONDS = 600;
+// Floor between refresh attempts, so a persistently failing
+// /v1/publish/requests cannot turn the 5s signaling reconnect loop into a
+// request storm.
+constexpr int64_t P2P_TOKEN_REFRESH_MIN_INTERVAL_MS = 60 * 1000;
+
+std::string WHIPOutput::AcquireP2PToken()
+{
+	std::lock_guard<std::mutex> lock(p2pTokenMutex);
+	if (p2pToken.empty() || natProbeUrl.empty())
+		return p2pToken;
+
+	// ppcenter issues the publisher signal token with a TTL (config
+	// publisherTokenTtlSeconds, default 1h) and P2PSignalClient reconnects
+	// forever with whatever token it was constructed with. A stream older than
+	// the TTL therefore has every reconnect rejected with HTTP 401, so the
+	// publisher never re-attaches and every viewer is judged
+	// missing_publisher_probe (edge-only) until the stream is restarted.
+	// Confirmed in production 2026-09-29: signal attaches stopped at 08:40, the
+	// token minted at 08:15:36 expired ~09:15, reconnects 401'd from 09:32.
+	//
+	// Decoding the token's own `exp` means we only re-request when genuinely
+	// close to expiry, so a healthy stream still calls ppcenter exactly once
+	// (in Setup()).
+	const int64_t expiry = ppcenter_publish_token_expiry_unix(p2pToken);
+	const int64_t now = static_cast<int64_t>(::time(nullptr));
+	if (expiry != 0 && expiry - now > P2P_TOKEN_REFRESH_MARGIN_SECONDS)
+		return p2pToken;
+
+	const int64_t now_ms = static_cast<int64_t>(obs_get_video_frame_time() / 1000000);
+	if (now_ms - lastP2PTokenRefreshMs < P2P_TOKEN_REFRESH_MIN_INTERVAL_MS)
+		return p2pToken;
+	lastP2PTokenRefreshMs = now_ms;
+
+	// Re-running /v1/publish/requests is safe mid-stream: it only validates
+	// credentials and signs new WHIP/signal credentials - it opens no session
+	// and touches no billing (see ppcenter/internal/apis/publish_v1.go).
+	PPCenterPublishRequest request;
+	request.url = natProbeUrl;
+	request.app_id = natProbeAppId;
+	request.app_secret = natProbeAppSecret;
+	request.stream_name = natProbeStreamName;
+	request.device_id = natProbeClientId;
+	request.nat_probe_id = natProbeId;
+	PPCenterPublishResponse response;
+	std::string error;
+	if (!ppcenter_resolve_publish(request, response, error) || response.signal_token.empty()) {
+		do_log(LOG_WARNING,
+		       "P2P signal token refresh failed: %s (keeping the current token; will retry on the next reconnect)",
+		       error.empty() ? "response carried no signal token" : error.c_str());
+		return p2pToken;
+	}
+	p2pToken = response.signal_token;
+	do_log(LOG_INFO, "P2P signal token refreshed (previous expired at unix %lld)",
+	       static_cast<long long>(expiry));
+	return p2pToken;
 }
 
 void register_whip_output()

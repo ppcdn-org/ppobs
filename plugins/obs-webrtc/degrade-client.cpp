@@ -338,12 +338,21 @@ void WsDegradeClient::RegisterOutput(obs_output_t *out, const std::string &h264_
 	std::lock_guard<std::mutex> lk(mtx);
 	output = out;
 
-	// Cache each codec's full layer count once; a degrade-triggered restart
-	// re-registers with the same encoders, and re-counting after a trim
-	// would make the ceiling shrink.
+	// Track each codec's layer ceiling as the largest ladder ever seen, not
+	// the first one. This client is a singleton shared by more than one
+	// output: the P2P companion output ("ppcenter_p2p", H264-only, a single
+	// layer) registers before the real multi-layer WHIP output, so latching
+	// the first count pinned H264's ceiling at 1 - the server's TARGET_STATE
+	// layers=3 was then clamped down to 1 and WHIPOutput::Setup() trimmed the
+	// ladder to its lowest layer, silently publishing only 360p. Taking the
+	// max keeps an already-degraded or single-layer output from lowering the
+	// ceiling while letting a later, fuller output raise it; a
+	// degrade-triggered restart re-registers the same encoders, so the max
+	// never shrinks on its own.
 	for (auto &ch : channels) {
-		if (ch->max_layers == 0)
-			ch->max_layers = (int)codecEncoders(ch->codec).size();
+		const int counted = (int)codecEncoders(ch->codec).size();
+		if (counted > ch->max_layers)
+			ch->max_layers = counted;
 	}
 
 	if (Channel *h264 = FindChannel("h264"))
