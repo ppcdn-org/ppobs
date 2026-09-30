@@ -124,7 +124,8 @@ static uint32_t advanceRtpTimestamp(const std::shared_ptr<rtc::RtpPacketizationC
 // prefixes) in this SRT/rtmp_custom-companion scenario, the packetizer
 // mis-parses and the browser can never assemble a frame. This dumps the first
 // few video AUs' structure so we can see the actual format + NAL types +
-// whether SPS/PPS ride with the keyframe. Remove once P2P decode is fixed.
+// whether SPS/PPS ride with the keyframe. Logged at Debug only (off at the
+// default log level). Remove once P2P decode is fixed.
 static void logP2PVideoNALDiag(const struct encoder_packet *packet)
 {
 	static int logged = 0;
@@ -182,7 +183,7 @@ static void logP2PVideoNALDiag(const struct encoder_packet *packet)
 		}
 	}
 	// NAL types: 7=SPS 8=PPS 5=IDR 1=nonIDR 6=SEI 9=AUD
-	blog(LOG_INFO, "[obs-webrtc] [p2p-naldiag] #%d key=%d size=%zu fmt=%s head=[%s] nalTypes=[%s]", logged,
+	blog(LOG_DEBUG, "[obs-webrtc] [p2p-naldiag] #%d key=%d size=%zu fmt=%s head=[%s] nalTypes=[%s]", logged,
 	     packet->keyframe ? 1 : 0, n, fmt, head, nals);
 }
 
@@ -244,8 +245,9 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 		// resolutions' NAL units into one SSRC/sequence-number stream,
 		// which no decoder can make sense of.
 		if (p2pSignal) {
-			// TEMPORARY P2P feed diagnostics (2026-09-30) - remove once the
-			// feed regression is understood.
+			// TEMPORARY P2P feed diagnostics (2026-09-30) - logged at Debug
+			// only, so a normal run's log stays readable; remove once the feed
+			// regression is understood.
 			p2pFeedCounters.videoPackets++;
 			if (packet->encoder == p2pVideoEncoder)
 				p2pFeedCounters.encoderMatched++;
@@ -281,7 +283,7 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 					} catch (const std::exception &e) {
 						p2pFeedCounters.sendErrors++;
 						if (p2pFeedCounters.sendErrors <= 5)
-							blog(LOG_WARNING, "[obs-webrtc] [p2p-feed] videoTrack->send() threw: %s",
+							blog(LOG_DEBUG, "[obs-webrtc] [p2p-feed] videoTrack->send() threw: %s",
 							     e.what());
 					} catch (...) {
 						p2pFeedCounters.sendErrors++;
@@ -298,7 +300,7 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 			if (now_ms - lastP2PFeedLogMs >= 2000) {
 				lastP2PFeedLogMs = now_ms;
 				size_t peers = p2pSignal->PeerCount();
-				blog(LOG_INFO,
+				blog(LOG_DEBUG,
 				     "[obs-webrtc] [p2p-feed] 2s: videoPkts=%llu encMatch=%llu peers=%zu sent=%llu skipNoTrack=%llu skipNoKey=%llu sendErr=%llu p2pEnc=%p pktEnc=%p key=%d lastTs=%u lastSeq=%u lastDts=%lld",
 				     (unsigned long long)p2pFeedCounters.videoPackets,
 				     (unsigned long long)p2pFeedCounters.encoderMatched, peers,
@@ -1033,7 +1035,7 @@ bool WHIPOutput::StartP2PSignal()
 	const char *audioCodec = "opus";
 	p2pSignal = std::make_unique<P2PSignalClient>(p2pSignalUrl, p2pToken, p2pStreamPath, videoCodec, audioCodec,
 						      generate_random_u32(), p2pStunServers, p2pMaxSessions,
-						      [this]() { return AcquireP2PToken(); });
+						      [this](bool force) { return AcquireP2PToken(force); });
 	p2pSignal->Start();
 	qosPolicy = std::make_unique<UplinkQosPolicy>(UplinkQosConfig{});
 	return true;
@@ -1141,7 +1143,7 @@ constexpr int64_t P2P_TOKEN_REFRESH_MARGIN_SECONDS = 600;
 // request storm.
 constexpr int64_t P2P_TOKEN_REFRESH_MIN_INTERVAL_MS = 60 * 1000;
 
-std::string WHIPOutput::AcquireP2PToken()
+std::string WHIPOutput::AcquireP2PToken(bool force)
 {
 	std::lock_guard<std::mutex> lock(p2pTokenMutex);
 	if (p2pToken.empty() || natProbeUrl.empty())
@@ -1165,13 +1167,20 @@ std::string WHIPOutput::AcquireP2PToken()
 		return p2pToken;
 
 	const int64_t now_ms = static_cast<int64_t>(obs_get_video_frame_time() / 1000000);
-	if (now_ms - lastP2PTokenRefreshMs < P2P_TOKEN_REFRESH_MIN_INTERVAL_MS)
+	// Unforced refreshes stay throttled so a healthy stream rarely calls
+	// ppcenter. A forced refresh (force=true: the signaling client's previous
+	// connect attempt already failed) bypasses the floor, so a token that went
+	// stale while ppcenter was restarting is replaced on the next 5s reconnect
+	// rather than up to P2P_TOKEN_REFRESH_MIN_INTERVAL_MS later.
+	if (!force && now_ms - lastP2PTokenRefreshMs < P2P_TOKEN_REFRESH_MIN_INTERVAL_MS)
 		return p2pToken;
 	lastP2PTokenRefreshMs = now_ms;
 
-	// Re-running /v1/publish/requests is safe mid-stream: it only validates
-	// credentials and signs new WHIP/signal credentials - it opens no session
-	// and touches no billing (see ppcenter/internal/apis/publish_v1.go).
+	// The dedicated /v1/publish/p2p-token endpoint is origin-independent: it
+	// only validates credentials and signs a new signal token - it opens no
+	// session and touches no billing (see ppcenter/internal/apis/publish_v1.go).
+	// Using it (rather than the full /v1/publish/requests, which also selects an
+	// Origin) is what lets this refresh succeed during an Origin restart/blip.
 	PPCenterPublishRequest request;
 	request.url = natProbeUrl;
 	request.app_id = natProbeAppId;
@@ -1181,7 +1190,7 @@ std::string WHIPOutput::AcquireP2PToken()
 	request.nat_probe_id = natProbeId;
 	PPCenterPublishResponse response;
 	std::string error;
-	if (!ppcenter_resolve_publish(request, response, error) || response.signal_token.empty()) {
+	if (!ppcenter_refresh_p2p_token(request, response, error) || response.signal_token.empty()) {
 		do_log(LOG_WARNING,
 		       "P2P signal token refresh failed: %s (keeping the current token; will retry on the next reconnect)",
 		       error.empty() ? "response carried no signal token" : error.c_str());

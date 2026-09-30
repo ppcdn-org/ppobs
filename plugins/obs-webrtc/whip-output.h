@@ -82,7 +82,10 @@ private:
 	// Returns a currently-valid publisher signal token, minting a replacement
 	// from ppcenter when the cached one is close to expiring. Called by
 	// P2PSignalClient before each connection attempt - see its own comment.
-	std::string AcquireP2PToken();
+	// force=true (a previous signaling connect attempt already failed) lets a
+	// stale token be refreshed on the very next 5s reconnect instead of
+	// waiting out P2P_TOKEN_REFRESH_MIN_INTERVAL_MS.
+	std::string AcquireP2PToken(bool force);
 
 	obs_output_t *output;
 
@@ -111,9 +114,10 @@ private:
 	std::unique_ptr<P2PSignalClient> p2pSignal;
 	// p2pToken is read by the signaling thread (AcquireP2PToken, via the token
 	// provider) and written by both Setup() and AcquireP2PToken(); guard it
-	// with p2pTokenMutex. lastP2PTokenRefreshMs throttles refresh attempts so a
-	// persistently failing /v1/publish/requests cannot turn the signaling
-	// reconnect loop into a request storm.
+	// with p2pTokenMutex. lastP2PTokenRefreshMs throttles unforced refresh
+	// attempts so a persistently failing /v1/publish/p2p-token cannot turn the
+	// signaling reconnect loop into a request storm (a forced refresh, after a
+	// signaling connect failure, intentionally bypasses it).
 	std::mutex p2pTokenMutex;
 	std::string p2pToken;
 	int64_t lastP2PTokenRefreshMs = 0;
@@ -137,8 +141,9 @@ private:
 	// peers. Rolled up once every 2s while P2P is enabled, so a repro shows
 	// whether p2pVideoEncoder still matches, whether the feed is stuck
 	// waiting for a keyframe, or whether send() is throwing (the catch that
-	// used to swallow it now counts + logs the first few). Remove once the
-	// feed regression is understood.
+	// used to swallow it now counts + logs the first few). Logged at Debug
+	// only, so it is off at the default log level. Remove once the feed
+	// regression is understood.
 	struct P2PFeedCounters {
 		uint64_t videoPackets = 0;   // every OBS video packet seen by Data()
 		uint64_t encoderMatched = 0; // packet->encoder == p2pVideoEncoder

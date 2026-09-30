@@ -65,6 +65,17 @@ bool base64url_decode(const std::string &input, std::string &output)
 	}
 	return true;
 }
+
+// p2p_token_url derives the token-only endpoint from the configured publish
+// URL by replacing its final path segment ("requests" -> "p2p-token"), so the
+// two always share one configured base URL / host.
+std::string p2p_token_url(const std::string &publish_url)
+{
+	const size_t slash = publish_url.find_last_of('/');
+	if (slash == std::string::npos)
+		return publish_url + "/p2p-token";
+	return publish_url.substr(0, slash + 1) + "p2p-token";
+}
 }
 
 int64_t ppcenter_publish_token_expiry_unix(const std::string &token)
@@ -200,6 +211,92 @@ bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPub
 	if (h264Track == response.whip_tracks.end() || h264Track->second.url.empty() ||
 	    h264Track->second.bearer_token.empty()) {
 		error = "ppcenter response is missing the h264 WHIP track";
+		return false;
+	}
+	return true;
+}
+
+bool ppcenter_refresh_p2p_token(const PPCenterPublishRequest &request, PPCenterPublishResponse &response,
+				std::string &error)
+{
+	if (request.url.empty() || request.app_id.empty() || request.app_secret.empty() || request.stream_name.empty()) {
+		error = "ppcenter URL, app ID, app secret and stream name are required";
+		return false;
+	}
+
+	const std::string json_body = ppcenter_build_publish_json(request);
+
+	CURL *curl = curl_easy_init();
+	if (!curl) {
+		error = "failed to initialize HTTP client";
+		return false;
+	}
+	struct curl_slist *headers = nullptr;
+	headers = curl_slist_append(headers, "Content-Type: application/json");
+	const std::string user_agent_header = generate_user_agent();
+	headers = curl_slist_append(headers, user_agent_header.c_str());
+	ResponseBuffer buffer;
+	char curl_error[CURL_ERROR_SIZE] = {};
+	const std::string url = p2p_token_url(request.url);
+	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(json_body.size()));
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_response);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, PPCENTER_TIMEOUT_SECONDS);
+	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_error);
+
+	const CURLcode result = curl_easy_perform(curl);
+	long status = 0;
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+
+	if (result != CURLE_OK) {
+		error = buffer.exceeded ? "ppcenter response is too large" :
+			(curl_error[0] ? curl_error : curl_easy_strerror(result));
+		return false;
+	}
+	if (status != 200) {
+		error = "ppcenter rejected the P2P token request (HTTP " + std::to_string(status) + ")";
+		return false;
+	}
+
+	nlohmann::json decoded;
+	try {
+		decoded = nlohmann::json::parse(buffer.data);
+	} catch (const std::exception &) {
+		error = "ppcenter returned invalid JSON";
+		return false;
+	}
+
+	response.signal_token.clear();
+	response.signal_url.clear();
+	if (decoded.contains("signal") && decoded["signal"].is_object()) {
+		const auto &signal = decoded["signal"];
+		response.signal_token = signal.value("token", "");
+		response.signal_url = signal.value("signalUrl", "");
+	}
+	response.stun_servers.clear();
+	if (decoded.contains("stunServers") && decoded["stunServers"].is_array()) {
+		for (const auto &server : decoded["stunServers"]) {
+			if (server.is_string()) {
+				auto url_value = server.get<std::string>();
+				if (url_value.compare(0, 5, "stun:") == 0 || url_value.compare(0, 6, "stuns:") == 0)
+					response.stun_servers.push_back(std::move(url_value));
+			}
+		}
+	}
+	response.max_sessions = 3;
+	if (decoded.contains("maxP2PSessions") && decoded["maxP2PSessions"].is_number_integer()) {
+		const int n = decoded["maxP2PSessions"].get<int>();
+		if (n > 0)
+			response.max_sessions = n;
+	}
+	if (response.signal_token.empty()) {
+		error = "ppcenter returned no P2P signal token";
 		return false;
 	}
 	return true;

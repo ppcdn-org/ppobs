@@ -95,7 +95,7 @@ std::optional<OfferedCodec> FindOfferedCodec(const rtc::Description &offer, cons
 
 class P2PSignalImpl {
 public:
-	P2PSignalImpl(const std::string &url, const std::string &token, std::function<std::string()> tokenProvider)
+	P2PSignalImpl(const std::string &url, const std::string &token, std::function<std::string(bool)> tokenProvider)
 		: signalUrl(url), signalToken(token), tokenProvider(std::move(tokenProvider))
 	{
 		validEndpoint = ParseWebSocketSignalURL(signalUrl).valid;
@@ -149,13 +149,20 @@ public:
 private:
 	void run()
 	{
+		// force=true from the first retry/reconnect onward, so a publisher
+		// token that went stale (e.g. ppcenter restarted while it was near
+		// expiry) is refreshed on the next 5s reconnect rather than waiting out
+		// the provider's own 60s floor - see WHIPOutput::AcquireP2PToken(force).
+		bool force = false;
 		while (running) {
-			if (!connectWS()) {
+			if (!connectWS(force)) {
+				force = true;
 				blog(LOG_WARNING, "[ppobs P2P] signal connect failed; retrying in 5s");
 				if (!running) return;
 				waitFor(std::chrono::seconds(5));
 				continue;
 			}
+			force = true;
 			blog(LOG_INFO, "[ppobs P2P] signaling connected");
 			{
 				std::unique_lock<std::mutex> lock(wsMutex);
@@ -186,9 +193,9 @@ private:
 		wsCv.wait_for(lock, delay, [this] { return !running.load(); });
 	}
 
-	bool connectWS()
+	bool connectWS(bool force)
 	{
-		auto sock = std::make_shared<rtc::WebSocket>(makeWebSocketConfig());
+		auto sock = std::make_shared<rtc::WebSocket>(makeWebSocketConfig(force));
 		auto opened = std::make_shared<std::promise<bool>>();
 		auto openedFuture = opened->get_future();
 
@@ -246,7 +253,7 @@ private:
 		return openedFuture.get();
 	}
 
-	rtc::WebSocketConfiguration makeWebSocketConfig() const
+	rtc::WebSocketConfiguration makeWebSocketConfig(bool force) const
 	{
 		rtc::WebSocketConfiguration config;
 		// ppcenter reads the P2P token from the Sec-WebSocket-Protocol header
@@ -256,7 +263,7 @@ private:
 		// - see WHIPOutput::AcquireP2PToken().
 		std::string token = signalToken;
 		if (tokenProvider) {
-			std::string refreshed = tokenProvider();
+			std::string refreshed = tokenProvider(force);
 			if (!refreshed.empty())
 				token = std::move(refreshed);
 		}
@@ -283,8 +290,9 @@ private:
 	std::string signalUrl;
 	std::string signalToken;
 	// Consulted before each connect attempt to obtain a current token; see the
-	// P2PSignalClient constructor comment. Empty means "always use signalToken".
-	std::function<std::string()> tokenProvider;
+	// P2PSignalClient constructor comment. The bool is `force` (a prior attempt
+	// already failed). Empty means "always use signalToken".
+	std::function<std::string(bool)> tokenProvider;
 	bool validEndpoint = false;
 	std::thread thread;
 	std::atomic<bool> running{false};
@@ -299,7 +307,7 @@ private:
 P2PSignalClient::P2PSignalClient(const std::string &url, const std::string &token, const std::string &streamPath,
 				 const std::string &videoCodec, const std::string &audioCodec, uint32_t baseSsrc,
 				 std::vector<std::string> stunServers, int maxPeers,
-				 std::function<std::string()> tokenProvider)
+				 std::function<std::string(bool)> tokenProvider)
 	: impl(std::make_unique<P2PSignalImpl>(url, token, std::move(tokenProvider))),
 	  streamPath(streamPath), videoCodec(videoCodec), audioCodec(audioCodec), baseSsrc(baseSsrc),
 	  stunServers(std::move(stunServers)), maxPeers(maxPeers > 0 ? maxPeers : 3)

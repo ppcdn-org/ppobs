@@ -144,15 +144,16 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 {
 	try {
 
-	// Temporary: route libdatachannel's own (libjuice) internal logging into
-	// the OBS log, so an ICE gathering that yields no candidates at all can
-	// be explained rather than guessed at. Process-global and verbose -
-	// remove alongside the other [diag] logging below once the 2026-09-22
-	// STUN investigation concludes. See docs/test/ppcdn-debug-log.md.
+	// libdatachannel's own (libjuice) internal logging, forwarded to the OBS
+	// log at Debug level only. The Warning threshold keeps the callback from
+	// formatting every ICE trace only to drop it, so this is quiet by default.
+	// It existed to explain an ICE gathering that yielded no candidates; lower
+	// the threshold and/or the probe_log levels below to re-investigate.
+	// Process-global. See docs/test/ppcdn-debug-log.md.
 	static std::once_flag rtcLoggerOnce;
 	std::call_once(rtcLoggerOnce, [] {
-		rtc::InitLogger(rtc::LogLevel::Debug, [](rtc::LogLevel level, std::string message) {
-			probe_log(LOG_INFO, "[diag][rtc:%d] %s", (int)level, message.c_str());
+		rtc::InitLogger(rtc::LogLevel::Warning, [](rtc::LogLevel level, std::string message) {
+			probe_log(LOG_DEBUG, "[diag][rtc:%d] %s", (int)level, message.c_str());
 		});
 	});
 
@@ -186,12 +187,11 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 	const std::string stunHost = DeriveStunHost(ppcenterUrl);
 	if (!stunHost.empty())
 		cfg.iceServers.emplace_back("stun:" + stunHost + ":3478");
-	// Temporary diagnostic logging (LOG_INFO, not LOG_DEBUG, so it's
-	// guaranteed to land in the log file) - remove once the 2026-09-22
-	// STUN-reachability investigation concludes. See
-	// docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
+	// Diagnostic logging, kept at Debug so a normal publish's log stays
+	// readable - raise these to Info to re-investigate the 2026-09-22
+	// STUN-reachability issue. See docs/test/ppcdn-debug-log.md's entry.
 	for (const auto &s : cfg.iceServers)
-		probe_log(LOG_INFO, "[diag] configured ICE server: %s", s.hostname.c_str());
+		probe_log(LOG_DEBUG, "[diag] configured ICE server: %s", s.hostname.c_str());
 
 	auto pc = std::make_shared<rtc::PeerConnection>(cfg);
 	// A PeerConnection with no track/channel has nothing to negotiate,
@@ -203,31 +203,31 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 	auto state = std::make_shared<GatheringState>();
 
 	pc->onGatheringStateChange([state](rtc::PeerConnection::GatheringState gatheringState) {
-		probe_log(LOG_INFO, "[diag] gathering state: %d", (int)gatheringState);
+		probe_log(LOG_DEBUG, "[diag] gathering state: %d", (int)gatheringState);
 		if (gatheringState == rtc::PeerConnection::GatheringState::Complete) {
 			std::lock_guard<std::mutex> lock(state->mutex);
 			state->done = true;
 			state->cv.notify_all();
 		}
 	});
-	pc->onStateChange([](rtc::PeerConnection::State s) { probe_log(LOG_INFO, "[diag] pc state: %d", (int)s); });
+	pc->onStateChange([](rtc::PeerConnection::State s) { probe_log(LOG_DEBUG, "[diag] pc state: %d", (int)s); });
 
 	pc->onLocalCandidate([state](const rtc::Candidate &candidate) {
 		// Temporary diagnostic logging - see this function's iceServers
 		// comment; remove alongside it once the investigation concludes.
-		probe_log(LOG_INFO, "[diag] raw candidate: %s", candidate.candidate().c_str());
+		probe_log(LOG_DEBUG, "[diag] raw candidate: %s", candidate.candidate().c_str());
 		rtc::Candidate resolved = candidate;
 		if (!resolved.resolve(rtc::Candidate::ResolveMode::Simple)) {
-			probe_log(LOG_INFO, "[diag] candidate failed to resolve");
+			probe_log(LOG_DEBUG, "[diag] candidate failed to resolve");
 			return;
 		}
 		auto address = resolved.address();
 		auto port = resolved.port();
 		if (!address || !port) {
-			probe_log(LOG_INFO, "[diag] resolved candidate has no address/port");
+			probe_log(LOG_DEBUG, "[diag] resolved candidate has no address/port");
 			return;
 		}
-		probe_log(LOG_INFO, "[diag] resolved candidate: address=%s port=%u type=%d", address->c_str(), *port,
+		probe_log(LOG_DEBUG, "[diag] resolved candidate: address=%s port=%u type=%d", address->c_str(), *port,
 			  (int)resolved.type());
 		const bool isSrflx = resolved.type() == rtc::Candidate::Type::ServerReflexive;
 		const bool isHost = resolved.type() == rtc::Candidate::Type::Host;
@@ -273,7 +273,7 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 		const bool predicateMet = state->cv.wait_for(
 			lock, std::chrono::milliseconds(ICE_GATHER_TIMEOUT_MS),
 			[&] { return state->done || (state->best.found && state->best.isSrflx && state->best.isIPv4); });
-		probe_log(LOG_INFO,
+		probe_log(LOG_DEBUG,
 			  "[diag] wait finished: predicateMet=%d done=%d best.found=%d best.isSrflx=%d best.isIPv4=%d",
 			  (int)predicateMet, (int)state->done, (int)state->best.found, (int)state->best.isSrflx,
 			  (int)state->best.isIPv4);

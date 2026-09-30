@@ -42,6 +42,18 @@ std::string ppcenter_build_publish_json(const PPCenterPublishRequest &request);
 bool ppcenter_resolve_publish(const PPCenterPublishRequest &request, PPCenterPublishResponse &response,
 			      std::string &error);
 
+// ppcenter_refresh_p2p_token mints a fresh P2P publisher signal token through
+// /v1/publish/p2p-token, a dedicated endpoint that does NOT select an Origin.
+// ppcenter_resolve_publish runs the full publish flow (Origin selection + WHIP
+// credentials), so during an Origin restart/blip it fails closed with 503 and
+// the token refresh is blocked; this path depends only on the P2P coordinator,
+// so a mid-stream token refresh survives an Origin outage. Takes the same
+// request body as ppcenter_resolve_publish and fills only the
+// signal_token/signal_url/stun_servers/max_sessions fields - it never returns
+// WHIP tracks.
+bool ppcenter_refresh_p2p_token(const PPCenterPublishRequest &request, PPCenterPublishResponse &response,
+				std::string &error);
+
 // ppcenter_publish_token_expiry_unix decodes the `exp` (unix seconds) claim of
 // a ppcenter publisher signal token without verifying it. The token is
 // "<base64url(JSON claims)>.<base64url(HMAC)>" (see
