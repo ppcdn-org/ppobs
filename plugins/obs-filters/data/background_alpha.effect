@@ -1,0 +1,137 @@
+/*
+ * Applies a portrait segmentation mask as the alpha channel.
+ *
+ * The mask arrives at model resolution (much smaller than the video), so it is
+ * sampled with linear filtering and stretched over the frame.  That upscale is
+ * what makes the edge look continuous rather than blocky; the matte itself is
+ * softened on the CPU side before upload (see background-mask.c).
+ *
+ * Output is straight (non-premultiplied) alpha: OBS composites the filtered
+ * source over whatever sits below it in the scene, which is where the
+ * replacement background lives in the P0 design.
+ */
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d mask_tex;
+
+/* Scales mask UVs when the video is not the mask's aspect ratio, so the matte
+ * lands on the same part of the subject regardless of camera resolution. */
+uniform float2 mask_scale = {1.0, 1.0};
+uniform float2 mask_offset = {0.0, 0.0};
+
+/* Blends between the untouched frame (0) and the matted result (1).  Lets the
+ * filter fade out instead of popping when segmentation stops being available. */
+uniform float mask_strength = 1.0;
+
+/* Debug view: shows the matte as greyscale so the operator can tune threshold
+ * and feather without guessing from the composite. */
+uniform float show_mask = 0.0;
+
+/* Measured colour of the wall the subject was shot against, 0-1 RGB.  The
+ * footage is not a green screen: it is a near-white, slightly blue-tinted grey
+ * that varies across the frame, so the colour is measured per frame on the CPU
+ * (background_mask_estimate_colour) rather than assumed to be white. */
+uniform float3 background_colour = {1.0, 1.0, 1.0};
+
+/* How far edge pixels are pulled toward their unmixed colour, and the floor on
+ * the alpha used as the divisor.  Solving for the subject colour divides by
+ * alpha, which amplifies matte error as alpha approaches zero; without both of
+ * these the correction overshoots a pale fringe into a dark one. */
+uniform float despill_strength = 0.0;
+uniform float despill_floor = 0.5;
+
+/* Colour distance at which a pixel stops being treated as wall, and the width
+ * of the ramp above it.  The matte is produced a frame or two behind the live
+ * video, so during a fast arm swing it still marks as subject a region the arm
+ * has already left.  Those pixels are wall, and compositing them leaves a pale
+ * ghost trailing the arm.  Keying on how close the pixel is to the measured
+ * wall colour removes the ghost without waiting for the matte to catch up. */
+uniform float reject_tolerance = 0.0;
+uniform float reject_softness = 0.063;
+
+sampler_state textureSampler {
+	Filter = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+VertData VSDefault(VertData vert_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv = vert_in.uv;
+	return vert_out;
+}
+
+float sample_mask(float2 uv)
+{
+	float2 mask_uv = uv * mask_scale + mask_offset;
+	return mask_tex.Sample(textureSampler, saturate(mask_uv)).r;
+}
+
+/* Recovers the subject's own colour from an edge pixel.
+ *
+ * A pixel on the silhouette is a blend of subject and wall:
+ *     observed = a*F + (1-a)*B
+ * Compositing `observed` over a replacement background carries that wall
+ * colour with it, which is the pale outline seen around the arms.  Solving for
+ * F removes it.  Opaque pixels contain no wall colour and are left alone. */
+float3 unmix_background(float3 observed, float coverage)
+{
+	if (despill_strength <= 0.0 || coverage >= 0.98)
+		return observed;
+
+	float divisor = max(coverage, despill_floor);
+	float3 solved = (observed - (1.0 - divisor) * background_colour) / divisor;
+
+	return lerp(observed, saturate(solved), despill_strength);
+}
+
+/* Fades out coverage for pixels that match the wall colour, which is how a
+ * stale matte's ghost is removed.  The subject is far from the near-white wall
+ * in every frame measured, so the ramp only bites on actual background. */
+float reject_background(float coverage, float3 observed)
+{
+	if (reject_tolerance <= 0.0)
+		return coverage;
+
+	float distance = max(max(abs(observed.r - background_colour.r), abs(observed.g - background_colour.g)),
+			     abs(observed.b - background_colour.b));
+
+	return coverage * saturate((distance - reject_tolerance) / reject_softness);
+}
+
+float4 PSMaskRGBA(VertData vert_in) : TARGET
+{
+	float4 rgba = image.Sample(textureSampler, vert_in.uv);
+	float coverage = sample_mask(vert_in.uv);
+
+	coverage = reject_background(coverage, rgba.rgb);
+
+	/* At strength 0 the source passes through untouched, which keeps the
+	 * filter honest when the model has not produced a matte yet. */
+	float alpha = lerp(1.0, coverage, mask_strength);
+
+	/* Unmix before the alpha is applied: the correction is defined against
+	 * the observed pixel, not against an already-faded one. */
+	float3 foreground = unmix_background(rgba.rgb, coverage);
+
+	float4 matted = float4(foreground, rgba.a * alpha);
+	float4 debug = float4(coverage, coverage, coverage, 1.0);
+	return lerp(matted, debug, show_mask);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader = PSMaskRGBA(vert_in);
+	}
+}

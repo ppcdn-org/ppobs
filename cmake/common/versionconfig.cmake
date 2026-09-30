@@ -21,7 +21,14 @@ if(NOT DEFINED OBS_VERSION_OVERRIDE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git
   endif()
 
   if(_obs_version_result EQUAL 0)
-    string(REGEX REPLACE ".*([0-9]+)\\.([0-9]+)\\.([0-9]+).*" "\\1;\\2;\\3" _obs_version_canonical ${_obs_version})
+    # The leading "[^0-9]*" skips a "v" prefix if the tag has one, without
+    # consuming any digits.  A plain ".*" does not work here: being greedy it
+    # eats the leading digits of a multi-digit major, so "32.1.2" resolves to
+    # "2.1.2" and OBS_VERSION_MAJOR becomes 2.  Position anchoring alone is not
+    # enough either, since it would leave the "v" outside the replaced span and
+    # prepend it to the result.
+    string(REGEX REPLACE "[^0-9]*([0-9]+)\\.([0-9]+)\\.([0-9]+).*" "\\1;\\2;\\3" _obs_version_canonical
+			  ${_obs_version})
   endif()
 elseif(DEFINED OBS_VERSION_OVERRIDE)
   if(OBS_VERSION_OVERRIDE MATCHES "([0-9]+)\\.([0-9]+)\\.([0-9]+).*")
