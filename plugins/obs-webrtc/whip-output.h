@@ -131,6 +131,31 @@ private:
 	// all rather than an undecodable mix of layers.
 	obs_encoder_t *p2pVideoEncoder = nullptr;
 
+	// TEMPORARY P2P feed diagnostics (2026-09-30): the P2P leg reaches
+	// ICE+DTLS+SRTP connected on both ends but the browser decodes no frame,
+	// and nothing in the log says whether Data() is actually feeding the
+	// peers. Rolled up once every 2s while P2P is enabled, so a repro shows
+	// whether p2pVideoEncoder still matches, whether the feed is stuck
+	// waiting for a keyframe, or whether send() is throwing (the catch that
+	// used to swallow it now counts + logs the first few). Remove once the
+	// feed regression is understood.
+	struct P2PFeedCounters {
+		uint64_t videoPackets = 0;   // every OBS video packet seen by Data()
+		uint64_t encoderMatched = 0; // packet->encoder == p2pVideoEncoder
+		uint64_t sent = 0;           // videoTrack->send() calls that returned
+		uint64_t skippedNoTrack = 0; // peer.videoTrack null or !isOpen()
+		uint64_t skippedNoKey = 0;   // !videoStarted && !packet->keyframe
+		uint64_t sendErrors = 0;     // videoTrack->send() threw
+		// Last RTP state actually pushed for a sent frame - reveals a stuck
+		// timestamp (one never-ending AU the browser can't decode) or a
+		// sequence-number jump.
+		uint32_t lastRtpTimestamp = 0;
+		uint16_t lastSequenceNumber = 0;
+		int64_t lastDtsUsec = 0;
+	};
+	P2PFeedCounters p2pFeedCounters;
+	int64_t lastP2PFeedLogMs = 0;
+
 	// The resolved per-codec WHIP endpoints Setup() got from ppcenter,
 	// reused by StartThread() to derive each codec's degrade control
 	// channel ws:// URL. Both are needed when HEVC/H264 multitrack is on

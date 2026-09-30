@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 #include <ctime>
+#include <exception>
 
 #ifdef WHIP_DEGRADE_ACTIVE
 #include "degrade-client.h"
@@ -242,31 +243,75 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 		// may feed it. Forwarding every layer here interleaved three
 		// resolutions' NAL units into one SSRC/sequence-number stream,
 		// which no decoder can make sense of.
-		if (p2pSignal && packet->encoder == p2pVideoEncoder) {
-			logP2PVideoNALDiag(packet); // TEMPORARY (2026-09-25) - remove once P2P decode is fixed
-			p2pSignal->ForEachPeer([&](P2PPeer &peer) {
-				if (!peer.videoTrack || !peer.videoTrack->isOpen())
-					return;
-				// Start this peer's feed on a keyframe - see P2PPeer::videoStarted.
-				if (!peer.videoStarted && !packet->keyframe)
-					return;
-				int64_t dur = peer.videoStarted ? packet->dts_usec - peer.lastVideoTimestamp : 0;
-				peer.lastVideoTimestamp = packet->dts_usec;
-				peer.videoStarted = true;
-				std::vector<rtc::byte> sample{(rtc::byte *)packet->data,
-							      (rtc::byte *)packet->data + packet->size};
-				auto rtp = peer.videoSrReporter->rtpConfig;
-				rtp->sequenceNumber = peer.videoSequenceNumber;
-				rtp->ssrc = peer.videoSsrc;
-				rtp->rid = "0";
-				rtp->timestamp = advanceRtpTimestamp(rtp, peer.videoRtpTimestamp, dur);
-				try {
-					peer.videoTrack->send(sample);
-				} catch (...) {
-				}
-				peer.videoSequenceNumber = rtp->sequenceNumber;
-				peer.videoRtpTimestamp = rtp->timestamp;
-			});
+		if (p2pSignal) {
+			// TEMPORARY P2P feed diagnostics (2026-09-30) - remove once the
+			// feed regression is understood.
+			p2pFeedCounters.videoPackets++;
+			if (packet->encoder == p2pVideoEncoder)
+				p2pFeedCounters.encoderMatched++;
+
+			if (packet->encoder == p2pVideoEncoder) {
+				logP2PVideoNALDiag(packet); // TEMPORARY (2026-09-25) - remove once P2P decode is fixed
+				p2pSignal->ForEachPeer([&](P2PPeer &peer) {
+					if (!peer.videoTrack || !peer.videoTrack->isOpen()) {
+						p2pFeedCounters.skippedNoTrack++;
+						return;
+					}
+					// Start this peer's feed on a keyframe - see P2PPeer::videoStarted.
+					if (!peer.videoStarted && !packet->keyframe) {
+						p2pFeedCounters.skippedNoKey++;
+						return;
+					}
+					int64_t dur = peer.videoStarted ? packet->dts_usec - peer.lastVideoTimestamp : 0;
+					peer.lastVideoTimestamp = packet->dts_usec;
+					peer.videoStarted = true;
+					std::vector<rtc::byte> sample{(rtc::byte *)packet->data,
+								      (rtc::byte *)packet->data + packet->size};
+					auto rtp = peer.videoSrReporter->rtpConfig;
+					rtp->sequenceNumber = peer.videoSequenceNumber;
+					rtp->ssrc = peer.videoSsrc;
+					rtp->rid = "0";
+					rtp->timestamp = advanceRtpTimestamp(rtp, peer.videoRtpTimestamp, dur);
+					try {
+						peer.videoTrack->send(sample);
+						p2pFeedCounters.sent++;
+						p2pFeedCounters.lastRtpTimestamp = rtp->timestamp;
+						p2pFeedCounters.lastSequenceNumber = rtp->sequenceNumber;
+						p2pFeedCounters.lastDtsUsec = packet->dts_usec;
+					} catch (const std::exception &e) {
+						p2pFeedCounters.sendErrors++;
+						if (p2pFeedCounters.sendErrors <= 5)
+							blog(LOG_WARNING, "[obs-webrtc] [p2p-feed] videoTrack->send() threw: %s",
+							     e.what());
+					} catch (...) {
+						p2pFeedCounters.sendErrors++;
+					}
+					peer.videoSequenceNumber = rtp->sequenceNumber;
+					peer.videoRtpTimestamp = rtp->timestamp;
+				});
+			}
+
+			// 2s rollup - fires while video keeps arriving (a live WHIP stream
+			// always does), so a repro shows the feed state at the moment a
+			// viewer is connected.
+			auto now_ms = (int64_t)(obs_get_video_frame_time() / 1000000);
+			if (now_ms - lastP2PFeedLogMs >= 2000) {
+				lastP2PFeedLogMs = now_ms;
+				size_t peers = p2pSignal->PeerCount();
+				blog(LOG_INFO,
+				     "[obs-webrtc] [p2p-feed] 2s: videoPkts=%llu encMatch=%llu peers=%zu sent=%llu skipNoTrack=%llu skipNoKey=%llu sendErr=%llu p2pEnc=%p pktEnc=%p key=%d lastTs=%u lastSeq=%u lastDts=%lld",
+				     (unsigned long long)p2pFeedCounters.videoPackets,
+				     (unsigned long long)p2pFeedCounters.encoderMatched, peers,
+				     (unsigned long long)p2pFeedCounters.sent,
+				     (unsigned long long)p2pFeedCounters.skippedNoTrack,
+				     (unsigned long long)p2pFeedCounters.skippedNoKey,
+				     (unsigned long long)p2pFeedCounters.sendErrors,
+				     (void *)p2pVideoEncoder, (void *)packet->encoder, packet->keyframe ? 1 : 0,
+				     (unsigned)p2pFeedCounters.lastRtpTimestamp,
+				     (unsigned)p2pFeedCounters.lastSequenceNumber,
+				     (long long)p2pFeedCounters.lastDtsUsec);
+				p2pFeedCounters = P2PFeedCounters{};
+			}
 		}
 	}
 }
