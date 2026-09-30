@@ -82,6 +82,12 @@ private:
 
 	obs_output_t *output;
 
+	// True while ApplyIfNeeded() is stopping the output to restart it with a
+	// new target. WHIPOutput::Stop() runs UnregisterOutput() synchronously
+	// during that stop; the flag tells it to keep the target instead of
+	// clearing it the way a user-initiated stop does. Guarded by mtx.
+	bool restart_to_apply = false;
+
 	std::vector<std::unique_ptr<Channel>> channels;
 
 	mutable std::mutex mtx;

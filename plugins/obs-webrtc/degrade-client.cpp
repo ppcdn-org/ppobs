@@ -366,6 +366,24 @@ void WsDegradeClient::UnregisterOutput()
 	std::lock_guard<std::mutex> lk(mtx);
 	output = nullptr;
 
+	// An executor-driven restart (see ApplyIfNeeded) stops the output only to
+	// start it again with the new target, so its target must survive. Any
+	// other stop - the user hitting Stop, or a permanent failure libobs will
+	// reconnect from - discards the cached target, so the next start
+	// publishes the user's configured ladder again; mmx re-sends its current
+	// target on (re)connect when it has one, so a still-current degrade is
+	// re-applied anyway.
+	if (restart_to_apply) {
+		restart_to_apply = false;
+	} else {
+		for (auto &ch : channels) {
+			ch->target = TargetState{};
+			ch->target_set = false;
+			ch->last_pct = 100;
+			ch->max_layers = 0;
+		}
+	}
+
 	for (auto &ch : channels) {
 		if (ch->conn) {
 			websocketpp::lib::error_code ec;
@@ -480,6 +498,10 @@ void WsDegradeClient::ApplyIfNeeded(Channel &ch, const TargetState &target)
 		}
 
 		out_copy = output;
+		// obs_output_stop() below runs WHIPOutput::Stop() synchronously,
+		// which calls UnregisterOutput(): tell it this is our own restart so
+		// it keeps the target we just set for Setup() to trim to.
+		restart_to_apply = true;
 	}
 
 	// --- Stop first (outside the mutex: Stop() re-enters this class via
@@ -504,6 +526,7 @@ void WsDegradeClient::ApplyIfNeeded(Channel &ch, const TargetState &target)
 		ch.target = prev;
 		ch.target_set = prev_set;
 		ch.last_pct = prev_pct;
+		restart_to_apply = false;
 		return;
 	}
 
