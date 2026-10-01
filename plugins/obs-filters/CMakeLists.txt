@@ -109,5 +109,20 @@ if(ENABLE_TEST_INPUT)
     target_compile_definitions(matting-bench PRIVATE FACE_SWAP_HAS_ORT=1)
     target_link_libraries(matting-bench PRIVATE OBS::libobs OBS::onnxruntime)
     set_target_properties(matting-bench PROPERTIES FOLDER tests)
+
+    # The pinned runtime has to sit next to each executable that loads it, for
+    # the same reason obs-filters copies it next to obs.exe.  Leaving it out
+    # does not fail the build: the loader searches System32 before PATH, and
+    # Windows ships its own older onnxruntime.dll there, so these two would
+    # find an API version they cannot use and skip themselves as "ONNX Runtime
+    # unavailable" - reporting success while exercising nothing.
+    foreach(_ort_test matting-e2e-test matting-bench)
+      add_custom_command(
+        TARGET ${_ort_test}
+        POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:${_ort_test}>"
+        VERBATIM
+      )
+    endforeach()
   endif()
 endif()
