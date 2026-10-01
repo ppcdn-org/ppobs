@@ -25,7 +25,6 @@
 !buildspec.json
 !CMakeLists.txt
 !CMakePresets.json
-!VERSION
 !COC.rst
 !COMMITMENT
 !CONTRIBUTING.md
