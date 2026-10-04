@@ -66,40 +66,52 @@ void PpcenterTimeSync::Stop()
 
 void PpcenterTimeSync::Run()
 {
+	// The next probe burst is due on its own schedule, not "shortly after
+	// whatever connect just succeeded". ppcenter (or a proxy in front of it)
+	// closes the idle /ws/play socket well before RESYNC_INTERVAL_MS, and
+	// treating each such close as a reason to re-probe turned the intended
+	// 45s cadence into a resync every ~10s. A drop may reconnect early, but
+	// it must not move the next probe forward.
+	auto nextProbeAt = std::chrono::steady_clock::now();
 	while (running.load()) {
 		if (!ConnectOnce()) {
 			WaitFor(std::chrono::milliseconds(RECONNECT_DELAY_MS));
 			continue;
 		}
 
-		std::vector<std::pair<int64_t, int64_t>> samples;
-		for (int i = 0; i < PROBE_SAMPLE_COUNT && running.load(); ++i) {
-			{
-				std::lock_guard<std::mutex> lock(mutex);
-				if (!wsConnected)
-					break;
+		if (std::chrono::steady_clock::now() >= nextProbeAt) {
+			std::vector<std::pair<int64_t, int64_t>> samples;
+			for (int i = 0; i < PROBE_SAMPLE_COUNT && running.load(); ++i) {
+				{
+					std::lock_guard<std::mutex> lock(mutex);
+					if (!wsConnected)
+						break;
+				}
+				ProbeOnce(samples);
+				WaitFor(std::chrono::milliseconds(PROBE_SPACING_MS));
 			}
-			ProbeOnce(samples);
-			WaitFor(std::chrono::milliseconds(PROBE_SPACING_MS));
+
+			if (!samples.empty()) {
+				auto best = std::min_element(
+					samples.begin(), samples.end(),
+					[](const std::pair<int64_t, int64_t> &a, const std::pair<int64_t, int64_t> &b) {
+						return a.second < b.second;
+					});
+				ntp_clock_set_ppcenter_offset(best->first);
+				blog(LOG_INFO, "[ppobs TimeSync] offset=%lldms rtt=%lldms (%zu/%d samples)",
+				     (long long)best->first, (long long)best->second, samples.size(),
+				     PROBE_SAMPLE_COUNT);
+			}
+			nextProbeAt = std::chrono::steady_clock::now() +
+				      std::chrono::milliseconds(RESYNC_INTERVAL_MS);
 		}
 
-		if (!samples.empty()) {
-			auto best = std::min_element(
-				samples.begin(), samples.end(),
-				[](const std::pair<int64_t, int64_t> &a, const std::pair<int64_t, int64_t> &b) {
-					return a.second < b.second;
-				});
-			ntp_clock_set_ppcenter_offset(best->first);
-			blog(LOG_INFO, "[ppobs TimeSync] offset=%lldms rtt=%lldms (%zu/%d samples)",
-			     (long long)best->first, (long long)best->second, samples.size(), PROBE_SAMPLE_COUNT);
-		}
-
-		// Hold this offset until the next resync, waking early to reconnect if
-		// the socket dropped.
+		// Hold the current offset until the next scheduled resync, waking
+		// early only to reconnect a dropped socket.
 		{
 			std::unique_lock<std::mutex> lock(mutex);
-			cv.wait_for(lock, std::chrono::milliseconds(RESYNC_INTERVAL_MS),
-				    [this] { return !running.load() || !wsConnected; });
+			cv.wait_until(lock, nextProbeAt,
+				      [this] { return !running.load() || !wsConnected; });
 		}
 		Disconnect();
 	}
