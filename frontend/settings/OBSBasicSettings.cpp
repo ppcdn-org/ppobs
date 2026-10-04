@@ -2634,13 +2634,13 @@ void OBSBasicSettings::LoadAdvancedSettings()
 				   config_get_bool(appConfig, "General", "LossReconnectEnable");
 	int lossReconnectPeriod = config_has_user_value(appConfig, "General", "LossReconnectPeriodSec")
 					  ? (int)config_get_int(appConfig, "General", "LossReconnectPeriodSec")
-					  : 10;
+					  : 30;
 	int lossReconnectWindow = config_has_user_value(appConfig, "General", "LossReconnectWindowSec")
 					  ? (int)config_get_int(appConfig, "General", "LossReconnectWindowSec")
-					  : 60;
+					  : 300;
 	double lossReconnectThreshold = config_has_user_value(appConfig, "General", "LossReconnectThresholdPct")
 						? config_get_double(appConfig, "General", "LossReconnectThresholdPct")
-						: 1.2;
+						: 1.5;
 
 	loading = true;
 

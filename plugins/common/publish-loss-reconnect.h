@@ -52,9 +52,9 @@ static inline void publish_loss_config_load(struct publish_loss_config *cfg)
 {
 	memset(cfg, 0, sizeof(*cfg));
 	cfg->enable = true;
-	cfg->period_sec = 10;
-	cfg->window_sec = 60;
-	cfg->threshold_pct = 1.2;
+	cfg->period_sec = 30;
+	cfg->window_sec = 300;
+	cfg->threshold_pct = 1.5;
 
 	config_t *conf = obs_frontend_get_app_config();
 	if (!conf)
@@ -74,7 +74,7 @@ static inline void publish_loss_config_load(struct publish_loss_config *cfg)
 	if (cfg->window_sec < cfg->period_sec)
 		cfg->window_sec = cfg->period_sec;
 	if (cfg->threshold_pct <= 0.0)
-		cfg->threshold_pct = 1.2;
+		cfg->threshold_pct = 1.5;
 }
 
 static inline void publish_loss_monitor_init(struct publish_loss_monitor *m, const struct publish_loss_config *cfg)
