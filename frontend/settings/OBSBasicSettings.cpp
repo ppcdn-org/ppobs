@@ -582,6 +582,10 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->reconnectMaxRetries,  SCROLL_CHANGED, ADV_CHANGED);
 	HookWidget(ui->whipDisconnectGraceSec,  SCROLL_CHANGED, ADV_CHANGED);
 	HookWidget(ui->whipReconnectBackoffSec, SCROLL_CHANGED, ADV_CHANGED);
+	HookWidget(ui->lossReconnectEnable,   CHECK_CHANGED,  ADV_CHANGED);
+	HookWidget(ui->lossReconnectPeriod,   SCROLL_CHANGED, ADV_CHANGED);
+	HookWidget(ui->lossReconnectWindow,   SCROLL_CHANGED, ADV_CHANGED);
+	HookWidget(ui->lossReconnectThreshold, DSCROLL_CHANGED, ADV_CHANGED);
 	HookWidget(ui->processPriority,      COMBO_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->confirmOnExit,        CHECK_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->bindToIP,             COMBO_CHANGED,  ADV_CHANGED);
@@ -2625,6 +2629,19 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	const char *ipFamily = config_get_string(main->Config(), "Output", "IPFamily");
 	bool confirmOnExit = config_get_bool(App()->GetUserConfig(), "General", "ConfirmOnExit");
 
+	config_t *appConfig = App()->GetAppConfig();
+	bool lossReconnectEnable = !config_has_user_value(appConfig, "General", "LossReconnectEnable") ||
+				   config_get_bool(appConfig, "General", "LossReconnectEnable");
+	int lossReconnectPeriod = config_has_user_value(appConfig, "General", "LossReconnectPeriodSec")
+					  ? (int)config_get_int(appConfig, "General", "LossReconnectPeriodSec")
+					  : 10;
+	int lossReconnectWindow = config_has_user_value(appConfig, "General", "LossReconnectWindowSec")
+					  ? (int)config_get_int(appConfig, "General", "LossReconnectWindowSec")
+					  : 60;
+	double lossReconnectThreshold = config_has_user_value(appConfig, "General", "LossReconnectThresholdPct")
+						? config_get_double(appConfig, "General", "LossReconnectThresholdPct")
+						: 1.2;
+
 	loading = true;
 
 	LoadRendererList();
@@ -2648,6 +2665,11 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	ui->reconnectMaxRetries->setValue(maxRetries);
 	ui->whipDisconnectGraceSec->setValue(whipDisconnectGraceSec);
 	ui->whipReconnectBackoffSec->setValue(whipReconnectBackoffSec);
+
+	ui->lossReconnectEnable->setChecked(lossReconnectEnable);
+	ui->lossReconnectPeriod->setValue(lossReconnectPeriod);
+	ui->lossReconnectWindow->setValue(lossReconnectWindow);
+	ui->lossReconnectThreshold->setValue(lossReconnectThreshold);
 
 	ui->streamDelaySec->setValue(delaySec);
 	ui->streamDelayPreserve->setChecked(preserveDelay);
@@ -3298,6 +3320,17 @@ void OBSBasicSettings::SaveAdvancedSettings()
 	SaveSpinBox(ui->reconnectMaxRetries, "Output", "MaxRetries");
 	SaveSpinBox(ui->whipDisconnectGraceSec, "Output", "WhipDisconnectGraceSec");
 	SaveSpinBox(ui->whipReconnectBackoffSec, "Output", "WhipReconnectBackoffSec");
+
+	config_t *lossAppConfig = App()->GetAppConfig();
+	if (WidgetChanged(ui->lossReconnectEnable))
+		config_set_bool(lossAppConfig, "General", "LossReconnectEnable", ui->lossReconnectEnable->isChecked());
+	if (WidgetChanged(ui->lossReconnectPeriod))
+		config_set_int(lossAppConfig, "General", "LossReconnectPeriodSec", ui->lossReconnectPeriod->value());
+	if (WidgetChanged(ui->lossReconnectWindow))
+		config_set_int(lossAppConfig, "General", "LossReconnectWindowSec", ui->lossReconnectWindow->value());
+	if (WidgetChanged(ui->lossReconnectThreshold))
+		config_set_double(lossAppConfig, "General", "LossReconnectThresholdPct",
+				  ui->lossReconnectThreshold->value());
 	SaveComboData(ui->bindToIP, "Output", "BindIP");
 	SaveComboData(ui->ipFamily, "Output", "IPFamily");
 	SaveCheckBox(ui->autoRemux, "Video", "AutoRemux");

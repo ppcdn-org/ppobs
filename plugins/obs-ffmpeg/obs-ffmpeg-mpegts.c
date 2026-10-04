@@ -283,6 +283,84 @@ int ff_network_init(void)
 	return 1;
 }
 
+static void mpegts_srt_loss_arm(struct ffmpeg_output *stream)
+{
+	struct publish_loss_config cfg;
+	publish_loss_config_load(&cfg);
+	publish_loss_monitor_init(&stream->loss_monitor, &cfg);
+	stream->loss_next_read_ms = 0;
+	stream->loss_prev_sent = 0;
+	stream->loss_prev_snd_loss = 0;
+	stream->loss_prev_retrans = 0;
+	stream->loss_stats_primed = false;
+}
+
+/* Samples the SRT sender's cumulative counters once a second and feeds the
+ * shared window policy. "Unrecoverable" mirrors the receiver-side formula
+ * (lost minus retransmitted): packets the sender saw as lost minus the ones
+ * it managed to resend. Returns true when the window crosses the threshold
+ * and the publisher should be forced to reconnect. */
+static bool mpegts_sample_srt_loss(struct ffmpeg_output *stream)
+{
+	if (!stream->ff_data.config.is_srt || !stream->loss_monitor.enable || !stream->h)
+		return false;
+
+	int64_t now_ms = (int64_t)(os_gettime_ns() / 1000000);
+	if (now_ms < stream->loss_next_read_ms)
+		return false;
+	stream->loss_next_read_ms = now_ms + 1000;
+
+	SRTContext *s = (SRTContext *)stream->h->priv_data;
+	if (!s || s->fd == SRT_INVALID_SOCK)
+		return false;
+
+	SRT_TRACEBSTATS perf = {0};
+	if (srt_bstats(s->fd, &perf, 0) < 0)
+		return false;
+
+	int64_t sent = perf.pktSentTotal;
+	int64_t snd_loss = perf.pktSndLossTotal;
+	int64_t retrans = perf.pktRetransTotal;
+
+	/* First read after a (re)connect, or a counter reset: only prime. */
+	if (!stream->loss_stats_primed || sent < stream->loss_prev_sent || snd_loss < stream->loss_prev_snd_loss ||
+	    retrans < stream->loss_prev_retrans) {
+		stream->loss_stats_primed = true;
+		stream->loss_prev_sent = sent;
+		stream->loss_prev_snd_loss = snd_loss;
+		stream->loss_prev_retrans = retrans;
+		return false;
+	}
+
+	int64_t d_sent = sent - stream->loss_prev_sent;
+	int64_t d_loss = snd_loss - stream->loss_prev_snd_loss;
+	int64_t d_retrans = retrans - stream->loss_prev_retrans;
+	stream->loss_prev_sent = sent;
+	stream->loss_prev_snd_loss = snd_loss;
+	stream->loss_prev_retrans = retrans;
+
+	int64_t unrecoverable = d_loss - d_retrans;
+	if (unrecoverable < 0)
+		unrecoverable = 0;
+	int64_t expected = d_sent - d_retrans;
+	if (expected < 0)
+		expected = 0;
+
+	bool have_sample = false;
+	double sample_pct = 0.0;
+	bool reconnect = publish_loss_monitor_record(&stream->loss_monitor, (uint64_t)unrecoverable,
+						     (uint64_t)expected, now_ms, &have_sample, &sample_pct);
+
+	if (have_sample && sample_pct > PUBLISH_LOSS_LOG_THRESHOLD_PCT)
+		info("SRT loss %.2f%% this interval (unrecovered=%lld retrans=%lld expected=%lld)", sample_pct,
+		     (long long)unrecoverable, (long long)d_retrans, (long long)expected);
+
+	if (reconnect)
+		warn("SRT windowed unrecoverable loss above threshold, forcing reconnect");
+
+	return reconnect;
+}
+
 static inline int connect_mpegts_url(struct ffmpeg_output *stream, bool is_rist)
 {
 	int err = 0;
@@ -356,6 +434,9 @@ static inline int connect_mpegts_url(struct ffmpeg_output *stream, bool is_rist)
 		goto fail;
 	else
 		stream->has_connected = true;
+
+	if (!is_rist)
+		mpegts_srt_loss_arm(stream);
 
 	return 0;
 fail:
@@ -836,6 +917,11 @@ static void *write_thread(void *data)
 			} else {
 				obs_output_signal_stop(stream->output, OBS_OUTPUT_ERROR);
 			}
+			break;
+		}
+
+		if (mpegts_sample_srt_loss(stream)) {
+			obs_output_signal_stop(stream->output, OBS_OUTPUT_DISCONNECTED);
 			break;
 		}
 	}

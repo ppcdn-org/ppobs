@@ -8793,11 +8793,123 @@
                      </property>
                     </spacer>
                    </item>
-                  </layout>
-                 </widget>
-                </item>
-                <item>
-                 <widget class="QGroupBox" name="advNetworkGroupBox">
+                   </layout>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QGroupBox" name="advancedLossReconnectGroupBox">
+                   <property name="title">
+                    <string>Basic.Settings.Output.LossReconnect</string>
+                   </property>
+                   <layout class="QFormLayout" name="formLayout_lossReconnect">
+                    <property name="fieldGrowthPolicy">
+                     <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
+                    </property>
+                    <property name="labelAlignment">
+                     <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                    </property>
+                    <property name="topMargin">
+                     <number>2</number>
+                    </property>
+                    <item row="0" column="1">
+                     <widget class="QCheckBox" name="lossReconnectEnable">
+                      <property name="text">
+                       <string>Basic.Settings.Output.LossReconnect.Enable</string>
+                      </property>
+                      <property name="checked">
+                       <bool>true</bool>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="1" column="0">
+                     <widget class="QLabel" name="labelLossReconnectPeriod">
+                      <property name="text">
+                       <string>Basic.Settings.Output.LossReconnect.Period</string>
+                      </property>
+                      <property name="buddy">
+                       <cstring>lossReconnectPeriod</cstring>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="1" column="1">
+                     <widget class="QSpinBox" name="lossReconnectPeriod">
+                      <property name="suffix">
+                       <string> s</string>
+                      </property>
+                      <property name="minimum">
+                       <number>1</number>
+                      </property>
+                      <property name="maximum">
+                       <number>60</number>
+                      </property>
+                      <property name="value">
+                       <number>10</number>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="2" column="0">
+                     <widget class="QLabel" name="labelLossReconnectWindow">
+                      <property name="text">
+                       <string>Basic.Settings.Output.LossReconnect.Window</string>
+                      </property>
+                      <property name="buddy">
+                       <cstring>lossReconnectWindow</cstring>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="2" column="1">
+                     <widget class="QSpinBox" name="lossReconnectWindow">
+                      <property name="suffix">
+                       <string> s</string>
+                      </property>
+                      <property name="minimum">
+                       <number>1</number>
+                      </property>
+                      <property name="maximum">
+                       <number>600</number>
+                      </property>
+                      <property name="value">
+                       <number>60</number>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="3" column="0">
+                     <widget class="QLabel" name="labelLossReconnectThreshold">
+                      <property name="text">
+                       <string>Basic.Settings.Output.LossReconnect.Threshold</string>
+                      </property>
+                      <property name="buddy">
+                       <cstring>lossReconnectThreshold</cstring>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="3" column="1">
+                     <widget class="QDoubleSpinBox" name="lossReconnectThreshold">
+                      <property name="suffix">
+                       <string> %</string>
+                      </property>
+                      <property name="decimals">
+                       <number>2</number>
+                      </property>
+                      <property name="minimum">
+                       <double>0.100000000000000</double>
+                      </property>
+                      <property name="maximum">
+                       <double>100.000000000000000</double>
+                      </property>
+                      <property name="singleStep">
+                       <double>0.100000000000000</double>
+                      </property>
+                      <property name="value">
+                       <double>1.200000000000000</double>
+                      </property>
+                     </widget>
+                    </item>
+                   </layout>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QGroupBox" name="advNetworkGroupBox">
                   <property name="title">
                    <string>Basic.Settings.Advanced.Network</string>
                   </property>

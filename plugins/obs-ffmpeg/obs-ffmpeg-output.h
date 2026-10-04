@@ -7,6 +7,7 @@
 #include <libswscale/swscale.h>
 #ifdef NEW_MPEGTS_OUTPUT
 #include "obs-ffmpeg-url.h"
+#include "publish-loss-reconnect.h"
 #endif
 
 struct ffmpeg_cfg {
@@ -134,6 +135,16 @@ struct ffmpeg_output {
 	pthread_mutex_t start_stop_mutex;
 	volatile bool start_stop_thread_active;
 	bool has_connected;
+
+	/* SRT publish loss-reconnect: samples srt_bstats every second and feeds
+	 * the shared window policy; see obs-ffmpeg-mpegts.c's
+	 * mpegts_sample_srt_loss(). */
+	struct publish_loss_monitor loss_monitor;
+	int64_t loss_next_read_ms;
+	int64_t loss_prev_sent;
+	int64_t loss_prev_snd_loss;
+	int64_t loss_prev_retrans;
+	bool loss_stats_primed;
 #endif
 };
 

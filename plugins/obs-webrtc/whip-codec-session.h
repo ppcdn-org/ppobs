@@ -18,6 +18,31 @@
 
 #include <rtc/rtc.hpp>
 
+#include "publish-loss-reconnect.h"
+
+// Sender-side RTP loss estimator. The remote (mmx) receiver periodically sends
+// RTCP Receiver Reports; each report block carries the cumulative number of
+// packets lost and the extended highest sequence number for one of our SSRCs.
+// We sum the deltas across a sample interval so the WHIP session can apply the
+// shared loss-reconnect policy. Attached to the video track's MediaHandler
+// chain (incoming RTCP reaches it just like the NACK responder's).
+class RtcpLossTracker : public rtc::MediaHandler {
+public:
+	// Returns the (lost, expected) deltas since the previous call and resets.
+	std::pair<uint64_t, uint64_t> TakeDelta();
+
+	void incoming(rtc::message_vector &messages, const rtc::message_callback &send) override;
+
+private:
+	void ParseReceiverReport(const uint8_t *pkt, size_t len);
+
+	std::mutex mutex;
+	std::map<uint32_t, uint32_t> last_ext_seq;
+	std::map<uint32_t, int64_t> last_cum_lost;
+	uint64_t acc_lost = 0;
+	uint64_t acc_expected = 0;
+};
+
 // One codec's independent WHIP publish session (H264 or HEVC) - see
 // docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md §4.1.
 //
@@ -192,6 +217,8 @@ private:
 	std::shared_ptr<rtc::Track> video_track;
 	std::shared_ptr<rtc::RtcpSrReporter> audio_sr_reporter;
 	std::shared_ptr<rtc::RtcpSrReporter> video_sr_reporter;
+	std::shared_ptr<RtcpLossTracker> video_loss_tracker;
+	struct publish_loss_monitor loss_monitor;
 	std::shared_ptr<rtc::DataChannel> timestamp_channel;
 
 	std::vector<obs_encoder_t *> video_layers; // in rid order

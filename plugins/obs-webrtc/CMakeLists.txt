@@ -23,6 +23,8 @@ target_sources(
   PRIVATE obs-webrtc.cpp nat-probe.cpp nat-probe.h ppcenter-client.cpp ppcenter-client.h ppcenter-signal-message.cpp ppcenter-signal-message.h ppcenter-signal-outgoing.cpp ppcenter-signal-outgoing.h ppcenter-websocket-frame.cpp ppcenter-websocket-frame.h ppcenter-websocket-utils.cpp ppcenter-websocket-utils.h ppcenter-time-sync.cpp ppcenter-time-sync.h ppcenter-time-sync-utils.cpp ppcenter-time-sync-utils.h ppcenter-signal.cpp ppcenter-signal.h device-registration.cpp device-registration.h encoder-report.cpp encoder-report.h uplink-qos-policy.cpp uplink-qos-policy.h whip-output.cpp whip-output.h whip-codec-session.cpp whip-codec-session.h whip-service.cpp whip-service.h whip-utils.h degrade-client.cpp degrade-client.h quality-score.cpp quality-score.h
 )
 
+target_include_directories(obs-webrtc PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+
 target_compile_definitions(
   obs-webrtc
   PRIVATE WHIP_DEGRADE_ACTIVE ASIO_STANDALONE $<$<PLATFORM_ID:Windows>:_WEBSOCKETPP_CPP11_STL_>
@@ -32,6 +34,7 @@ target_compile_definitions(
 target_link_libraries(
   obs-webrtc
   PRIVATE OBS::libobs
+          OBS::frontend-api
           LibDataChannel::LibDataChannel
           CURL::libcurl
           Websocketpp::Websocketpp

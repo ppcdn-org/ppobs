@@ -81,6 +81,75 @@ size_t curl_write_headers(char *data, size_t size, size_t nmemb, void *priv)
 
 } // namespace
 
+static uint32_t rtcp_read_be32(const uint8_t *p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+void RtcpLossTracker::incoming(rtc::message_vector &messages, const rtc::message_callback &)
+{
+	for (const auto &msg : messages) {
+		if (!msg || msg->type != rtc::Message::Binary)
+			continue;
+		const auto *data = reinterpret_cast<const uint8_t *>(msg->data());
+		size_t size = msg->size();
+		size_t offset = 0;
+		while (offset + 4 <= size) {
+			uint8_t version = data[offset] >> 6;
+			uint8_t pt = data[offset + 1];
+			uint16_t len = (uint16_t)((data[offset + 2] << 8) | data[offset + 3]);
+			size_t pkt_len = ((size_t)len + 1) * 4;
+			if (version != 2 || offset + pkt_len > size)
+				break;
+			if (pt == 201) // receiver report
+				ParseReceiverReport(data + offset, pkt_len);
+			offset += pkt_len;
+		}
+	}
+}
+
+void RtcpLossTracker::ParseReceiverReport(const uint8_t *pkt, size_t len)
+{
+	if (len < 8)
+		return;
+
+	uint8_t rc = pkt[0] & 0x1f;
+	size_t off = 8;
+	std::lock_guard<std::mutex> lk(mutex);
+	for (uint8_t i = 0; i < rc && off + 24 <= len; i++, off += 24) {
+		uint32_t ssrc = rtcp_read_be32(pkt + off);
+		uint32_t raw = ((uint32_t)pkt[off + 4] << 16) | ((uint32_t)pkt[off + 5] << 8) | (uint32_t)pkt[off + 6];
+		/* cumulative packets lost is a signed 24-bit field */
+		int64_t cum = (raw & 0x800000u) ? (int64_t)raw - 0x1000000 : (int64_t)raw;
+		uint32_t ext = rtcp_read_be32(pkt + off + 8);
+
+		auto it = last_ext_seq.find(ssrc);
+		if (it != last_ext_seq.end()) {
+			int64_t lost_delta = cum - last_cum_lost[ssrc];
+			if (lost_delta < 0)
+				lost_delta = 0;
+			uint32_t ext_delta = ext - it->second;
+			/* Ignore a jump that looks like a stream restart rather
+			 * than a normal sequence advance. */
+			if (ext_delta < 0x80000000u) {
+				acc_lost += (uint64_t)lost_delta;
+				acc_expected += ext_delta;
+			}
+		}
+		last_ext_seq[ssrc] = ext;
+		last_cum_lost[ssrc] = cum;
+	}
+}
+
+std::pair<uint64_t, uint64_t> RtcpLossTracker::TakeDelta()
+{
+	std::lock_guard<std::mutex> lk(mutex);
+	std::pair<uint64_t, uint64_t> r{acc_lost, acc_expected};
+	acc_lost = 0;
+	acc_expected = 0;
+	return r;
+}
+
 // whip-utils.h's do_log bakes in "output" as the variable name, which this
 // class also has (so the macro itself works unmodified) but its format
 // string has no room for this session's codec label - redefine it here to
@@ -326,6 +395,9 @@ void WHIPCodecSession::ConfigureVideoTrack(const std::string &media_stream_id, c
 	packetizer->addToChain(new_video_sr_reporter);
 	packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>(video_nack_buffer_size));
 
+	auto loss_tracker = std::make_shared<RtcpLossTracker>();
+	packetizer->addToChain(loss_tracker);
+
 	if (cfg.enable_pacing) {
 		int64_t total_bitrate_kbps = 0;
 		for (auto *layer : video_layers) {
@@ -349,6 +421,7 @@ void WHIPCodecSession::ConfigureVideoTrack(const std::string &media_stream_id, c
 	std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 	video_track = new_video_track;
 	video_sr_reporter = new_video_sr_reporter;
+	video_loss_tracker = loss_tracker;
 }
 
 bool WHIPCodecSession::DoConnect(uint64_t generation, std::string &resourceURL)
@@ -640,6 +713,7 @@ void WHIPCodecSession::TeardownGeneration(uint64_t generation, const std::string
 		timestamp_channel = nullptr;
 		audio_sr_reporter = nullptr;
 		video_sr_reporter = nullptr;
+		video_loss_tracker = nullptr;
 	}
 	ClosePeerConnectionWithTimeout(closing);
 	if (wasConnected)
@@ -657,6 +731,12 @@ const char *WHIPCodecSession::RunUntilDisconnect(uint64_t generation)
 	int64_t last_progress_ns = os_gettime_ns();
 	const auto pollInterval =
 		std::chrono::seconds(cfg.watchdog_interval_sec > 0 ? cfg.watchdog_interval_sec : 1);
+
+	// Fresh loss window per generation: a reconnect must not inherit stale
+	// samples from the connection that was just torn down.
+	struct publish_loss_config loss_cfg;
+	publish_loss_config_load(&loss_cfg);
+	publish_loss_monitor_init(&loss_monitor, &loss_cfg);
 
 	for (;;) {
 		PCEvent evt;
@@ -723,6 +803,25 @@ const char *WHIPCodecSession::RunUntilDisconnect(uint64_t generation)
 			       "Watchdog: no bytes sent for %.0fs (threshold %ds) - treating session as dead, tearing down and reconnecting",
 			       stalled_sec, cfg.watchdog_stall_sec);
 			return "watchdog-stall";
+		}
+
+		std::shared_ptr<RtcpLossTracker> tracker;
+		{
+			std::shared_lock<std::shared_mutex> lk(tracks_mutex);
+			tracker = video_loss_tracker;
+		}
+		if (tracker) {
+			auto delta = tracker->TakeDelta();
+			bool have_sample = false;
+			double sample_pct = 0.0;
+			bool reconnect = publish_loss_monitor_record(&loss_monitor, delta.first, delta.second,
+								     now_ns / 1000000, &have_sample, &sample_pct);
+			if (have_sample && sample_pct > PUBLISH_LOSS_LOG_THRESHOLD_PCT)
+				do_log(LOG_INFO, "WHIP RTP loss %.2f%% this interval", sample_pct);
+			if (reconnect) {
+				do_log(LOG_WARNING, "WHIP windowed RTP loss above threshold, forcing reconnect");
+				return "loss-reconnect";
+			}
 		}
 	}
 }

@@ -41,6 +41,8 @@ target_sources(
     obs-ffmpeg.c
 )
 
+target_include_directories(obs-ffmpeg PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+
 target_compile_options(obs-ffmpeg PRIVATE $<$<COMPILE_LANG_AND_ID:C,AppleClang,Clang>:-Wno-shorten-64-to-32>)
 target_compile_definitions(
   obs-ffmpeg
@@ -63,6 +65,7 @@ target_link_libraries(
     FFmpeg::avutil
     FFmpeg::swscale
     FFmpeg::swresample
+    OBS::frontend-api
     $<$<PLATFORM_ID:Windows>:OBS::w32-pthreads>
     $<$<PLATFORM_ID:Windows>:ws2_32>
     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:Libva::va>
