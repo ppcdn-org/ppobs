@@ -69,6 +69,28 @@ bool IsCustomSRTService(obs_service_t *service)
 	return protocol && astrcmpi(protocol, "srt") == 0 && id && strcmp(id, "rtmp_custom") == 0;
 }
 
+// ppobs's "ppcenter_url" setting may be the bare origin
+// ("https://api.pp-cdn.org") or the full publish endpoint; this returns the
+// publish endpoint either way so the SRT node request below POSTs to the right
+// URL. Mirrors the plugin's DerivePpcenterPublishUrl
+// (plugins/obs-webrtc/ppcenter-time-sync-utils.cpp).
+std::string NormalizePpcenterPublishUrl(const std::string &url)
+{
+	const auto schemeEnd = url.find("://");
+	if (schemeEnd == std::string::npos)
+		return "";
+	const std::string scheme = url.substr(0, schemeEnd);
+	if (scheme != "http" && scheme != "https")
+		return "";
+	const size_t hostStart = schemeEnd + 3;
+	const size_t pathStart = url.find('/', hostStart);
+	const std::string host = (pathStart == std::string::npos) ? url.substr(hostStart)
+								  : url.substr(hostStart, pathStart - hostStart);
+	if (host.empty())
+		return "";
+	return scheme + "://" + host + "/v1/publish/requests";
+}
+
 } // namespace
 
 bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
@@ -86,7 +108,7 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 	if (!strstr(rawServer, PPCDN_PUBLISH_ENDPOINT_PLACEHOLDER))
 		return true;
 
-	const std::string ppcenterURL = obs_data_get_string(settings, "ppcenter_url");
+	const std::string ppcenterURL = NormalizePpcenterPublishUrl(obs_data_get_string(settings, "ppcenter_url"));
 	const std::string appID = obs_data_get_string(settings, "ppcenter_appid");
 	const std::string appSecret = obs_data_get_string(settings, "ppcenter_secret");
 	const std::string region = obs_data_get_string(settings, "ppcenter_region");

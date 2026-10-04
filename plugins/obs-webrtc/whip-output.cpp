@@ -3,6 +3,8 @@
 #include "whip-utils.h"
 #include "ppcenter-client.h"
 #include "ppcenter-signal.h"
+#include "ppcenter-time-sync.h"
+#include "ppcenter-time-sync-utils.h"
 #include "nat-probe.h"
 #include "device-registration.h"
 #include "encoder-report.h"
@@ -603,13 +605,25 @@ bool WHIPOutput::Setup(uint64_t generation)
 		return false;
 	}
 	OBSDataAutoRelease service_settings = obs_service_get_settings(service);
-	const std::string ppcenter_url = obs_data_get_string(service_settings, "ppcenter_url");
+	// The setting may be the bare origin ("https://api.pp-cdn.org") or the
+	// full publish endpoint; normalize it once so every consumer below
+	// (publish, device registration, NAT probe, encoder report) keeps working,
+	// and derive the /ws/play clock probe from the same value.
+	const std::string ppcenter_url =
+		DerivePpcenterPublishUrl(obs_data_get_string(service_settings, "ppcenter_url"));
 	if (ppcenter_url.empty()) {
 		do_log(LOG_ERROR, "ppcenter url not configured");
 		if (IsActiveGeneration(generation))
 			obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
 		return false;
 	}
+
+	// Align ppobs's clock to ppcenter (the same TIME_SYNC probe pplayer uses)
+	// so ppobs and pplayer measure delay against one time base. The public-NTP
+	// thread keeps running as a fallback. Shared process-wide per ppcenter
+	// origin, so an SRT publish's P2P companion output reuses the same
+	// /ws/play connection instead of opening a second one.
+	timeSync = AcquirePpcenterTimeSync(ppcenter_url);
 
 	// wantMultitrack only gates whether the HEVC session is additionally
 	// set up and connected below - the publish request itself always asks
@@ -1010,6 +1024,8 @@ void WHIPOutput::StopThread(bool signal, uint64_t generation)
 	running = false;
 	if (p2pSignal)
 		p2pSignal.reset();
+	// Drop our reference; the shared sync stops when the last holder does.
+	timeSync.reset();
 
 	if (h264Session) {
 		h264Session->Stop();

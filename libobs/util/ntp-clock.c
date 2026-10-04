@@ -47,6 +47,11 @@ typedef int ntp_socket_t;
 #define NTP_RESYNC_INTERVAL_MS (30 * 60 * 1000) /* resync every 30 minutes */
 #define NTP_RETRY_INTERVAL_MS (30 * 1000)       /* retry sooner if never synced */
 
+/* A ppcenter TIME_SYNC result older than this is ignored: the obs-webrtc
+ * plugin resyncs every ~45s, so 120s tolerates a couple of missed rounds
+ * before falling back to the public-NTP offset. */
+#define NTP_PPCENTER_STALE_NS (120ULL * 1000000000ULL)
+
 static const char *ntp_servers[] = {
 	"time.cloudflare.com",
 	"time.windows.com",
@@ -57,6 +62,11 @@ struct ntp_anchor {
 	pthread_mutex_t lock;
 	int64_t offset_ms; /* ntp_utc_ms(t) - system_wall_clock_ms(t), from the last successful sync */
 	bool synced;
+	/* ppcenter reference (pplayer-style /ws/play TIME_SYNC), pushed by the
+	 * obs-webrtc plugin. Preferred while fresh; see ntp_clock_now_ms(). */
+	int64_t ppcenter_offset_ms;
+	bool ppcenter_synced;
+	uint64_t ppcenter_at_ns;
 };
 
 static struct ntp_anchor anchor;
@@ -76,6 +86,9 @@ static void ntp_lazy_init(void)
 	pthread_mutex_init(&anchor.lock, NULL);
 	anchor.offset_ms = 0;
 	anchor.synced = false;
+	anchor.ppcenter_offset_ms = 0;
+	anchor.ppcenter_synced = false;
+	anchor.ppcenter_at_ns = 0;
 }
 
 #ifdef _WIN32
@@ -310,8 +323,16 @@ uint64_t ntp_clock_now_ms(void)
 {
 	pthread_once(&ntp_once, ntp_lazy_init);
 
+	const uint64_t mono_now = (uint64_t)os_gettime_ns();
 	pthread_mutex_lock(&anchor.lock);
-	int64_t offset_ms = anchor.offset_ms;
+	int64_t offset_ms;
+	if (anchor.ppcenter_synced &&
+	    mono_now - anchor.ppcenter_at_ns < NTP_PPCENTER_STALE_NS) {
+		/* ppcenter is the shared base with pplayer while fresh. */
+		offset_ms = anchor.ppcenter_offset_ms;
+	} else {
+		offset_ms = anchor.offset_ms;
+	}
 	pthread_mutex_unlock(&anchor.lock);
 
 	/* offset_ms is 0 until the first successful sync, so the uncorrected
@@ -323,8 +344,24 @@ bool ntp_clock_is_synced(void)
 {
 	pthread_once(&ntp_once, ntp_lazy_init);
 
+	const uint64_t mono_now = (uint64_t)os_gettime_ns();
 	pthread_mutex_lock(&anchor.lock);
-	bool s = anchor.synced;
+	bool s = anchor.synced ||
+		 (anchor.ppcenter_synced &&
+		  mono_now - anchor.ppcenter_at_ns < NTP_PPCENTER_STALE_NS);
 	pthread_mutex_unlock(&anchor.lock);
 	return s;
+}
+
+void ntp_clock_set_ppcenter_offset(int64_t offset_ms)
+{
+	pthread_once(&ntp_once, ntp_lazy_init);
+
+	pthread_mutex_lock(&anchor.lock);
+	anchor.ppcenter_offset_ms = offset_ms;
+	anchor.ppcenter_synced = true;
+	anchor.ppcenter_at_ns = (uint64_t)os_gettime_ns();
+	pthread_mutex_unlock(&anchor.lock);
+
+	blog(LOG_INFO, "ntp-clock: ppcenter TIME_SYNC offset applied, offset=%" PRId64 "ms", offset_ms);
 }

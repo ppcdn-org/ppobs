@@ -20,6 +20,7 @@
 
 class P2PSignalClient;
 class UplinkQosPolicy;
+class PpcenterTimeSync;
 
 // The libobs output object ("whip_output"). Wraps one or two independent
 // WHIPCodecSession instances (H264 always; HEVC too when the HEVC/H264
@@ -112,6 +113,11 @@ private:
 	std::atomic<int> connect_time_ms{0};
 
 	std::unique_ptr<P2PSignalClient> p2pSignal;
+	// Aligns ppobs's clock to ppcenter (same /ws/play TIME_SYNC probe pplayer
+	// uses) so both share one time base for the SEI delay measurement. Shared
+	// across outputs publishing to the same ppcenter (see
+	// AcquirePpcenterTimeSync); acquired in Setup(), released in StopThread().
+	std::shared_ptr<PpcenterTimeSync> timeSync;
 	// p2pToken is read by the signaling thread (AcquireP2PToken, via the token
 	// provider) and written by both Setup() and AcquireP2PToken(); guard it
 	// with p2pTokenMutex. lastP2PTokenRefreshMs throttles unforced refresh

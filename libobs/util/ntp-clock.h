@@ -37,6 +37,15 @@ EXPORT uint64_t ntp_clock_now_ms(void);
 /* Whether at least one NTP sync has ever succeeded. */
 EXPORT bool ntp_clock_is_synced(void);
 
+/* Applies a clock offset in milliseconds measured against ppcenter's /ws/play
+ * TIME_SYNC probe (the same probe pplayer uses). While it is fresh it takes
+ * precedence over the public-NTP offset, so ppobs and pplayer share ppcenter
+ * as one time base; if no ppcenter sync has landed for a while, the
+ * public-NTP offset (then the raw wall clock) is used instead. offset_ms is
+ * (ppcenterClock - localWallClock), i.e. the value to ADD to the local wall
+ * clock. Safe to call from any thread. */
+EXPORT void ntp_clock_set_ppcenter_offset(int64_t offset_ms);
+
 #ifdef __cplusplus
 }
 #endif
