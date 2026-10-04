@@ -39,6 +39,8 @@
 #define info(format, ...) do_log(LOG_INFO, format, ##__VA_ARGS__)
 #define error(format, ...) do_log(LOG_ERROR, format, ##__VA_ARGS__)
 
+static void ffmpeg_mpegts_deactivate(struct ffmpeg_output *stream);
+
 static void ffmpeg_mpegts_set_last_error(struct ffmpeg_data *data, const char *error)
 {
 	if (data->last_error)
@@ -664,6 +666,14 @@ static void close_mpegts_url(struct ffmpeg_output *stream, bool is_rist)
 
 void ffmpeg_mpegts_data_free(struct ffmpeg_output *stream, struct ffmpeg_data *data)
 {
+	/* The write thread borrows stream->ff_data.output; it must be joined
+	 * before that context is freed or reinitialized. Callers normally do
+	 * this via ffmpeg_mpegts_full_stop(), but a stop that took the
+	 * "not active" path could otherwise free a context a still-running
+	 * write thread was mid av_write_frame() on. */
+	if (stream->write_thread_active)
+		ffmpeg_mpegts_deactivate(stream);
+
 	if (data->initialized)
 		av_write_trailer(data->output);
 
@@ -852,6 +862,15 @@ static int mpegts_process_packet(struct ffmpeg_output *stream)
 	if (!packet)
 		return 0;
 
+	/* Never hand a packet to FFmpeg before avformat_write_header() has
+	 * initialized each stream's timestamp state: compute_muxer_pkt_fields()
+	 * divides by a per-stream fraction denominator that is still zero until
+	 * then (an integer divide-by-zero inside libavformat). */
+	if (!stream->ff_data.initialized) {
+		av_packet_free(&packet);
+		return 0;
+	}
+
 	//blog(LOG_DEBUG,
 	//     "size = %d, flags = %lX, stream = %d, "
 	//     "packets queued: %lu",
@@ -927,6 +946,27 @@ static void *write_thread(void *data)
 	}
 	os_atomic_set_bool(&stream->stopping, true);
 	return NULL;
+}
+
+/* Starts the muxer write thread. Deferred until avformat_write_header() has
+ * succeeded (see ffmpeg_mpegts_data): starting it at finalize time let the
+ * thread process packets - reused across an output reconnect, or racing the
+ * teardown - while the freshly allocated FFmpeg context still had no stream
+ * timestamp state, which divides by zero inside libavformat. */
+static bool mpegts_start_write_thread(struct ffmpeg_output *stream)
+{
+	if (stream->write_thread_active)
+		return true;
+
+	os_event_reset(stream->stop_event);
+	int ret = pthread_create(&stream->write_thread, NULL, write_thread, stream);
+	if (ret != 0) {
+		ffmpeg_mpegts_log_error(LOG_WARNING, &stream->ff_data,
+					"ffmpeg_output_start: Failed to create write thread.");
+		return false;
+	}
+	stream->write_thread_active = true;
+	return true;
 }
 
 static bool get_extradata(struct ffmpeg_output *stream)
@@ -1159,15 +1199,8 @@ static bool ffmpeg_mpegts_finalize(struct ffmpeg_output *stream, struct ffmpeg_c
 		}
 		av_dump_format(ff_data->output, 0, NULL, 1);
 	}
-	os_event_reset(stream->stop_event);
-	int ret = pthread_create(&stream->write_thread, NULL, write_thread, stream);
-	if (ret != 0) {
-		ffmpeg_mpegts_log_error(LOG_WARNING, &stream->ff_data,
-					"ffmpeg_output_start: Failed to create write thread.");
-		*code = OBS_OUTPUT_ERROR;
-		return false;
-	}
-	stream->write_thread_active = true;
+	/* The write thread is started from ffmpeg_mpegts_data(), only once the
+	 * header has been written (see mpegts_start_write_thread()). */
 	stream->total_bytes = 0;
 	obs_output_begin_data_capture(stream->output, 0);
 	return true;
@@ -1215,7 +1248,7 @@ static void ffmpeg_mpegts_full_stop(void *data)
 {
 	struct ffmpeg_output *stream = data;
 
-	if (active(stream)) {
+	if (active(stream) || stream->write_thread_active) {
 		ffmpeg_mpegts_deactivate(stream);
 	}
 	ffmpeg_mpegts_data_free(stream, &stream->ff_data);
@@ -1225,7 +1258,10 @@ static void stop(void *data, bool signal, uint64_t ts)
 {
 	struct ffmpeg_output *stream = data;
 
-	if (active(stream)) {
+	/* Gate on write_thread_active, not just active(): `running` can already
+	 * be false while the write thread is still alive, and freeing the
+	 * FFmpeg context under it is exactly the reconnect crash. */
+	if (active(stream) || stream->write_thread_active) {
 		/* bypassed when called by destroy ==> no draining, instant stop */
 		if (ts > 0) {
 			/* this controls the draining of all packets in the write_threads when we stop */
@@ -1331,9 +1367,13 @@ static bool ffmpeg_mpegts_start(void *data)
 	if (os_atomic_load_bool(&stream->start_stop_thread_active))
 		pthread_join(stream->start_stop_thread, NULL);
 
-	if (stream->write_thread_active)
+	if (stream->write_thread_active) {
 		pthread_join(stream->write_thread, NULL);
+		stream->write_thread_active = false;
+	}
 
+	/* A fresh session writes its own header and only then starts the write
+	 * thread (mpegts_start_write_thread), so reset the flag here too. */
 	stream->audio_start_ts = 0;
 	stream->video_start_ts = 0;
 	stream->total_bytes = 0;
@@ -1551,20 +1591,40 @@ static void ffmpeg_mpegts_data(void *data, struct encoder_packet *packet)
 	struct ffmpeg_data *ff_data = &stream->ff_data;
 	int code;
 	if (!stream->got_headers) {
-		if (get_extradata(stream)) {
-			stream->got_headers = true;
-		} else {
-			warn("Failed to retrieve headers");
-			code = OBS_OUTPUT_INVALID_STREAM;
-			goto fail;
+		bool header_failed = false;
+		/* Serialize across encoder threads: a multi-track output
+		 * delivers each track's first packet from its own thread, and
+		 * the header must be written exactly once. Holding write_mutex
+		 * also keeps a concurrent teardown from freeing the context
+		 * while it is being initialized. */
+		pthread_mutex_lock(&stream->write_mutex);
+		if (!stream->got_headers) {
+			if (get_extradata(stream)) {
+				stream->got_headers = true;
+			} else {
+				warn("Failed to retrieve headers");
+				code = OBS_OUTPUT_INVALID_STREAM;
+				header_failed = true;
+			}
+			if (!header_failed && !write_header(stream, ff_data)) {
+				error("Failed to write headers");
+				code = OBS_OUTPUT_INVALID_STREAM;
+				header_failed = true;
+			}
+			if (!header_failed) {
+				av_dump_format(ff_data->output, 0, NULL, 1);
+				ff_data->initialized = true;
+				/* Header is in place: it is now safe for the
+				 * write thread to call av_write_frame(). */
+				if (!mpegts_start_write_thread(stream)) {
+					code = OBS_OUTPUT_ERROR;
+					header_failed = true;
+				}
+			}
 		}
-		if (!write_header(stream, ff_data)) {
-			error("Failed to write headers");
-			code = OBS_OUTPUT_INVALID_STREAM;
+		pthread_mutex_unlock(&stream->write_mutex);
+		if (header_failed)
 			goto fail;
-		}
-		av_dump_format(ff_data->output, 0, NULL, 1);
-		ff_data->initialized = true;
 	}
 
 	if (!active(stream))
