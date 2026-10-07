@@ -589,6 +589,26 @@ ObsEncoderConfig buildEncoderConfig(obs_output_t *output, const std::vector<obs_
 	return config;
 }
 
+// deriveCodecWhipURL inserts a "/<codec>" path segment before the trailing
+// "/whip" of a concrete WHIP endpoint, producing the codec-suffixed path
+// (e.g. ".../app/stream/whip" -> ".../app/stream/hevc/whip"). Used only for
+// direct publishes (a concrete Server URL with no "{ppcenter_appid}"
+// placeholder) when HEVC/H264 multitrack is on and ppcenter is not resolving
+// the per-codec endpoints. A query/fragment is preserved; if "/whip" isn't
+// found the segment is appended instead.
+static std::string deriveCodecWhipURL(const std::string &url, const std::string &codec)
+{
+	static const std::string suffix = "/whip";
+	const size_t q = url.find_first_of("?#");
+	const std::string base = q == std::string::npos ? url : url.substr(0, q);
+	const std::string tail = q == std::string::npos ? std::string() : url.substr(q);
+	if (base.size() >= suffix.size() &&
+	    base.compare(base.size() - suffix.size(), suffix.size(), suffix) == 0) {
+		return base.substr(0, base.size() - suffix.size()) + "/" + codec + suffix + tail;
+	}
+	return base + "/" + codec + tail;
+}
+
 } // namespace
 
 bool WHIPOutput::Setup(uint64_t generation)
@@ -605,87 +625,102 @@ bool WHIPOutput::Setup(uint64_t generation)
 		return false;
 	}
 	OBSDataAutoRelease service_settings = obs_service_get_settings(service);
-	// The setting may be the bare origin ("https://api.pp-cdn.org") or the
-	// full publish endpoint; normalize it once so every consumer below
-	// (publish, device registration, NAT probe, encoder report) keeps working,
-	// and derive the /ws/play clock probe from the same value.
-	const std::string ppcenter_url =
-		DerivePpcenterPublishUrl(obs_data_get_string(service_settings, "ppcenter_url"));
-	if (ppcenter_url.empty()) {
-		do_log(LOG_ERROR, "ppcenter url not configured");
-		if (IsActiveGeneration(generation))
-			obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
-		return false;
-	}
 
-	// Align ppobs's clock to ppcenter (the same TIME_SYNC probe pplayer uses)
-	// so ppobs and pplayer measure delay against one time base. The public-NTP
-	// thread keeps running as a fallback. Shared process-wide per ppcenter
-	// origin, so an SRT publish's P2P companion output reuses the same
-	// /ws/play connection instead of opening a second one.
-	timeSync = AcquirePpcenterTimeSync(ppcenter_url);
+	// A concrete Server URL (no "{ppcenter_appid}" placeholder) is honored
+	// verbatim: ppobs publishes straight to that endpoint and does NOT let
+	// ppcenter rewrite it. Only a URL carrying the placeholder opts into
+	// ppcenter endpoint resolution (Origin selection + per-codec whip_tracks).
+	// This lets an operator point ppobs directly at a specific node without
+	// registering it as an Origin in ppcenter.
+	const std::string configured_server = obs_data_get_string(service_settings, "server");
+	const std::string configured_token = obs_data_get_string(service_settings, "bearer_token");
+	const bool direct_publish =
+		!configured_server.empty() &&
+		configured_server.find("{ppcenter_appid}") == std::string::npos;
 
-	// wantMultitrack only gates whether the HEVC session is additionally
-	// set up and connected below - the publish request itself always asks
-	// ppcenter for codec-tagged WHIP tracks (see
-	// ppcenter_build_publish_json), since every WHIP publish, H264-only
-	// included, lands on the codec-suffixed path (".../h264/whip"),
-	// matching the design doc's §3.1 URL convention.
+	// wantMultitrack only gates whether the HEVC session is additionally set
+	// up and connected below.
 	const bool wantMultitrack = multitrackEnabled(output);
 
-	PPCenterPublishRequest request{ppcenter_url,
-				       obs_data_get_string(service_settings, "ppcenter_appid"),
-				       obs_data_get_string(service_settings, "ppcenter_secret"),
-				       obs_data_get_string(service_settings, "ppcenter_stream"),
-				       obs_data_get_string(service_settings, "ppcenter_region")};
-	// Register this device's hardware identity with ppcenter before
-	// publishing. The server enforces a per-user device binding limit and
-	// rejects publishes from unregistered devices (HTTP 403). Registration
-	// is best-effort: if it fails, we still attempt to publish with the
-	// best deviceId we have, and the server will reject the publish if
-	// device binding is required for this account.
-	std::string deviceId = RegisterPpobsDevice(request.url, request.app_id, request.app_secret);
-	if (deviceId.empty()) {
-		deviceId = GetOrCreateP2PClientId();
-		do_log(LOG_WARNING,
-		       "device registration failed; falling back to generated deviceId=%s",
-		       deviceId.c_str());
-	} else {
-		do_log(LOG_INFO, "device registered: deviceId=%s", deviceId.c_str());
-	}
-	request.device_id = deviceId;
-	natProbeUrl = request.url;
-	natProbeAppId = request.app_id;
-	natProbeAppSecret = request.app_secret;
-	natProbeStreamName = request.stream_name;
-	natProbeClientId = deviceId;
-	// /1,000,000 to match CheckNatProbeRefresh()'s own conversion (ns -> ms) -
-	// this baseline and that function's now_ms must be in the same unit or
-	// the first comparison is meaningless. Originally written with the same
-	// /1000 bug CheckNatProbeRefresh() itself had (see that function's
-	// comment): left as microseconds here while the other site got fixed
-	// would have made this baseline ~1000x larger than any real ms
-	// timestamp, so now_ms - lastNatProbeRefreshMs stays deeply negative
-	// (and therefore "under the throttle") for longer than any real stream
-	// runs - the periodic refresh would never fire in practice.
-	lastNatProbeRefreshMs = (int64_t)(obs_get_video_frame_time() / 1000000);
-	const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name, natProbeClientId);
-	if (probe.succeeded) {
-		request.nat_probe_id = probe.probe_id;
-		natProbeId = probe.probe_id;
-		do_log(LOG_INFO, "P2P publisher NAT probe registered");
-	} else {
-		// NAT probing is an optional P2P optimization. Publishing must
-		// continue normally; ppcenter will naturally choose edge-only.
-		do_log(LOG_WARNING, "P2P publisher NAT probe failed; continuing with edge-only fallback");
-	}
+	std::string ppcenter_url;
+	PPCenterPublishRequest request;
+	std::string deviceId;
 	PPCenterPublishResponse resp;
-	std::string error;
-	if (!ppcenter_resolve_publish(request, resp, error)) {
-		do_log(LOG_ERROR, "ppcenter resolve publish failed: %s", error.c_str());
-		if (IsActiveGeneration(generation))
-			obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
-		return false;
+
+	if (direct_publish) {
+		do_log(LOG_INFO,
+		       "WHIP direct publish to configured endpoint (ppcenter resolution skipped): %s",
+		       configured_server.c_str());
+		resp.whip_tracks["h264"] = PPCenterWhipTrack{configured_server, configured_token};
+		if (wantMultitrack)
+			resp.whip_tracks["hevc"] =
+				PPCenterWhipTrack{deriveCodecWhipURL(configured_server, "hevc"), configured_token};
+	} else {
+		// The setting may be the bare origin ("https://api.pp-cdn.org") or the
+		// full publish endpoint; normalize it once so every consumer below
+		// (publish, device registration, NAT probe, encoder report) keeps
+		// working, and derive the /ws/play clock probe from the same value.
+		ppcenter_url = DerivePpcenterPublishUrl(obs_data_get_string(service_settings, "ppcenter_url"));
+		if (ppcenter_url.empty()) {
+			do_log(LOG_ERROR, "ppcenter url not configured");
+			if (IsActiveGeneration(generation))
+				obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
+			return false;
+		}
+
+		// Align ppobs's clock to ppcenter (the same TIME_SYNC probe pplayer
+		// uses) so ppobs and pplayer measure delay against one time base.
+		// Shared process-wide per ppcenter origin, so an SRT publish's P2P
+		// companion output reuses the same /ws/play connection.
+		timeSync = AcquirePpcenterTimeSync(ppcenter_url);
+
+		request = PPCenterPublishRequest{ppcenter_url,
+						 obs_data_get_string(service_settings, "ppcenter_appid"),
+						 obs_data_get_string(service_settings, "ppcenter_secret"),
+						 obs_data_get_string(service_settings, "ppcenter_stream"),
+						 obs_data_get_string(service_settings, "ppcenter_region")};
+		// Register this device's hardware identity with ppcenter before
+		// publishing. The server enforces a per-user device binding limit and
+		// rejects publishes from unregistered devices (HTTP 403). Registration
+		// is best-effort: if it fails, we still attempt to publish with the
+		// best deviceId we have, and the server will reject the publish if
+		// device binding is required for this account.
+		deviceId = RegisterPpobsDevice(request.url, request.app_id, request.app_secret);
+		if (deviceId.empty()) {
+			deviceId = GetOrCreateP2PClientId();
+			do_log(LOG_WARNING,
+			       "device registration failed; falling back to generated deviceId=%s",
+			       deviceId.c_str());
+		} else {
+			do_log(LOG_INFO, "device registered: deviceId=%s", deviceId.c_str());
+		}
+		request.device_id = deviceId;
+		natProbeUrl = request.url;
+		natProbeAppId = request.app_id;
+		natProbeAppSecret = request.app_secret;
+		natProbeStreamName = request.stream_name;
+		natProbeClientId = deviceId;
+		// /1,000,000 to match CheckNatProbeRefresh()'s own conversion (ns -> ms) -
+		// this baseline and that function's now_ms must be in the same unit or
+		// the first comparison is meaningless.
+		lastNatProbeRefreshMs = (int64_t)(obs_get_video_frame_time() / 1000000);
+		const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name, natProbeClientId);
+		if (probe.succeeded) {
+			request.nat_probe_id = probe.probe_id;
+			natProbeId = probe.probe_id;
+			do_log(LOG_INFO, "P2P publisher NAT probe registered");
+		} else {
+			// NAT probing is an optional P2P optimization. Publishing must
+			// continue normally; ppcenter will naturally choose edge-only.
+			do_log(LOG_WARNING, "P2P publisher NAT probe failed; continuing with edge-only fallback");
+		}
+		std::string error;
+		if (!ppcenter_resolve_publish(request, resp, error)) {
+			do_log(LOG_ERROR, "ppcenter resolve publish failed: %s", error.c_str());
+			if (IsActiveGeneration(generation))
+				obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+			return false;
+		}
 	}
 	p2pToken = resp.signal_token;
 	p2pSignalUrl = resp.signal_url;
@@ -909,7 +944,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 		}
 	}
 
-	do_log(LOG_INFO, "ppcenter resolved WHIP: h264=%s hevc=%s P2P: %s", h264Url.c_str(),
+	do_log(LOG_INFO, "WHIP endpoints: h264=%s hevc=%s P2P: %s", h264Url.c_str(),
 	       hevcUrl.empty() ? "disabled" : hevcUrl.c_str(), p2pSignalUrl.empty() ? "disabled" : "enabled");
 
 	return true;
