@@ -7,6 +7,8 @@ if(OS_WINDOWS)
   include(cmake/onnxruntime.cmake)
 endif()
 
+include(cmake/soundtouch.cmake)
+
 target_sources(
   obs-filters
   PRIVATE
@@ -41,6 +43,9 @@ target_sources(
     matting-models.h
     matting-ort.c
     matting-ort.h
+    audioshift-filter.c
+    audioshift-soundtouch.cpp
+    audioshift-soundtouch.h
 )
 
 target_link_libraries(obs-filters PRIVATE OBS::libobs $<$<PLATFORM_ID:Windows>:OBS::w32-pthreads>)
@@ -64,6 +69,16 @@ if(TARGET OBS::onnxruntime)
       "${OBS_OUTPUT_DIR}/$<CONFIG>/${OBS_EXECUTABLE_DESTINATION}"
     VERBATIM
   )
+endif()
+
+if(TARGET OBS::soundtouch)
+  target_compile_definitions(obs-filters PRIVATE AUDIOSHIFT_HAS_SOUNDTOUCH=1)
+  target_link_libraries(obs-filters PRIVATE OBS::soundtouch)
+  # TODO(audioshift): if the real SoundTouch build turns out to be a shared
+  # library (likely, see docs/audioshift-design.md 3.3's LGPL-2.1 dynamic
+  # -linking note), it will need the same POST_BUILD copy-next-to-obs.exe
+  # step onnxruntime.cmake's target does above, once its actual DLL path is
+  # known.
 endif()
 
 include(cmake/speexdsp.cmake)

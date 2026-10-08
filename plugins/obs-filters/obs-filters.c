@@ -42,6 +42,7 @@ extern struct obs_source_info expander_filter;
 extern struct obs_source_info upward_compressor_filter;
 extern struct obs_source_info luma_key_filter;
 extern struct obs_source_info luma_key_filter_v2;
+extern struct obs_source_info audioshift_filter;
 
 bool obs_module_load(void)
 {
@@ -80,5 +81,6 @@ bool obs_module_load(void)
 	obs_register_source(&upward_compressor_filter);
 	obs_register_source(&luma_key_filter);
 	obs_register_source(&luma_key_filter_v2);
+	obs_register_source(&audioshift_filter);
 	return true;
 }

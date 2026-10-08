@@ -373,20 +373,30 @@ filter_audio(audio):
 | 叠加机器人/回声效果导致削波 | 破音、失真 | P0 不内置限幅，引导用户叠加现有 `Limiter` 滤镜；P1 做效果层时评估是否需要内部软限幅 |
 | 用户挂载到非人声源（游戏音效/音乐） | 效果难听但不应崩溃 | 功能说明中明确建议用途，保证极端情况下仍是直通而非崩溃/静音 |
 
-## 12. ppobs 代码落点（计划）
+## 12. ppobs 代码落点
 
-### 12.1 计划新增文件
+### 12.1 已新增文件
 
 ```text
-plugins/obs-filters/audioshift-filter.c / .h        滤镜主体（properties、FIFO、延迟补偿）
+plugins/obs-filters/audioshift-filter.c              滤镜主体（properties、FIFO、延迟补偿）
 plugins/obs-filters/audioshift-soundtouch.cpp / .h   SoundTouch C++ API 的 C 封装
-plugins/obs-filters/cmake/soundtouch.cmake           依赖查找/vendor 接线
+plugins/obs-filters/cmake/soundtouch.cmake           依赖查找；无 vendor 兜底（见 3.3）
+```
 
+未新增 `audioshift-filter.h`：和 `gain-filter.c`/`compressor-filter.c`/
+`noise-suppress-filter.c` 等既有简单音频滤镜一样，`struct obs_source_info` 直接在
+`.c` 文件里定义，只在 `obs-filters.c` 里 `extern` 声明，不需要单独的头文件——只有
+跨文件共享的辅助模块（如 `background-mask.h`）才有头文件，AudioShift 目前没有这种
+共享需求。
+
+尚未新增（P0 范围内，暂缓）：
+
+```text
 plugins/obs-filters/audioshift-bench.c               性能基准（ENABLE_TEST_INPUT）
 plugins/obs-filters/audioshift-filter-test.c         滤镜逻辑单元测试（ENABLE_TEST_INPUT）
 ```
 
-### 12.2 计划修改文件
+### 12.2 已修改文件
 
 ```text
 plugins/obs-filters/CMakeLists.txt       接入 cmake/soundtouch.cmake，注册新源文件
@@ -430,15 +440,26 @@ P0 不追求"自然"性别转换音质，只做娱乐向角色化变声；若后
 - SoundTouch 官方仓库地址（`codeberg.org/soundtouch/soundtouch`）、最新版本号
   （2.4.1）、LGPL-2.1 许可证、CMake find_package 支持的网络检索核实（见 3.3）
 - `plugins/obs-filters/` 骨架代码（滤镜本体、SoundTouch 桥接层、CMake 接线、
-  中英文 locale）已落地，详见下方"代码落点"一节；因未获得下载第三方源码的许可，
+  中英文 locale）已落地，详见上方"代码落点"一节；因未获得下载第三方源码的许可，
   `AUDIOSHIFT_HAS_SOUNDTOUCH` 当前始终未定义，滤镜可注册但处理逻辑是直通
+- **已跑通一次真实构建**：`cmake --build build_x64 --config RelWithDebInfo
+  --target obs-filters` 在本机（见 `BUILD_NOTE.md` 的环境）编译并链接通过，产出
+  `build_x64/plugins/obs-filters/RelWithDebInfo/obs-filters.dll`，没有报错或警告。
+  这确认了 `obs-filters` target 内 `.c`/`.cpp` 混合编译可行，`audioshift-filter.c`
+  调用 `audioshift-soundtouch.cpp` 导出的 C 接口链接正常——但这只验证了"不接入真实
+  SoundTouch 时的直通路径"能编译，`AUDIOSHIFT_HAS_SOUNDTOUCH=1` 分支（真正调用
+  `soundtouch::SoundTouch` 的那部分代码）仍完全未被编译器看到过，拿到真实依赖后
+  很可能还需要修正
 
 ### 仍未验证
 
 - SoundTouch 源码包的实际下载、SHA-256 核验（需要用户明确同意后才能下载第三方文件）
-- `obs-filters` target 混合编译 `.c`/`.cpp` 的可行性——已写出 `.cpp` 桥接文件，但
-  **尚未跑通一次实际编译**确认链接通过（见下方构建验证小节）
+- `AUDIOSHIFT_HAS_SOUNDTOUCH=1` 分支（`audioshift-soundtouch.cpp` 里真正调用
+  SoundTouch C++ API 的代码）在真实头文件下能否编译通过——上面的构建验证只走了
+  "SoundTouch 不存在"的直通分支
 - 实际 CPU 占用、算法延迟的真实测量值（第 8 节数字均为预期范围，非实测）——依赖真实
   SoundTouch 库接入后才能测
 - 真实人声在各预设下的主观音质评估
 - 长时间直播下的稳定性与内存表现
+- 滤镜在 OBS 实际界面中能否正常添加、显示属性面板（本次只验证了编译链接，没有
+  启动 `obs64.exe` 做运行期验证）
