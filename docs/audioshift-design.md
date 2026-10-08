@@ -80,23 +80,41 @@
 
 参照 `virtual-background-design.md` §3.6 确立的纪律，正式发布前必须完成：
 
-- 确认当前 SoundTouch 官方源码仓库地址与最新稳定版本号——**已通过网络检索核实**：
-  历史上托管在 `surina.net/soundtouch`，源码仓库现已迁移到
-  `https://codeberg.org/soundtouch/soundtouch`，最新稳定版本 **2.4.1**（2026-03-29
-  发布）；仓库顶层含 `include/`（公开头文件）、`source/`、`CMakeLists.txt` 以及
-  `SoundTouchConfig.cmake.in`（说明其自带 `find_package` 集成支持）。此为网络检索
-  结果，**实际下载/校验仍需在真正引入依赖时按下一条执行**。
-- 记录所用版本号、下载来源、SHA-256——**仍未执行**：本阶段只做了信息检索，尚未实际
-  下载源码包，因此无法给出 SHA-256。按安全规范，下载第三方文件前需征得用户明确同意
-  （见本文档配套的实现进展说明），实际下载需单独确认后进行。
-- 确认 LGPL-2.1 的动态链接义务已满足：以共享库形式链接（而非静态整体链接进
-  `obs-filters` 二进制），随发行包附带 LGPL 许可证全文和版权声明，并保留用户按 LGPL
-  条款获取/替换该库对应版本源码的途径
-- Windows 平台没有预编译 SoundTouch 包随 `obs-deps` 提供，且本项目尚未获得许可下载/
-  vendor 真实源码，因此当前 `cmake/soundtouch.cmake` 只实现了"检测到才启用，检测不到
-  则优雅降级为直通"的 `find_package` 路径（镜像 `onnxruntime.cmake` 的可选依赖模式），
-  **没有**像 `rnnoise.cmake` 那样内置一份 vendored 源码兜底——这一步要等拿到下载许可、
-  实际引入源码后才能补上
+- 确认当前 SoundTouch 官方源码仓库地址与最新稳定版本号——**已核实**：源码仓库现已
+  从历史上的 `surina.net/soundtouch` 迁移到
+  `https://codeberg.org/soundtouch/soundtouch`，最新稳定版本 **2.4.1**。
+- 记录所用版本号、下载来源、SHA-256——**已完成**（经用户明确同意后下载，见下方
+  §3.4）：实际 vendor 的是 git 提交
+  `0047e0b1ecfceb041348579119bf79b73a322a3a`（"Bump version to 2.4.1"，
+  2026-03-29），标签 `2.4.1` 指向同一提交。provenance 记录见
+  `plugins/obs-filters/soundtouch/VENDORED-FROM.md`。
+- LGPL-2.1 义务：本项目选择**把 SoundTouch 完整源码 vendor 进仓库，以对象库形式
+  静态编译进 `obs-filters.dll`**，而不是动态链接一份预编译二进制——这比"动态链接 +
+  随包附带许可证文本"的路径更直接地满足 LGPL-2.1 的对应源码（corresponding source）
+  义务，因为完整源码本身就在这个开源仓库里，使用方天然就能获取、修改、重新编译。
+  `COPYING.TXT`（LGPL-2.1 全文）随 vendored 目录一并保留在
+  `plugins/obs-filters/soundtouch/COPYING.TXT`。
+- Windows 平台没有预编译 SoundTouch 包随 `obs-deps` 提供，因此 `cmake/soundtouch.cmake`
+  采用"先尝试 `find_package`（极少数机器可能已装有系统包），找不到则构建 vendored
+  源码"的两级策略——这与 `rnnoise.cmake` 的结构完全一致，而不再是上一版文档记载的
+  "只有可选检测、没有 vendor 兜底"（那时还没拿到下载许可）。
+
+### 3.4 实际下载与裁剪记录
+
+- 来源：`git clone --depth 1 --branch 2.4.1 https://codeberg.org/soundtouch/soundtouch.git`
+- 只 vendor 了 SoundTouch 库本身的源码，**排除**了：
+  - `source/SoundStretch`（命令行工具）、`source/SoundTouchDLL`（C 包装 DLL，
+    AudioShift 直接从 `.cpp` 调 C++ API，不需要它）、`source/Android-lib`、
+    `source/csharp-example`
+  - 上游自带的构建系统文件（`CMakeLists.txt`、autotools 相关文件、`.sln`/`.vcxproj`）
+    ——改用本项目自己的 `cmake/soundtouch.cmake`，镜像 `rnnoise.cmake` 的手写
+    `target_sources` 对象库模式，而不是 `add_subdirectory` 整个上游项目（避免引入
+    上游的 `install()`/pkgconfig/包配置生成规则污染本项目的打包流程）
+  - `BPMDetect.cpp`/`BPMDetect.h`（节拍检测，AudioShift 不用；已核实
+    `SoundTouch.cpp`、`TDStretch.cpp`、`RateTransposer.cpp` 均不引用它，裁剪理由
+    记在 `VENDORED-FROM.md`）
+- 保留的文件清单、裁剪理由、更新到新版本的操作方式，均记录在
+  `plugins/obs-filters/soundtouch/VENDORED-FROM.md`，不在本文档重复。
 
 ## 4. 总体架构
 
@@ -124,9 +142,11 @@ plugins/obs-filters/audioshift-soundtouch.h     C 头文件，供 .c 文件 #inc
 `receiveSamples`、`flush`/`clear`（切换预设或滤镜被禁用再启用时清空内部状态，避免
 残留样本污染新一段音频）。
 
-CMake 需要确认 `obs-filters` target 允许在同一 target 内混合编译 `.c`/`.cpp`
-（OBS 其他插件如 `obs-webrtc` 已是纯 C++，技术上没有阻碍，但需要在阶段 A 用一个最小
-的空实现验证构建系统按预期分别调用 C/C++ 编译器、且导出符号可从 `.c` 文件正确调用）。
+**已验证**：`obs-filters` target 内混合编译 `.c`/`.cpp` 没有问题——`cmake --build
+--target obs-filters` 成功编译了 `audioshift-filter.c`、`audioshift-soundtouch.cpp`
+以及 vendored 的 13 个 SoundTouch `.cpp` 源文件（通过独立的 `obs-soundtouch` 对象库
+target，见 §12.1），链接产出 `obs-filters.dll`，`.c` 文件里对 `audioshift-soundtouch.h`
+声明的 `extern "C"` 函数的调用也编译链接通过，没有报错或警告。
 
 ### 4.3 声道与采样率
 
@@ -380,7 +400,9 @@ filter_audio(audio):
 ```text
 plugins/obs-filters/audioshift-filter.c              滤镜主体（properties、FIFO、延迟补偿）
 plugins/obs-filters/audioshift-soundtouch.cpp / .h   SoundTouch C++ API 的 C 封装
-plugins/obs-filters/cmake/soundtouch.cmake           依赖查找；无 vendor 兜底（见 3.3）
+plugins/obs-filters/cmake/soundtouch.cmake           依赖查找 + vendored 源码对象库构建
+plugins/obs-filters/soundtouch/                      vendored SoundTouch 2.4.1 源码子集
+plugins/obs-filters/soundtouch/VENDORED-FROM.md      版本/commit/裁剪范围记录（见 3.4）
 ```
 
 未新增 `audioshift-filter.h`：和 `gain-filter.c`/`compressor-filter.c`/
@@ -438,28 +460,31 @@ P0 不追求"自然"性别转换音质，只做娱乐向角色化变声；若后
 - 现有音频滤镜架构、`obs_audio_data` 契约、FIFO/延迟补偿范式的代码走读（见第 4、5 节
   引用的具体文件）
 - SoundTouch 官方仓库地址（`codeberg.org/soundtouch/soundtouch`）、最新版本号
-  （2.4.1）、LGPL-2.1 许可证、CMake find_package 支持的网络检索核实（见 3.3）
-- `plugins/obs-filters/` 骨架代码（滤镜本体、SoundTouch 桥接层、CMake 接线、
-  中英文 locale）已落地，详见上方"代码落点"一节；因未获得下载第三方源码的许可，
-  `AUDIOSHIFT_HAS_SOUNDTOUCH` 当前始终未定义，滤镜可注册但处理逻辑是直通
-- **已跑通一次真实构建**：`cmake --build build_x64 --config RelWithDebInfo
-  --target obs-filters` 在本机（见 `BUILD_NOTE.md` 的环境）编译并链接通过，产出
-  `build_x64/plugins/obs-filters/RelWithDebInfo/obs-filters.dll`，没有报错或警告。
-  这确认了 `obs-filters` target 内 `.c`/`.cpp` 混合编译可行，`audioshift-filter.c`
-  调用 `audioshift-soundtouch.cpp` 导出的 C 接口链接正常——但这只验证了"不接入真实
-  SoundTouch 时的直通路径"能编译，`AUDIOSHIFT_HAS_SOUNDTOUCH=1` 分支（真正调用
-  `soundtouch::SoundTouch` 的那部分代码）仍完全未被编译器看到过，拿到真实依赖后
-  很可能还需要修正
+  （2.4.1）、LGPL-2.1 许可证、CMake find_package 支持的核实（见 3.3）
+- **已获用户明确同意并实际下载**：vendor 了 SoundTouch 2.4.1（commit
+  `0047e0b1`）的库源码子集进 `plugins/obs-filters/soundtouch/`，裁剪范围记录在
+  `VENDORED-FROM.md`（见 3.4）
+- `plugins/obs-filters/` 完整骨架代码（滤镜本体、SoundTouch 桥接层、vendored 源码、
+  CMake 接线、中英文 locale）已落地，详见上方"代码落点"一节
+- **已跑通两次真实构建**：
+  1. 不接入 SoundTouch 时的直通路径（`AUDIOSHIFT_HAS_SOUNDTOUCH` 未定义）
+  2. **接入真实 vendored SoundTouch 后的完整路径**——`cmake --build build_x64
+     --config RelWithDebInfo --target obs-filters` 编译了全部 13 个 vendored
+     SoundTouch `.cpp` 文件（通过 `obs-soundtouch` 对象库 target）、
+     `audioshift-soundtouch.cpp` 的 `AUDIOSHIFT_HAS_SOUNDTOUCH=1` 分支（真正调用
+     `soundtouch::SoundTouch::setPitchSemiTones`/`putSamples`/`receiveSamples` 等
+     API）、以及 `audioshift-filter.c`，链接产出
+     `build_x64/plugins/obs-filters/RelWithDebInfo/obs-filters.dll`，没有报错或
+     警告。`§4.2` 里记录的 API 签名假设（`uint` 类型、`setPitchSemiTones(double)`
+     重载选择等）都在真实头文件下被验证为正确，不需要修正
 
 ### 仍未验证
 
-- SoundTouch 源码包的实际下载、SHA-256 核验（需要用户明确同意后才能下载第三方文件）
-- `AUDIOSHIFT_HAS_SOUNDTOUCH=1` 分支（`audioshift-soundtouch.cpp` 里真正调用
-  SoundTouch C++ API 的代码）在真实头文件下能否编译通过——上面的构建验证只走了
-  "SoundTouch 不存在"的直通分支
-- 实际 CPU 占用、算法延迟的真实测量值（第 8 节数字均为预期范围，非实测）——依赖真实
-  SoundTouch 库接入后才能测
-- 真实人声在各预设下的主观音质评估
+- 实际 CPU 占用、算法延迟的真实测量值（第 8 节数字均为预期范围，非实测）
+- 真实人声在各预设下的主观音质评估——目前只验证了"能编译链接"，没有验证过
+  "处理出来的声音是否真的符合预期"
 - 长时间直播下的稳定性与内存表现
-- 滤镜在 OBS 实际界面中能否正常添加、显示属性面板（本次只验证了编译链接，没有
-  启动 `obs64.exe` 做运行期验证）
+- 滤镜在 OBS 实际界面中能否正常添加、显示属性面板、处理真实音频流（本次只验证了
+  编译链接，没有启动 `obs64.exe` 做运行期验证）
+- vendored 对象库在非 Windows/非 MSVC 平台（若 ppobs 未来扩展到那些平台）上的
+  编译情况——本次验证只覆盖了 BUILD_NOTE.md 记载的 Windows + VS 2026 环境

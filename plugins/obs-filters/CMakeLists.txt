@@ -71,14 +71,15 @@ if(TARGET OBS::onnxruntime)
   )
 endif()
 
-if(TARGET OBS::soundtouch)
+if(TARGET SoundTouch::SoundTouch)
   target_compile_definitions(obs-filters PRIVATE AUDIOSHIFT_HAS_SOUNDTOUCH=1)
-  target_link_libraries(obs-filters PRIVATE OBS::soundtouch)
-  # TODO(audioshift): if the real SoundTouch build turns out to be a shared
-  # library (likely, see docs/audioshift-design.md 3.3's LGPL-2.1 dynamic
-  # -linking note), it will need the same POST_BUILD copy-next-to-obs.exe
-  # step onnxruntime.cmake's target does above, once its actual DLL path is
-  # known.
+  target_link_libraries(obs-filters PRIVATE SoundTouch::SoundTouch)
+  # No POST_BUILD DLL-copy step needed here, unlike OBS::onnxruntime above:
+  # the vendored soundtouch.cmake path builds SoundTouch as an OBJECT
+  # library straight into obs-filters.dll itself, not a separate shared
+  # library. This also sidesteps the LGPL-2.1 dynamic-linking question
+  # entirely (see docs/audioshift-design.md 3.3) -- the full corresponding
+  # source is already sitting in plugins/obs-filters/soundtouch/.
 endif()
 
 include(cmake/speexdsp.cmake)
