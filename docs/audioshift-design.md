@@ -42,6 +42,8 @@
   预设是"角色化"效果（机器人、卡通、低沉大叔等娱乐效果），不承诺性别转换的自然度。
 - **机器人 / 回声等附加效果层**：P0 只做纯音高变换；环形调制（机器人音）、延迟反馈
   （空灵/山洞）等属于叠加效果，放入 P1（见 6.2 节），避免 P0 范围扩散。
+- **"温柔男中音""甜美女高音"一类情感化声音模板**：这类模板需要音高 + EQ + 压缩的
+  组合而不是单一滤镜能给的，且涉及前端批量应用滤镜链的改动，放入 P1（见 6.4 节）。
 - **基于神经网络的音色转换**（RVC / so-vits-svc 一类的 any-to-any 音色克隆）：延迟、
   CPU/GPU 占用、模型许可证复杂度都远超 P0 可接受范围，列为 P2 研究方向，不承诺交付。
 - 云端变声或在线账号服务
@@ -78,16 +80,23 @@
 
 参照 `virtual-background-design.md` §3.6 确立的纪律，正式发布前必须完成：
 
-- 确认当前 SoundTouch 官方源码仓库地址与最新稳定版本号（历史上托管在
-  `surina.net/soundtouch`，近年源码仓库有迁移，**需在阶段 A 实际核实一次**，不能假定
-  旧文档记忆的地址仍然准确）
-- 记录所用版本号、下载来源、SHA-256
+- 确认当前 SoundTouch 官方源码仓库地址与最新稳定版本号——**已通过网络检索核实**：
+  历史上托管在 `surina.net/soundtouch`，源码仓库现已迁移到
+  `https://codeberg.org/soundtouch/soundtouch`，最新稳定版本 **2.4.1**（2026-03-29
+  发布）；仓库顶层含 `include/`（公开头文件）、`source/`、`CMakeLists.txt` 以及
+  `SoundTouchConfig.cmake.in`（说明其自带 `find_package` 集成支持）。此为网络检索
+  结果，**实际下载/校验仍需在真正引入依赖时按下一条执行**。
+- 记录所用版本号、下载来源、SHA-256——**仍未执行**：本阶段只做了信息检索，尚未实际
+  下载源码包，因此无法给出 SHA-256。按安全规范，下载第三方文件前需征得用户明确同意
+  （见本文档配套的实现进展说明），实际下载需单独确认后进行。
 - 确认 LGPL-2.1 的动态链接义务已满足：以共享库形式链接（而非静态整体链接进
   `obs-filters` 二进制），随发行包附带 LGPL 许可证全文和版权声明，并保留用户按 LGPL
   条款获取/替换该库对应版本源码的途径
-- 若 Windows 平台的预编译 SoundTouch 包不随 `obs-deps` 提供，参照 `rnnoise.cmake` 的
-  "先 `find_package`，找不到则使用仓库内 vendored 源码构建对象库"模式自行引入源码并
-  核验许可证文件完整保留
+- Windows 平台没有预编译 SoundTouch 包随 `obs-deps` 提供，且本项目尚未获得许可下载/
+  vendor 真实源码，因此当前 `cmake/soundtouch.cmake` 只实现了"检测到才启用，检测不到
+  则优雅降级为直通"的 `find_package` 路径（镜像 `onnxruntime.cmake` 的可选依赖模式），
+  **没有**像 `rnnoise.cmake` 那样内置一份 vendored 源码兜底——这一步要等拿到下载许可、
+  实际引入源码后才能补上
 
 ## 4. 总体架构
 
@@ -141,17 +150,27 @@ CMake 需要确认 `obs-filters` target 允许在同一 target 内混合编译 `
 
 ## 5. 实时处理管线
 
-### 5.1 线程模型：无需独立 worker 线程
+### 5.1 线程模型：无需独立 worker 线程，也不需要 mutex
 
 与虚拟背景滤镜（ONNX 神经网络推理，单帧耗时数十毫秒，必须放到独立 worker 线程避免
 阻塞 OBS 渲染/音频线程）不同，SoundTouch 的 WSOLA 时域算法对典型语音帧（十毫秒级）的
 处理成本极低（预计落在微秒到低个位数毫秒级，需在阶段 B 实测确认），可以**直接在
-`filter_audio` 回调内同步处理**，不引入额外线程、不需要跨线程的 mutex 保护音频数据
-本身——这与 `gain-filter.c`/`compressor-filter.c` 的同步处理模型一致。
+`filter_audio` 回调内同步处理**，不引入额外线程——这与 `gain-filter.c`/
+`compressor-filter.c` 的同步处理模型一致。
 
-仍然需要一个轻量 `pthread_mutex_t`（或等价的原子/锁）保护**设置**：`update()`
-在 UI 线程被调用修改音高/预设参数，而 `filter_audio` 在音频线程读取，二者存在竞争，
-做法与 `compressor-filter.c` 对设置的互斥保护一致。
+**`soundtouch::SoundTouch` 实例只由音频线程触碰**，不需要 mutex：
+
+- `update()`（UI 线程调用）**不直接操作** SoundTouch 实例，只把目标值写入滤镜结构体里
+  几个普通字段（`pending_semitones`、`pending_sample_rate`、`pending_channels`）——这几个
+  都是简单标量，和 `gain-filter.c`/`compressor-filter.c` 里 `update()` 直接写
+  `multiple`/`ratio`/`threshold` 等字段一样，允许偶尔的"读到一半"撞车，后果最多是晚一次
+  回调才生效，不是内存安全问题。
+- `filter_audio()`（音频线程）每次调用先比较 `pending_*` 与"已生效"值：半音值变化直接
+  调用 `setPitchSemiTones()`；采样率或声道数变化则需要重建 SoundTouch 实例并清空所有
+  deque（视为新的一段音频，做法同 `noise-suppress-filter.c` 的 `reset_data`）。
+  由于创建/销毁/设置/处理全部只发生在音频线程内部，不存在跨线程争用同一个 C++ 对象的
+  场景，不需要 `compressor-filter.c` 那种为 `weak_sidechain`（一个会被两个线程交替
+  写入/读取的指针）准备的 mutex——AudioShift 没有类似的跨线程指针。
 
 ### 5.2 缓冲与延迟补偿
 
@@ -161,22 +180,29 @@ SoundTouch 内部维护 FIFO，`putSamples`/`receiveSamples` 不保证每次调�
 
 ```text
 filter_audio(audio):
-  1. interleave audio->data[*][0..frames) 到 scratch
-  2. st_put_samples(st, scratch, frames)
-  3. 循环 st_receive_samples 把可取到的输出帧追加进滤镜自带的 output 缓冲（DARRAY）
-  4. 若 output 缓冲中累积帧数 < audio->frames：返回 NULL（按 filter_audio 文档允许的
-     "推迟输出"语义），等待后续调用补足
-  5. 否则从 output 缓冲头部取出 audio->frames 帧，deinterleave 回自带的
-     struct obs_audio_data 输出对象，timestamp 按累计算法延迟回退
-     （= audio->timestamp - latency_ns，latency_ns 由已缓冲但未吐出的帧数folosi
-     当前采样率换算得到，做法与 noise-suppress 的 `ng->latency` 字段一致）
-  6. 返回该输出对象
+  1. 若 pending_sample_rate/pending_channels 变化：重建 SoundTouch 实例，清空全部 deque
+  2. 若 pending_semitones 变化：st_set_pitch_semitones(st, pending_semitones)
+  3. 把 {audio->frames, audio->timestamp} 推入 info_buffer（同 noise-suppress 的用法）
+  4. interleave audio->data[*][0..frames) 到 scratch
+  5. st_put_samples(st, scratch, frames)；samples_fed += frames
+  6. 循环 st_receive_samples 把可取到的输出帧 deinterleave 后追加进每声道的
+     output_buffers deque；每次成功取出 N 帧，samples_emitted += N
+  7. 查看 info_buffer 队首记录的期望帧数；若 output_buffers[0] 里攒的字节数不够：
+     返回 NULL（按 filter_audio 文档允许的"推迟输出"语义），等待后续调用补足
+  8. 否则弹出 info_buffer 队首记录，从 output_buffers 头部取出对应帧数，deinterleave
+     回滤镜自带的 struct obs_audio_data 输出对象；timestamp 回退量
+     = (samples_fed - samples_emitted) / sample_rate 换算成纳秒
+     （即"已经喂给 SoundTouch 但还没吐出来的帧数"，不是一个固定常量——
+     这是和 `noise-suppress-filter.c` 的关键差异：RNNoise 是固定 10ms 分块器，
+     延迟是常数；SoundTouch 是可变长度 FIFO，必须用累计喂入/吐出帧数差动态算延迟，
+     而不能照抄一个固定的 `ng->latency`）
+  9. 返回该输出对象
 ```
 
-算法引入的恒定延迟（SoundTouch 内部序列长度相关设置，典型用于语音场景可调到数十毫秒
-级，具体数值待阶段 B 用真实参数实测后记录）需要在属性页做只读展示（"预计延迟：~N ms"），
-让用户理解启用变声会给自己的耳返/混听带来多大延迟，这与虚拟背景文档强调"遮罩陈旧度"
-对应的用户可感知延迟是同一类问题。
+算法引入的延迟（SoundTouch 内部序列长度相关设置，典型用于语音场景可调到数十毫秒级，
+具体数值待阶段 B 用真实参数实测后记录）需要在属性页做只读展示（"预计延迟：~N ms"，
+取第 8 步同一个累计差值在稳态下的典型值），让用户理解启用变声会给自己的耳返/混听
+带来多大延迟，这与虚拟背景文档强调"遮罩陈旧度"对应的用户可感知延迟是同一类问题。
 
 切换预设/手动调节半音值时，若不清空 SoundTouch 内部状态直接变更参数，个别实现会在
 过渡瞬间产生明显的音高"打滑"或爆音；需要评估直接变更参数 vs. 变更前先 `flush`+
@@ -218,6 +244,42 @@ filter_audio(audio):
 共振峰变换（formant shifting）或音色转换模型，技术路线和工程量接近另一个独立项目
 （参考 Rubber Band 的 formant-preserving 选项，或 RVC 一类神经网络方案）。P0/P1 都不
 承诺这个方向，留作 P2 的研究课题，视 P0 上线后的用户反馈决定是否投入。
+
+### 6.4 P1：声音模板（温柔男中音 / 甜美女高音 等情感化预设）
+
+用户侧经常用"温柔男中音""甜美女高音"这类带情感/音色形容词的方式描述想要的变声效果，
+而不是直接说"调高 7 个半音"。这类模板**不能只靠 AudioShift 单个滤镜的音高变换实现**：
+
+- "温柔""甜美"这种质感来自音色明暗（EQ）和动态是否平稳（压缩），不是音高本身能给的。
+  纯音高变换只决定"大致音域"，决定不了"听起来柔和还是尖锐"。
+- 固定半音偏移对每个人效果不一致：同样 +7 个半音，原始声音偏低和偏高的两个人，输出
+  落在的实际音域中心是不同的。想要稳定地"听起来像某个目标音域"，理论上需要先实时估计
+  说话人原始基频，再动态计算应偏移的半音数（类似自动校音器的思路），而不是套一个
+  固定数字——这个自适应基频锚定方案工程量显著更大，不作为 P1 范围，列入 P2（见下）。
+
+**P1 推荐架构**：声音模板不在 AudioShift 滤镜内部重新实现 EQ/压缩逻辑（避免和已有的
+`eq-filter.c`/`compressor-filter.c` 重复造轮子），而是做成一层**组合预设**——选中
+"温柔男中音"时，实际是按预先调好的参数表，在同一个音频源上程序化地创建/配置一组滤镜：
+
+```text
+用户选择模板"温柔男中音"
+  -> AudioShift（半音：按模板设定，如 -3）
+  -> 3-Band Equalizer（按模板设定：轻降高频、轻升低频，营造"温柔"质感）
+  -> Compressor（按模板设定：中等比率、较快释放，让音量更平稳）
+  -> （可选）轻混响效果，视听感需要再决定是否引入新滤镜
+```
+
+这一层"按模板批量创建/配置滤镜"的逻辑**不属于 `plugins/obs-filters/`**，需要在
+`frontend/`（滤镜管理 UI 所在的 C++ 代码）新增一个"声音模板"入口，选中后调用 OBS
+前端已有的滤镜增删 API 依次添加/配置上述滤镜链，而不是在 libobs 插件层面处理。这部分
+前端改动的具体落点需要在阶段 E 单独勘查 `frontend/dialogs/OBSBasicFilters.cpp` 一类
+文件后再细化，本文档暂不展开。
+
+**P2 研究方向（不承诺）**：若 P1 的"固定参数模板"听感不够稳定（不同用户原始音域差异
+导致同一模板效果飘忽），可以研究基频检测 + 自适应半音偏移——实时估计输入人声基频
+（如自相关或 YIN 一类算法），计算与目标音域中心的半音差，动态写回 AudioShift 的
+`setPitchSemiTones` 参数。这类似于自动校音器，工程量和复杂度明显超过 P0/P1，仅作为
+后续研究方向记录，不在当前任何已排期阶段内。
 
 ## 7. OBS 属性设计
 
@@ -272,7 +334,9 @@ filter_audio(audio):
 ### 阶段 E（P1，不在首个发布范围内）
 
 1. 机器人 / 空灵回声效果层
-2. 评估是否投入共振峰保留或神经音色转换（P2 方向，需单独立项评估）
+2. 声音模板（见 6.4）：勘查 `frontend/dialogs/OBSBasicFilters.cpp` 一类文件，设计
+   "按模板批量创建/配置 AudioShift + EQ + Compressor 滤镜链"的前端入口
+3. 评估是否投入共振峰保留、自适应基频锚定或神经音色转换（P2 方向，需单独立项评估）
 
 ## 10. 测试要求
 
@@ -363,11 +427,18 @@ P0 不追求"自然"性别转换音质，只做娱乐向角色化变声；若后
 - 现状调研：确认 obsvlive 及 ppobs 均无可复用的音高变换代码或依赖（见文档头部说明）
 - 现有音频滤镜架构、`obs_audio_data` 契约、FIFO/延迟补偿范式的代码走读（见第 4、5 节
   引用的具体文件）
+- SoundTouch 官方仓库地址（`codeberg.org/soundtouch/soundtouch`）、最新版本号
+  （2.4.1）、LGPL-2.1 许可证、CMake find_package 支持的网络检索核实（见 3.3）
+- `plugins/obs-filters/` 骨架代码（滤镜本体、SoundTouch 桥接层、CMake 接线、
+  中英文 locale）已落地，详见下方"代码落点"一节；因未获得下载第三方源码的许可，
+  `AUDIOSHIFT_HAS_SOUNDTOUCH` 当前始终未定义，滤镜可注册但处理逻辑是直通
 
-### 仍未验证（均为阶段 A 及之后的工作）
+### 仍未验证
 
-- SoundTouch 当前官方仓库地址、版本号、许可证文本的实际核实
-- `obs-filters` target 混合编译 `.c`/`.cpp` 的可行性
-- 实际 CPU 占用、算法延迟的真实测量值（第 8 节数字均为预期范围，非实测）
+- SoundTouch 源码包的实际下载、SHA-256 核验（需要用户明确同意后才能下载第三方文件）
+- `obs-filters` target 混合编译 `.c`/`.cpp` 的可行性——已写出 `.cpp` 桥接文件，但
+  **尚未跑通一次实际编译**确认链接通过（见下方构建验证小节）
+- 实际 CPU 占用、算法延迟的真实测量值（第 8 节数字均为预期范围，非实测）——依赖真实
+  SoundTouch 库接入后才能测
 - 真实人声在各预设下的主观音质评估
 - 长时间直播下的稳定性与内存表现
