@@ -238,10 +238,23 @@ filter_audio(audio):
 | 预设 | 半音偏移 | 说明 |
 |---|---:|---|
 | 自定义 | 用户滑块（-12 ~ +12，步进 0.5） | 默认选项 |
-| 男声变女声 | +7 | 偏娱乐向，非自然共振峰转换（见 2.2） |
-| 女声变男声 / 低沉大叔 | -7 | |
-| 童声 / 萝莉 | +10 | 极端值，预期带"卡通化"音色 |
-| 怪物 / 巨人 | -10 | 极端值 |
+| 男声变女声 | +9 | 偏娱乐向，非自然共振峰转换（见 2.2） |
+| 女声变男声 / 低沉大叔 | -8 | |
+| 童声 / 萝莉 | +12 | 经典"花栗鼠"值，预期带明显"卡通化"音色 |
+| 怪物 / 巨人 | -12 | |
+
+数值依据：没有共振峰校正时，小幅偏移听起来只是"同一个声音带点抖动"，不足以让人
+感觉像换了个角色；因此这组预设刻意选在"明显被调高/调低、略显卡通"的区间，而不是
+"共振峰校正后才成立"的自然区间（据公开资料，纯音高工具男声变女声常用 +8~+12，
+"+12 不做共振峰校正"正是典型的"花栗鼠"效果；女声变男声在 -4~-5 已能被感知为男声，
+更深沉则需要更大偏移）。这些数值仍是**调研得出的估值，不是真人试听验证过的结果**
+——本文档编写环境没有音频播放能力，无法实际听感确认，阶段 C 仍需用真实人声复核。
+另外需要注意：很多消费级变声工具会把"调低音高"和"放慢语速"捆绑在一起实现（本质是
+简单的变速播放），这会让"低沉"效果同时伴随说话变慢；AudioShift 用 SoundTouch 把
+音高和时长解耦（`setTempo` 恒为 1.0，见 4.2），-12 只会变低沉，不会变慢，这点和多数
+简单实现不同。
+
+参考：[Male to Female Voice Changer: Sound Convincingly Feminine](https://voxbooster.com/blog/male-to-female-voice-changer-guide/)
 
 具体偏移量需在阶段 C 用真实人声试听调整，上表为初始设计值，不是最终定案。
 
@@ -314,13 +327,39 @@ filter_audio(audio):
 
 ## 8. 性能
 
-本节在编码前只能给出**预期范围与待验证项**，不编造尚未测得的具体数字：
+### 8.1 已实测：CPU 占用与算法延迟
 
-| 指标 | 预期 | 验证方式 |
-|---|---|---|
-| 单声道/立体声典型 CPU 占用 | 远低于 ONNX 推理滤镜，预计可忽略不计 | 阶段 B 用 `matting-bench.c` 同类手法写一个 `audioshift-bench.c` 基准测试 |
-| 算法引入延迟 | 预计数十毫秒级，具体取决于 SoundTouch 的 `SEQUENCE_MS`/`SEEKWINDOW_MS`/`OVERLAP_MS` 设置 | 阶段 B 实测并记录，决定是否需要针对语音场景调低默认序列长度以换取更低延迟 |
-| 极端半音值下的音质 | 预计出现"金属声"/颤音类伪影（WSOLA 的已知局限），需要试听评估可接受范围 | 阶段 C 真实人声试听 |
+`audioshift-bench.c`（`ENABLE_TEST_INPUT` 下的基准测试，直接驱动
+`audioshift-soundtouch.h` 的桥接层，不经过 OBS 滤镜回调）在本机（见
+`BUILD_NOTE.md` 的环境）用 48kHz、480 帧/块（对应 OBS 典型的 10ms 音频包）实测：
+
+| 配置 | 单块处理耗时（均值） | 单块处理耗时（最大值） | 算法引入延迟 |
+|---|---:|---:|---:|
+| 立体声 +9 半音 | 26.9 µs | 222.6 µs | ~91.4 ms |
+| 立体声 -12 半音 | 33.1 µs | 162.5 µs | ~32.0 ms |
+| 立体声 0 半音（不变调） | 17.7 µs | 87.9 µs | ~63.0 ms |
+| 单声道 +9 半音 | 23.5 µs | 129.3 µs | ~91.0 ms |
+
+CPU 占用结论：单块耗时均值在 17~33 微秒，相对 10ms（10000 微秒）的预算占比低于
+0.4%，即使取最坏观测值（222.6 微秒）也只占预算的 2.2%——**CPU 占用确认可忽略**，
+不需要为此单独做性能优化。
+
+算法延迟结论（**和编码前的预期不一致，需要在阶段 C 处理**）：延迟并不是一个
+数十毫秒的稳定数字，而是随半音偏移量变化，在本次实测里从 32ms 到 91ms 不等，且
+即使半音偏移为 0（不变调）也有 63ms 延迟——说明延迟主要来自 SoundTouch 默认的
+`SEQUENCE_MS`/`SEEKWINDOW_MS`/`OVERLAP_MS` 窗口设置（面向音乐场景调的默认值），
+不是音高变换本身的必然代价。90ms 级的延迟对直播场景里"边说话边通过耳返听自己"
+的场景会是能明显感知的卡顿感。阶段 C 需要评估调低这三个窗口参数（SoundTouch 文档
+里明确提到可以为语音场景调小）换取更低延迟，并重新跑一遍 `audioshift-bench.c`
+确认改善幅度，再据此决定 §7 的"预计延迟"展示文案是否需要默认提示用户"当前设置下
+延迟较高，建议调整"。
+
+### 8.2 仍未验证
+
+| 指标 | 说明 |
+|---|---|
+| 极端半音值下的音质 | 预计出现"金属声"/颤音类伪影（WSOLA 的已知局限），需要真人试听评估可接受范围——本文档编写环境没有音频播放能力，无法确认 |
+| 真实语音信号下的延迟是否与上表的合成正弦波一致 | `audioshift-bench.c` 用的是固定频率正弦波，真实语音的瞬态和谐波结构更复杂，WSOLA 的延迟特性可能不同 |
 
 ## 9. 分阶段实施
 
@@ -360,7 +399,21 @@ filter_audio(audio):
 
 ## 10. 测试要求
 
-### 功能测试
+### 已落地的自动化测试
+
+`audioshift-filter-test.c`（`ENABLE_TEST_INPUT`，纯逻辑单元测试，已跑通）：
+
+- 四个预设的半音映射值，以及未知/空字符串预设回退到 0（而不是沿用上一个值）
+- 交织：多声道 planar 输入到交织缓冲区的下标映射
+- 交织时某声道 `data[c]` 为 `NULL`（OBS 未提供该声道）时安全输出 0，不解引用空指针
+- 交织→反交织往返，每个声道的数据精确还原
+
+`audioshift-bench.c`（`ENABLE_TEST_INPUT`，性能基准，已跑通，结果见 8.1）——这两个
+测试覆盖的是"纯函数逻辑正确"和"CPU/延迟数量级"，**不覆盖**下面列出的功能/质量/
+稳定性测试：那些都需要在真实 OBS 界面里操作真实音频源，本次会话没有启动
+`obs64.exe` 验证过。
+
+### 功能测试（仍需人工在 OBS 里验证）
 
 - 挂载到麦克风、桌面音频、媒体源音轨
 - 预设切换、手动滑块调节（包括直播中热切换）
@@ -386,7 +439,7 @@ filter_audio(audio):
 
 | 风险 | 影响 | 应对 |
 |---|---|---|
-| LGPL 动态链接义务未满足 | 发行合规风险 | 严格动态链接 + 随包附带许可证文本，阶段 A 落实 |
+| LGPL 义务未满足 | 发行合规风险 | **已落实**：改为 vendor 完整源码静态编译进 `obs-filters.dll`（见 3.3/3.4），比动态链接更直接地满足对应源码义务，许可证文本随 `soundtouch/COPYING.TXT` 保留 |
 | 极端音高下伪影明显 | 用户体验差 | 限制预设的默认偏移范围，"自定义"滑块允许用户自行承担极端效果 |
 | 预设/参数热切换爆音 | 直播翻车 | 评估切换时机是否需要短暂静音过渡或内部状态重置 |
 | C/C++ 混合编译引入构建问题 | 延误交付 | 阶段 A 先用最小空实现验证，再开始实际滤镜逻辑开发 |
@@ -399,24 +452,25 @@ filter_audio(audio):
 
 ```text
 plugins/obs-filters/audioshift-filter.c              滤镜主体（properties、FIFO、延迟补偿）
+plugins/obs-filters/audioshift-filter.h              纯逻辑 helper（预设表、交织/反交织），供测试复用
+plugins/obs-filters/audioshift-filter-test.c         单元测试（ENABLE_TEST_INPUT），只链 .h，不链 .c
+plugins/obs-filters/audioshift-bench.c               真实 CPU/延迟基准（ENABLE_TEST_INPUT），见 8.1
 plugins/obs-filters/audioshift-soundtouch.cpp / .h   SoundTouch C++ API 的 C 封装
 plugins/obs-filters/cmake/soundtouch.cmake           依赖查找 + vendored 源码对象库构建
 plugins/obs-filters/soundtouch/                      vendored SoundTouch 2.4.1 源码子集
 plugins/obs-filters/soundtouch/VENDORED-FROM.md      版本/commit/裁剪范围记录（见 3.4）
 ```
 
-未新增 `audioshift-filter.h`：和 `gain-filter.c`/`compressor-filter.c`/
-`noise-suppress-filter.c` 等既有简单音频滤镜一样，`struct obs_source_info` 直接在
-`.c` 文件里定义，只在 `obs-filters.c` 里 `extern` 声明，不需要单独的头文件——只有
-跨文件共享的辅助模块（如 `background-mask.h`）才有头文件，AudioShift 目前没有这种
-共享需求。
-
-尚未新增（P0 范围内，暂缓）：
-
-```text
-plugins/obs-filters/audioshift-bench.c               性能基准（ENABLE_TEST_INPUT）
-plugins/obs-filters/audioshift-filter-test.c         滤镜逻辑单元测试（ENABLE_TEST_INPUT）
-```
+**为什么加了 `audioshift-filter.h`**：`gain-filter.c`/`compressor-filter.c`/
+`noise-suppress-filter.c` 等既有简单音频滤镜确实都没有头文件，最初也是照这个惯例做
+的。但真正写单元测试时发现问题：`audioshift-filter.c` 的 `audioshift_name()` 调用
+`obs_module_text()`，这个符号只有在 `obs-filters.c` 跑过
+`OBS_MODULE_USE_DEFAULT_LOCALE()` 宏之后才存在——测试程序如果链接整个
+`audioshift-filter.c`，链接器就会要求解析这个符号，而把 `obs-filters.c` 也链进来
+又会级联要求链接它 `extern` 引用的全部 ~30 个其它滤镜的 `struct obs_source_info`。
+解决办法是把三个纯逻辑函数（预设查表、交织、反交织）改成 `static inline` 直接定义在
+头文件里（和 `libobs/util/deque.h` 的做法一致），测试程序只 `#include` 这个头文件，
+完全不需要链接 `audioshift-filter.c`/`audioshift-soundtouch.cpp`/SoundTouch。
 
 ### 12.2 已修改文件
 
@@ -444,7 +498,8 @@ plugins/obs-filters/async-delay-filter.c      延迟/环形缓冲思路（P1 回
 该方案满足：
 
 - 本地离线处理，无云服务依赖
-- 依赖单一、成熟、许可证路径清晰（LGPL-2.1，动态链接合规即可商用）
+- 依赖单一、成熟、许可证路径清晰（LGPL-2.1，源码已 vendor 进本仓库静态编译，合规
+  路径比动态链接更直接）
 - 可挂载到任意音频源，与现有音频滤镜（降噪/压缩/限幅）自由叠加
 - 不新增 GPU/神经网络相关的分发与兼容性负担
 - 为 P1（效果层）和 P2（自然共振峰/音色转换，待评估）预留清晰的扩展边界
@@ -477,14 +532,24 @@ P0 不追求"自然"性别转换音质，只做娱乐向角色化变声；若后
      `build_x64/plugins/obs-filters/RelWithDebInfo/obs-filters.dll`，没有报错或
      警告。`§4.2` 里记录的 API 签名假设（`uint` 类型、`setPitchSemiTones(double)`
      重载选择等）都在真实头文件下被验证为正确，不需要修正
+- `audioshift-filter-test.c` 四项纯逻辑单元测试已跑通（退出码 0，无断言失败，见
+  10 节）
+- **实际 CPU 占用与算法延迟已实测**（`audioshift-bench.c`，见 8.1 完整数据）：
+  CPU 占用在 48kHz/480 帧块下均值 17~33 微秒，远低于 10ms 预算，可忽略；算法延迟
+  实测 32~91ms（随半音偏移量变化），比"数十毫秒级"的编码前预期更高且波动更大，
+  已记录为阶段 C 需要处理的问题（调低 SoundTouch 窗口参数）而不是直接采用默认值
 
 ### 仍未验证
 
-- 实际 CPU 占用、算法延迟的真实测量值（第 8 节数字均为预期范围，非实测）
-- 真实人声在各预设下的主观音质评估——目前只验证了"能编译链接"，没有验证过
-  "处理出来的声音是否真的符合预期"
+- 真实人声在各预设下的主观音质评估——`audioshift-bench.c` 用的是合成正弦波，只能
+  验证"跑得动、延迟多少"，不能验证"听起来像不像预期的角色"；本文档编写环境没有
+  音频播放能力，无法替代真人试听
+- 真实语音信号下延迟是否与合成正弦波的实测结果一致（见 8.2）
 - 长时间直播下的稳定性与内存表现
-- 滤镜在 OBS 实际界面中能否正常添加、显示属性面板、处理真实音频流（本次只验证了
-  编译链接，没有启动 `obs64.exe` 做运行期验证）
+- 滤镜在 OBS 实际界面中能否正常添加、显示属性面板、处理真实音频流——
+  `audioshift-filter-test.c`/`audioshift-bench.c` 都是独立命令行程序，直接调用
+  `audioshift-soundtouch.h` 或纯逻辑函数，不经过 `obs_register_source` 之后的真实
+  滤镜生命周期（`create`/`update`/`filter_audio`/`destroy` 由 OBS 调度），本次
+  仍没有启动 `obs64.exe` 做运行期验证
 - vendored 对象库在非 Windows/非 MSVC 平台（若 ppobs 未来扩展到那些平台）上的
   编译情况——本次验证只覆盖了 BUILD_NOTE.md 记载的 Windows + VS 2026 环境

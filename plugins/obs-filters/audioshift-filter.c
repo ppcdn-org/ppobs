@@ -6,6 +6,7 @@
 #include <util/deque.h>
 #include <util/dstr.h>
 
+#include "audioshift-filter.h"
 #include "audioshift-soundtouch.h"
 
 /* -------------------------------------------------------- */
@@ -21,11 +22,9 @@
 #define S_PITCH_SEMITONES "pitch_semitones"
 #define S_LATENCY_INFO "latency_info"
 
-#define S_PRESET_CUSTOM "custom"
-#define S_PRESET_MALE_TO_FEMALE "male_to_female"
-#define S_PRESET_FEMALE_TO_MALE "female_to_male"
-#define S_PRESET_CHILD "child"
-#define S_PRESET_MONSTER "monster"
+/* S_PRESET_CUSTOM / S_PRESET_MALE_TO_FEMALE / etc. come from
+ * audioshift-filter.h, shared with the preset-to-semitone lookup table
+ * defined there. */
 
 #define MT_ obs_module_text
 #define TEXT_PRESET MT_("AudioShift.Preset")
@@ -49,20 +48,6 @@
 #define AUDIOSHIFT_DRAIN_FRAMES 1024
 
 /* -------------------------------------------------------- */
-
-struct audioshift_preset {
-	const char *id;
-	float semitones;
-};
-
-/* Semitone offsets only; see docs/audioshift-design.md §6.1. Values are
- * initial design picks, to be re-tuned against real voices in Stage C. */
-static const struct audioshift_preset audioshift_presets[] = {
-	{S_PRESET_MALE_TO_FEMALE, 7.0f},
-	{S_PRESET_FEMALE_TO_MALE, -7.0f},
-	{S_PRESET_CHILD, 10.0f},
-	{S_PRESET_MONSTER, -10.0f},
-};
 
 struct audioshift_info {
 	uint32_t frames;
@@ -104,15 +89,6 @@ struct audioshift_data {
 };
 
 /* -------------------------------------------------------- */
-
-static float audioshift_preset_semitones(const char *preset)
-{
-	for (size_t i = 0; i < sizeof(audioshift_presets) / sizeof(audioshift_presets[0]); i++) {
-		if (strcmp(audioshift_presets[i].id, preset) == 0)
-			return audioshift_presets[i].semitones;
-	}
-	return 0.0f;
-}
 
 static const char *audioshift_name(void *unused)
 {
@@ -178,23 +154,6 @@ static void audioshift_destroy(void *data)
 	bfree(as->deinterleave_tmp);
 	da_free(as->output_data);
 	bfree(as);
-}
-
-static inline void audioshift_interleave(const struct obs_audio_data *audio, size_t channels, float *out)
-{
-	float **in = (float **)audio->data;
-
-	for (uint32_t i = 0; i < audio->frames; i++) {
-		for (size_t c = 0; c < channels; c++)
-			out[i * channels + c] = in[c] ? in[c][i] : 0.0f;
-	}
-}
-
-static inline void audioshift_deinterleave_channel(const float *interleaved, size_t channels, size_t channel,
-						    uint32_t frames, float *out)
-{
-	for (uint32_t i = 0; i < frames; i++)
-		out[i] = interleaved[i * channels + channel];
 }
 
 static void audioshift_reconfigure(struct audioshift_data *as, uint32_t sample_rate, size_t channels)

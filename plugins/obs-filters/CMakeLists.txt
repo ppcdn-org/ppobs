@@ -141,4 +141,24 @@ if(ENABLE_TEST_INPUT)
       )
     endforeach()
   endif()
+
+  # The functions under test are defined directly in audioshift-filter.h as
+  # static inline (like util/deque.h), precisely so this test doesn't need
+  # to link audioshift-filter.c itself: that file's audioshift_name() calls
+  # obs_module_text(), which only exists once OBS_MODULE_USE_DEFAULT_LOCALE()
+  # has run in obs-filters.c -- pulling that in would mean linking every
+  # other filter's .c file too, just to satisfy the linker.
+  add_executable(audioshift-filter-test audioshift-filter-test.c)
+  target_link_libraries(audioshift-filter-test PRIVATE OBS::libobs)
+  add_test(NAME audioshift-filter COMMAND audioshift-filter-test)
+  set_target_properties(audioshift-filter-test PROPERTIES FOLDER tests)
+
+  # Real CPU-cost measurement for the SoundTouch path; skips itself
+  # (see audioshift-bench.c) when no real SoundTouch was built.
+  if(TARGET SoundTouch::SoundTouch)
+    add_executable(audioshift-bench audioshift-soundtouch.cpp audioshift-bench.c)
+    target_compile_definitions(audioshift-bench PRIVATE AUDIOSHIFT_HAS_SOUNDTOUCH=1)
+    target_link_libraries(audioshift-bench PRIVATE OBS::libobs SoundTouch::SoundTouch)
+    set_target_properties(audioshift-bench PROPERTIES FOLDER tests)
+  endif()
 endif()
