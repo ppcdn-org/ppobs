@@ -61,6 +61,7 @@ enum class ListOpt : int {
 	SRT,
 	Custom,
 	WHIP,
+	ERTMP,
 };
 
 enum class Section : int {
@@ -83,9 +84,35 @@ inline bool OBSBasicSettings::IsSRT() const
 	return ui->service->currentData().toInt() == (int)ListOpt::SRT;
 }
 
+// ERTMP is Enhanced RTMP multitrack - OBS Enhanced Broadcasting's one-RTMP-
+// connection ABR ladder (see docs/design/
+// rtmp-ertmp-multitrack-simulcast-design.zh-CN.md). Like SRT, it's really
+// just "自定义/Custom" with a particular URL convention and default
+// template; the three are otherwise identical rtmp_custom services (see
+// IsRTMPCustomFamily). Unlike SRT, its Server URL scheme (rtmp://) is
+// indistinguishable from a plain Custom rtmp:// URL, so - unlike SRT's
+// srt://-prefix sniff in LoadStream1Settings - round-tripping which one was
+// selected needs its own persisted "is_ertmp" marker in the service
+// settings (see SaveStream1Settings/LoadStream1Settings).
+inline bool OBSBasicSettings::IsERTMP() const
+{
+	return ui->service->currentData().toInt() == (int)ListOpt::ERTMP;
+}
+
+// IsRTMPCustomFamily groups the three ListOpt entries that are all, under
+// the hood, the same "rtmp_custom" service/output (see SaveStream1Settings'
+// service_id selection) - differing only in default URL template and
+// Simulcast-ladder presentation, never in what gets created. Used
+// throughout this file wherever Custom-or-SRT was previously checked, since
+// ERTMP always belongs in that same bucket.
+bool OBSBasicSettings::IsRTMPCustomFamily() const
+{
+	return IsCustomService() || IsERTMP() || IsSRT();
+}
+
 bool OBSBasicSettings::IsWHIPSimulcast() const
 {
-	return IsWHIP() || IsSRT() || IsCustomService();
+	return IsWHIP() || IsRTMPCustomFamily();
 }
 
 void OBSBasicSettings::UpdateWHIPSimulcastControls()
@@ -207,13 +234,19 @@ void OBSBasicSettings::LoadStream1Settings()
 	}
 
 	if (is_rtmp_custom) {
-		// SRT and Custom both use rtmp_custom as the service type.
-		// Distinguish by checking if the server URL starts with srt://.
+		// SRT, ERTMP and Custom all use rtmp_custom as the service type.
+		// SRT is told apart by its srt:// server URL prefix; ERTMP's
+		// server URL (rtmp://) looks exactly like a plain Custom one, so
+		// it instead carries its own "is_ertmp" marker (see
+		// SaveStream1Settings) - checked first since a URL-prefix sniff
+		// can't distinguish it.
 		{
 			int idx = ui->service->findData(
-				server && strncmp(server, "srt://", 6) == 0
-					? (int)ListOpt::SRT
-					: (int)ListOpt::Custom);
+				obs_data_get_bool(settings, "is_ertmp")
+					? (int)ListOpt::ERTMP
+					: (server && strncmp(server, "srt://", 6) == 0)
+						  ? (int)ListOpt::SRT
+						  : (int)ListOpt::Custom);
 			ui->service->setCurrentIndex(idx >= 0 ? idx : 0);
 		}
 		lastServiceIdx = ui->service->currentIndex();
@@ -384,15 +417,19 @@ void OBSBasicSettings::SwapMultiTrack(const char *protocol)
 
 void OBSBasicSettings::SaveStream1Settings()
 {
-	bool customServer = IsCustomService() || IsSRT();
+	bool customServer = IsRTMPCustomFamily();
 	bool whip = IsWHIP();
 
-	// An empty SRT Server URL is filled with the PPCenter template that asks
-	// for the Origin address at stream start (utility/PPCDNPublishEndpoint.hpp)
-	// rather than saved as an unusable empty/loose URL.
+	// An empty SRT/ERTMP Server URL is filled with the PPCenter template that
+	// asks for the Origin address at stream start
+	// (utility/PPCDNPublishEndpoint.hpp) rather than saved as an unusable
+	// empty/loose URL.
 	QString customEndpoint = ui->customServer->text().trimmed();
 	if (IsSRT() && customEndpoint.isEmpty()) {
 		customEndpoint = PPCDN_SRT_DEFAULT_PUBLISH_URL;
+		ui->customServer->setText(customEndpoint);
+	} else if (IsERTMP() && customEndpoint.isEmpty()) {
+		customEndpoint = PPCDN_ERTMP_DEFAULT_PUBLISH_URL;
 		ui->customServer->setText(customEndpoint);
 	}
 
@@ -445,6 +482,12 @@ void OBSBasicSettings::SaveStream1Settings()
 			obs_data_set_string(settings, "username", QT_TO_UTF8(ui->authUsername->text()));
 			obs_data_set_string(settings, "password", QT_TO_UTF8(ui->authPw->text()));
 		}
+		// ERTMP's Server URL scheme (rtmp://) is indistinguishable from a
+		// plain Custom rtmp:// URL - unlike SRT, which LoadStream1Settings
+		// tells apart by its srt:// prefix - so this marker is the only way
+		// to round-trip which one was selected. See IsERTMP's comment.
+		if (IsERTMP())
+			obs_data_set_bool(settings, "is_ertmp", true);
 	}
 
 	if (!!auth && strcmp(auth->service(), "Twitch") == 0) {
@@ -570,7 +613,7 @@ void OBSBasicSettings::SaveStream1Settings()
 
 	auto oldMultitrackVideoSetting = config_get_bool(main->Config(), "Stream1", "EnableMultitrackVideo");
 
-	if (!IsCustomService() && !IsSRT()) {
+	if (!IsRTMPCustomFamily()) {
 		OBSDataAutoRelease settings = obs_data_create();
 		obs_data_set_string(settings, "service", QT_TO_UTF8(ui->service->currentText()));
 		OBSServiceAutoRelease temp_service =
@@ -827,7 +870,7 @@ void OBSBasicSettings::WHIPSimulcastLayerFollowMainToggled(size_t layerIdx, bool
 
 void OBSBasicSettings::UpdateMoreInfoLink()
 {
-	if (IsCustomService() || IsSRT() || IsWHIP()) {
+	if (IsRTMPCustomFamily() || IsWHIP()) {
 		ui->moreInfoButton->hide();
 		return;
 	}
@@ -878,7 +921,7 @@ void OBSBasicSettings::UpdateKeyLink()
 	} else if (IsWHIP()) {
 		ui->streamKeyLabel->setText(QTStr("Basic.AutoConfig.StreamPage.BearerToken"));
 		ui->streamKeyLabel->setToolTip("");
-	} else if (!IsCustomService() && !IsSRT()) {
+	} else if (!IsRTMPCustomFamily()) {
 		ui->streamKeyLabel->setText(QTStr("Basic.AutoConfig.StreamPage.StreamKey"));
 		ui->streamKeyLabel->setToolTip("");
 	} else {
@@ -941,9 +984,12 @@ void OBSBasicSettings::LoadServices(bool showAll)
 				     QVariant((int)ListOpt::ShowAll));
 	}
 
-	// Ordered SRT, WHIP, Custom... - inserted back-to-front so each
+	// Ordered SRT, WHIP, ERTMP, Custom... - inserted back-to-front so each
 	// insertItem(0, ...) doesn't have to account for the ones before it.
+	// ERTMP needs no obs_is_output_protocol_registered gate (unlike WHIP,
+	// an optional plugin): it's the base RTMP output, always built in.
 	ui->service->insertItem(0, QTStr("Basic.AutoConfig.StreamPage.Service.Custom"), QVariant((int)ListOpt::Custom));
+	ui->service->insertItem(0, QTStr("ERTMP"), QVariant((int)ListOpt::ERTMP));
 	if (obs_is_output_protocol_registered("WHIP")) {
 		ui->service->insertItem(0, QTStr("WHIP"), QVariant((int)ListOpt::WHIP));
 	}
@@ -1033,7 +1079,7 @@ void OBSBasicSettings::SwapStreamDestinationField()
 		break;
 	}
 
-	if (IsCustomService() || IsSRT()) {
+	if (IsRTMPCustomFamily()) {
 		ui->customServer->setText(customServiceEndpoint);
 		ui->key->setText(customServiceKey);
 		ui->useAuth->setChecked(customServiceUseAuth);
@@ -1080,17 +1126,17 @@ void OBSBasicSettings::on_service_currentIndexChanged(int idx)
 
 	if (ServiceSupportsCodecCheck() && UpdateResFPSLimits()) {
 		lastServiceIdx = idx;
-		if (IsCustomService() || IsSRT())
+		if (IsRTMPCustomFamily())
 			lastCustomServer = ui->customServer->text();
 	}
 
-	if (!IsCustomService() && !IsSRT()) {
+	if (!IsRTMPCustomFamily()) {
 		ui->advStreamTrackWidget->setCurrentWidget(ui->streamSingleTracks);
 	} else {
 		SwapMultiTrack(QT_TO_UTF8(protocol));
 	}
 
-	if (IsWHIP() || IsCustomService() || IsSRT()) {
+	if (IsWHIP() || IsRTMPCustomFamily()) {
 		ui->ppcenterGroupBox->show();
 	} else {
 		ui->ppcenterGroupBox->hide();
@@ -1116,7 +1162,7 @@ void OBSBasicSettings::on_customServer_textChanged(const QString &)
 void OBSBasicSettings::ServiceChanged(bool resetFields)
 {
 	std::string service = QT_TO_UTF8(ui->service->currentText());
-	bool custom = IsCustomService() || IsSRT();
+	bool custom = IsRTMPCustomFamily();
 	bool whip = IsWHIP();
 
 	ui->disconnectAccount->setVisible(false);
@@ -1171,6 +1217,9 @@ QString OBSBasicSettings::FindProtocol()
 {
 	if (IsSRT())
 		return QString("SRT");
+
+	if (IsERTMP())
+		return QString("RTMP");
 
 	if (IsCustomService()) {
 		if (ui->customServer->text().isEmpty())
@@ -1262,7 +1311,7 @@ void OBSBasicSettings::on_authPwShow_clicked()
 
 OBSService OBSBasicSettings::SpawnTempService()
 {
-	bool custom = IsCustomService() || IsSRT();
+	bool custom = IsRTMPCustomFamily();
 	bool whip = IsWHIP();
 	const char *service_id = "rtmp_common";
 
@@ -1423,7 +1472,7 @@ void OBSBasicSettings::on_useStreamKey_clicked()
 
 void OBSBasicSettings::on_useAuth_toggled()
 {
-	if (!IsCustomService() && !IsSRT())
+	if (!IsRTMPCustomFamily())
 		return;
 
 	bool use_auth = ui->useAuth->isChecked();
@@ -1528,7 +1577,7 @@ OBSService OBSBasicSettings::GetStream1Service()
 
 void OBSBasicSettings::UpdateServiceRecommendations()
 {
-	bool customServer = IsCustomService() || IsSRT();
+	bool customServer = IsRTMPCustomFamily();
 	ui->ignoreRecommended->setVisible(!customServer);
 	ui->enforceSettingsLabel->setVisible(!customServer);
 
@@ -1598,7 +1647,7 @@ void OBSBasicSettings::UpdateServiceRecommendations()
 
 void OBSBasicSettings::DisplayEnforceWarning(bool checked)
 {
-	if (IsCustomService() || IsSRT())
+	if (IsRTMPCustomFamily())
 		return;
 
 	if (!checked) {
@@ -1694,7 +1743,7 @@ bool OBSBasicSettings::UpdateResFPSLimits()
 	size_t res_count = 0;
 	int max_fps = 0;
 
-	if (!IsCustomService() && !IsSRT() && !ignoreRecommended) {
+	if (!IsRTMPCustomFamily() && !ignoreRecommended) {
 		OBSService service = GetStream1Service();
 		obs_service_get_supported_resolutions(service, &res_list, &res_count);
 		obs_service_get_max_fps(service, &max_fps);
@@ -1919,7 +1968,7 @@ bool OBSBasicSettings::ServiceAndVCodecCompatible()
 	OBSService service = SpawnTempService();
 	const char **codecs = obs_service_get_supported_video_codecs(service);
 
-	if (!codecs || IsCustomService() || IsSRT()) {
+	if (!codecs || IsRTMPCustomFamily()) {
 		const char *output;
 		char **output_codecs;
 
@@ -1953,7 +2002,7 @@ bool OBSBasicSettings::ServiceAndACodecCompatible()
 
 	// Custom services do not impose a protocol-specific audio codec. Preserve
 	// the encoder selected by the user for custom WHIP, SRT, RIST, or RTMP.
-	if (IsCustomService() || IsSRT())
+	if (IsRTMPCustomFamily())
 		return true;
 
 	OBSService service = SpawnTempService();
@@ -2029,7 +2078,7 @@ bool OBSBasicSettings::ServiceSupportsCodecCheck()
 	bool acodec_compat = ServiceAndACodecCompatible();
 
 	if (vcodec_compat && acodec_compat) {
-		if (lastServiceIdx != ui->service->currentIndex() || IsCustomService() || IsSRT())
+		if (lastServiceIdx != ui->service->currentIndex() || IsRTMPCustomFamily())
 			ResetEncoders(true);
 		return true;
 	}
@@ -2085,7 +2134,7 @@ bool OBSBasicSettings::ServiceSupportsCodecCheck()
 #undef WARNING_VAL
 
 	if (button == QMessageBox::No) {
-		if ((IsCustomService() || IsSRT()) && lastServiceIdx == ui->service->currentIndex())
+		if ((IsRTMPCustomFamily()) && lastServiceIdx == ui->service->currentIndex())
 			QMetaObject::invokeMethod(ui->customServer, "setText", Qt::QueuedConnection,
 						  Q_ARG(QString, lastCustomServer));
 		else
@@ -2114,7 +2163,7 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 	BPtr<char *> output_acodecs;
 	size_t idx = 0;
 
-	if (!vcodecs || IsCustomService() || IsSRT()) {
+	if (!vcodecs || IsRTMPCustomFamily()) {
 		const char *output;
 
 		obs_enum_output_types_with_protocol(QT_TO_UTF8(protocol), &output, return_first_id);
@@ -2122,7 +2171,7 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 		vcodecs = (const char **)output_vcodecs.Get();
 	}
 
-	if (!acodecs && !IsCustomService() && !IsSRT()) {
+	if (!acodecs && !IsRTMPCustomFamily()) {
 		const char *output;
 
 		obs_enum_output_types_with_protocol(QT_TO_UTF8(protocol), &output, return_first_id);

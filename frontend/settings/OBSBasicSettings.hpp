@@ -219,6 +219,8 @@ private:
 	bool IsCustomService() const;
 	inline bool IsWHIP() const;
 	inline bool IsSRT() const;
+	inline bool IsERTMP() const;
+	bool IsRTMPCustomFamily() const;
 	bool IsWHIPSimulcast() const;
 	void UpdateWHIPSimulcastControls();
 	void LoadServices(bool showAll);

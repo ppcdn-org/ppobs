@@ -3,6 +3,8 @@
 
 #include <qt-wrappers.hpp>
 
+#include <QUrl>
+
 #include <util/dstr.h>
 
 #include <nlohmann/json.hpp>
@@ -62,11 +64,39 @@ QString ParseSRTStreamName(const QString &url, const QString &appId)
 	return value.trimmed();
 }
 
-bool IsCustomSRTService(obs_service_t *service)
+// CustomLadderProtocol returns "srt"/"rtmp" for a custom rtmp_custom service
+// whose configured Server URL scheme is one PPCenter can dynamically resolve
+// an Origin address for (see ResolvePPCDNPublishEndpoint), or "" for
+// anything else - WHIP, rtmp_common, or a custom service whose URL resolved
+// to a protocol this feature doesn't cover (RIST/RTMPS). "rtmp" covers both
+// the "ERTMP" service preset and a plain "自定义/Custom" rtmp:// URL alike:
+// they're otherwise indistinguishable at this layer (see
+// OBSBasicSettings_Stream.cpp's ListOpt::ERTMP comment), and both get the
+// same dynamic-resolution behavior when they carry the placeholder.
+std::string CustomLadderProtocol(obs_service_t *service)
 {
 	const char *protocol = obs_service_get_protocol(service);
 	const char *id = obs_service_get_id(service);
-	return protocol && astrcmpi(protocol, "srt") == 0 && id && strcmp(id, "rtmp_custom") == 0;
+	if (!protocol || !id || strcmp(id, "rtmp_custom") != 0)
+		return "";
+	if (astrcmpi(protocol, "srt") == 0)
+		return "srt";
+	if (astrcmpi(protocol, "rtmp") == 0)
+		return "rtmp";
+	return "";
+}
+
+// ParseRTMPStreamName extracts the stream name from an RTMP multitrack
+// publish URL, whose path is "{appId}/{streamName}" with no trailing codec
+// segment (see PPCDN_ERTMP_DEFAULT_PUBLISH_URL) - unlike
+// ParseWHIPStreamNameFromServerUrl's path (.../whip), the stream name here
+// is simply the last path segment.
+QString ParseRTMPStreamName(const QString &url)
+{
+	QStringList segments = QUrl(url.trimmed()).path().split('/', Qt::SkipEmptyParts);
+	if (segments.isEmpty())
+		return QString();
+	return segments.last();
 }
 
 // ppobs's "ppcenter_url" setting may be the bare origin
@@ -95,7 +125,10 @@ std::string NormalizePpcenterPublishUrl(const std::string &url)
 
 bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 {
-	if (!service || !IsCustomSRTService(service))
+	if (!service)
+		return true;
+	const std::string protocol = CustomLadderProtocol(service);
+	if (protocol.empty())
 		return true;
 
 	OBSDataAutoRelease settings = obs_service_get_settings(service);
@@ -104,7 +137,7 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 		return true;
 
 	// Only services configured with the placeholder need a PPCenter round
-	// trip; a literal SRT URL keeps working exactly as before.
+	// trip; a literal SRT/RTMP URL keeps working exactly as before.
 	if (!strstr(rawServer, PPCDN_PUBLISH_ENDPOINT_PLACEHOLDER))
 		return true;
 
@@ -113,17 +146,21 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 	const std::string appSecret = obs_data_get_string(settings, "ppcenter_secret");
 	const std::string region = obs_data_get_string(settings, "ppcenter_region");
 	if (ppcenterURL.empty() || appID.empty() || appSecret.empty()) {
-		error = "PPCenter URL, app ID and app secret are required to resolve the SRT publish node";
+		error = "PPCenter URL, app ID and app secret are required to resolve the " +
+			QString(protocol.c_str()).toUpper().toStdString() + " publish node";
 		return false;
 	}
 
 	// Resolve the stream name from the *expanded* URL (the app id segment is
-	// already substituted there by rtmp_custom_update).
+	// already substituted there by rtmp_custom_update). SRT packs it into the
+	// "?streamid=publish:<appId>/<stream>" query; RTMP's path is plainly
+	// "<appId>/<stream>" with nothing to strip (see ParseRTMPStreamName).
 	const char *expanded = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
-	const QString streamName = ParseSRTStreamName(QT_UTF8(expanded && *expanded ? expanded : rawServer),
-						      QT_UTF8(appID.c_str()));
+	const QString expandedUrl = QT_UTF8(expanded && *expanded ? expanded : rawServer);
+	const QString streamName = protocol == "srt" ? ParseSRTStreamName(expandedUrl, QT_UTF8(appID.c_str()))
+						      : ParseRTMPStreamName(expandedUrl);
 	if (streamName.isEmpty()) {
-		error = "Cannot determine the SRT stream name from the configured URL";
+		error = "Cannot determine the stream name from the configured URL";
 		return false;
 	}
 
@@ -131,7 +168,7 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 		{"appId", appID},
 		{"appSecret", appSecret},
 		{"streamName", streamName.toStdString()},
-		{"protocol", "srt"},
+		{"protocol", protocol},
 	};
 	if (!region.empty())
 		body["requestRegion"] = region;
@@ -150,7 +187,8 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 		return false;
 	}
 	if (status != 200) {
-		error = "PPCenter rejected the SRT publish-node request (HTTP " + std::to_string(status) + ")";
+		error = "PPCenter rejected the " + QString(protocol.c_str()).toUpper().toStdString() +
+			" publish-node request (HTTP " + std::to_string(status) + ")";
 		return false;
 	}
 
@@ -172,13 +210,18 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 	obs_data_set_string(settings, "ppcdn_publish_endpoint", endpoint.c_str());
 	// Persist the resolved stream name for the P2P companion output. The
 	// settings-save path (OBSBasicSettings_Stream.cpp) fills "ppcenter_stream"
-	// with a WHIP URL-*path* parser that returns "" for an SRT
-	// "?streamid=publish:<appId>/<stream>" URL (the name lives in the query,
-	// not the path). That empty value would make the companion's
-	// WHIPOutput::Setup() fail both the NAT probe and ppcenter_resolve_publish
-	// ("stream name required"), leaving the SRT publisher out of the P2P mesh
-	// so every play decision falls back to edge-only. streamName here is parsed
-	// from the *expanded* URL above, so overwrite the empty value with it.
+	// with a WHIP URL-*path* parser (ParseWHIPStreamNameFromServerUrl, which
+	// expects a trailing "/whip" segment) that gets the wrong answer for
+	// both protocols here: "" for SRT's "?streamid=publish:<appId>/<stream>"
+	// URL (the name lives in the query, not the path) and the *appId*
+	// instead of the stream name for RTMP's plain two-segment path (no
+	// "/whip" to offset against). Either wrong value would make the
+	// companion's WHIPOutput::Setup() fail both the NAT probe and
+	// ppcenter_resolve_publish ("stream name required"), leaving the
+	// SRT/RTMP publisher out of the P2P mesh so every play decision falls
+	// back to edge-only. streamName here is parsed from the *expanded* URL
+	// above with the protocol-correct parser, so overwrite the wrong value
+	// with it.
 	obs_data_set_string(settings, "ppcenter_stream", streamName.toStdString().c_str());
 	obs_service_update(service, settings);
 	return true;
