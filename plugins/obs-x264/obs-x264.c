@@ -21,6 +21,7 @@
 #include <util/dstr.h>
 #include <util/darray.h>
 #include <util/platform.h>
+#include <util/threading.h>
 #include <obs-module.h>
 #include <opts-parser.h>
 
@@ -61,6 +62,10 @@ struct obs_x264 {
 
 	uint32_t roi_increment;
 	float *quant_offsets;
+
+	/* Set by obs_x264_request_keyframe() from an arbitrary thread and
+	 * consumed on the encode thread to emit one forced IDR. */
+	volatile bool request_keyframe;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -774,6 +779,16 @@ static void add_roi(struct obs_x264 *obsx264, x264_picture_t *pic)
 	obsx264->roi_increment = increment;
 }
 
+/* Called from an arbitrary thread (e.g. an output reconnect handler); only
+ * records the request so the encode thread emits a single forced IDR. */
+static void obs_x264_request_keyframe(void *data)
+{
+	struct obs_x264 *obsx264 = data;
+
+	if (obsx264)
+		os_atomic_set_bool(&obsx264->request_keyframe, true);
+}
+
 static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct encoder_packet *packet,
 			    bool *received_packet)
 {
@@ -786,8 +801,16 @@ static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct enco
 	if (!frame || !packet || !received_packet)
 		return false;
 
-	if (frame)
+	if (frame) {
 		init_pic_data(obsx264, &pic, frame);
+
+		/* Consume a pending keyframe request (output reconnect) so this
+		 * frame is encoded as an IDR random-access point. */
+		if (os_atomic_load_bool(&obsx264->request_keyframe)) {
+			pic.i_type = X264_TYPE_IDR;
+			os_atomic_set_bool(&obsx264->request_keyframe, false);
+		}
+	}
 
 	if (obs_encoder_has_roi(obsx264->encoder))
 		add_roi(obsx264, &pic);
@@ -861,5 +884,6 @@ struct obs_encoder_info obs_x264_encoder = {
 	.get_extra_data = obs_x264_extra_data,
 	.get_sei_data = obs_x264_sei,
 	.get_video_info = obs_x264_video_info,
+	.request_keyframe = obs_x264_request_keyframe,
 	.caps = OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_ROI,
 };

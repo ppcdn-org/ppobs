@@ -3,6 +3,7 @@
 #include <obs-nal.h>
 #include <util/darray.h>
 #include <util/dstr.h>
+#include <util/threading.h>
 
 /* ========================================================================= */
 
@@ -115,6 +116,16 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 	}
 
 	return true;
+}
+
+/* Called from an arbitrary thread (e.g. an output reconnect handler); only
+ * records the request so the encode thread emits a single forced IDR. */
+static void nvenc_request_keyframe(void *data)
+{
+	struct nvenc_data *enc = data;
+
+	if (enc)
+		os_atomic_set_bool(&enc->request_keyframe, true);
 }
 
 static bool init_session(struct nvenc_data *enc)
@@ -1310,6 +1321,13 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 	if (obs_encoder_has_roi(enc->encoder))
 		add_roi(enc, &params);
 
+	/* Consume a pending keyframe request (output reconnect) so this frame
+	 * is emitted as an IDR. */
+	if (os_atomic_load_bool(&enc->request_keyframe)) {
+		params.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
+		os_atomic_set_bool(&enc->request_keyframe, false);
+	}
+
 	NVENCSTATUS err = nv.nvEncEncodePicture(enc->session, &params);
 	if (err != NV_ENC_SUCCESS && err != NV_ENC_ERR_NEED_MORE_INPUT) {
 		nv_failed(enc->encoder, err, __FUNCTION__, "nvEncEncodePicture");
@@ -1405,6 +1423,7 @@ struct obs_encoder_info h264_nvenc_info = {
 	.get_defaults = h264_nvenc_defaults,
 	.get_properties = h264_nvenc_properties,
 	.get_extra_data = nvenc_extra_data,
+	.request_keyframe = nvenc_request_keyframe,
 	.get_sei_data = nvenc_sei_data,
 };
 
@@ -1426,6 +1445,7 @@ struct obs_encoder_info hevc_nvenc_info = {
 	.get_defaults = hevc_nvenc_defaults,
 	.get_properties = hevc_nvenc_properties,
 	.get_extra_data = nvenc_extra_data,
+	.request_keyframe = nvenc_request_keyframe,
 	.get_sei_data = nvenc_sei_data,
 };
 #endif
@@ -1447,6 +1467,7 @@ struct obs_encoder_info av1_nvenc_info = {
 	.get_defaults = av1_nvenc_defaults,
 	.get_properties = av1_nvenc_properties,
 	.get_extra_data = nvenc_extra_data,
+	.request_keyframe = nvenc_request_keyframe,
 };
 
 struct obs_encoder_info h264_nvenc_soft_info = {
@@ -1462,6 +1483,7 @@ struct obs_encoder_info h264_nvenc_soft_info = {
 	.get_defaults = h264_nvenc_defaults,
 	.get_properties = h264_nvenc_properties,
 	.get_extra_data = nvenc_extra_data,
+	.request_keyframe = nvenc_request_keyframe,
 	.get_sei_data = nvenc_sei_data,
 	.get_video_info = nvenc_soft_video_info,
 };
@@ -1480,6 +1502,7 @@ struct obs_encoder_info hevc_nvenc_soft_info = {
 	.get_defaults = hevc_nvenc_defaults,
 	.get_properties = hevc_nvenc_properties,
 	.get_extra_data = nvenc_extra_data,
+	.request_keyframe = nvenc_request_keyframe,
 	.get_sei_data = nvenc_sei_data,
 	.get_video_info = nvenc_soft_video_info,
 };
@@ -1498,6 +1521,7 @@ struct obs_encoder_info av1_nvenc_soft_info = {
 	.get_defaults = av1_nvenc_defaults,
 	.get_properties = av1_nvenc_properties,
 	.get_extra_data = nvenc_extra_data,
+	.request_keyframe = nvenc_request_keyframe,
 	.get_video_info = nvenc_soft_video_info,
 };
 

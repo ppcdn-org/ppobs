@@ -1233,11 +1233,28 @@ fail:
 	return false;
 }
 
+/* Ask every assigned video encoder for an IDR as soon as possible. On an
+ * output reconnect the SRT connection is a fresh random-access point, but the
+ * encoders keep running across the reconnect, so without this the first frame
+ * a viewer could decode would only arrive at the encoder's next scheduled GOP
+ * keyframe. */
+static void request_video_keyframes(struct ffmpeg_output *stream)
+{
+	for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++) {
+		obs_encoder_t *enc = obs_output_get_video_encoder2(stream->output, i);
+		if (!enc)
+			break;
+		obs_encoder_request_keyframe(enc);
+	}
+}
+
 static bool start(void *data)
 {
 	struct ffmpeg_output *stream = data;
 	if (!set_config(stream))
 		return false;
+
+	request_video_keyframes(stream);
 
 	os_atomic_set_bool(&stream->running, true);
 	os_atomic_set_bool(&stream->stopping, false);

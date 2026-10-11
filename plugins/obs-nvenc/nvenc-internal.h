@@ -116,6 +116,10 @@ struct nvenc_data {
 	struct nvenc_properties props;
 
 	CUcontext cu_ctx;
+
+	/* Set by nvenc_request_keyframe() from an arbitrary thread and consumed
+	 * on the encode thread to emit one forced IDR. */
+	volatile bool request_keyframe;
 };
 
 /* ------------------------------------------------------------------------- */

@@ -568,6 +568,24 @@ void obs_encoder_update(obs_encoder_t *encoder, obs_data_t *settings)
 	}
 }
 
+void obs_encoder_request_keyframe(obs_encoder_t *encoder)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_request_keyframe"))
+		return;
+
+	if (encoder->info.type != OBS_ENCODER_VIDEO)
+		return;
+
+	/* Encoders can be reused while switching output protocols/networks; a
+	 * request that arrives before the plugin has created its context is
+	 * simply dropped - the output that asked for it will get its keyframe
+	 * from the encoder's normal GOP cadence instead. */
+	if (!encoder->context.data || !encoder->info.request_keyframe)
+		return;
+
+	encoder->info.request_keyframe(encoder->context.data);
+}
+
 bool obs_encoder_get_extra_data(const obs_encoder_t *encoder, uint8_t **extra_data, size_t *size)
 {
 	if (!obs_encoder_valid(encoder, "obs_encoder_get_extra_data"))

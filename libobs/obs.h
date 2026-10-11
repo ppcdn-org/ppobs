@@ -2404,6 +2404,16 @@ EXPORT obs_properties_t *obs_encoder_properties(const obs_encoder_t *encoder);
  */
 EXPORT void obs_encoder_update(obs_encoder_t *encoder, obs_data_t *settings);
 
+/**
+ * Requests that the encoder emit a keyframe on its next output frame.
+ *
+ * Used by outputs that need a random access point immediately - e.g. after
+ * a publish reconnect, so the new connection does not have to wait for the
+ * encoder's periodic GOP keyframe. Only video encoders implement this; for
+ * any encoder whose plugin does not implement it, this is a no-op.
+ */
+EXPORT void obs_encoder_request_keyframe(obs_encoder_t *encoder);
+
 /** Gets extra data (headers) associated with this context */
 EXPORT bool obs_encoder_get_extra_data(const obs_encoder_t *encoder, uint8_t **extra_data, size_t *size);
 

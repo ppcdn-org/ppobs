@@ -861,6 +861,15 @@ bool WHIPCodecSession::ReconnectOnce(const char *disconnectReason)
 		if (DoConnect(generation, resourceURL)) {
 			do_log(LOG_INFO, "WHIPCodecSession: reconnected");
 			sending_enabled = true;
+
+			// The reconnected WHIP session is a fresh random-access point,
+			// but the encoders keep running across the reconnect - force an
+			// IDR on every layer so a viewer can decode immediately instead
+			// of waiting for the encoder's next scheduled GOP keyframe.
+			for (obs_encoder_t *layer : video_layers) {
+				if (layer)
+					obs_encoder_request_keyframe(layer);
+			}
 			return true;
 		}
 
