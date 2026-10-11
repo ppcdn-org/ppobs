@@ -189,6 +189,53 @@ static void logP2PVideoNALDiag(const struct encoder_packet *packet)
 	     packet->keyframe ? 1 : 0, n, fmt, head, nals);
 }
 
+static size_t h264StartCodeLength(const uint8_t *data, size_t size, size_t at)
+{
+	if (at + 3 < size && data[at] == 0 && data[at + 1] == 0 && data[at + 2] == 0 && data[at + 3] == 1)
+		return 4;
+	if (at + 2 < size && data[at] == 0 && data[at + 1] == 0 && data[at + 2] == 1)
+		return 3;
+	return 0;
+}
+
+static size_t findH264StartCode(const uint8_t *data, size_t size, size_t from)
+{
+	for (size_t i = from; i + 2 < size; i++) {
+		if (h264StartCodeLength(data, size, i) != 0)
+			return i;
+	}
+	return size;
+}
+
+struct H264ParameterSets {
+	bool hasSPS = false;
+	bool hasPPS = false;
+	std::vector<uint8_t> annexB;
+};
+
+static H264ParameterSets extractH264ParameterSets(const uint8_t *data, size_t size)
+{
+	H264ParameterSets out;
+	size_t at = findH264StartCode(data, size, 0);
+	while (at < size) {
+		const size_t sc = h264StartCodeLength(data, size, at);
+		const size_t nal = at + sc;
+		if (nal >= size)
+			break;
+		const size_t next = findH264StartCode(data, size, nal + 1);
+		const uint8_t type = data[nal] & 0x1f;
+		if (type == 7 || type == 8) {
+			out.annexB.insert(out.annexB.end(), data + at, data + next);
+			out.hasSPS |= type == 7;
+			out.hasPPS |= type == 8;
+		}
+		at = next;
+	}
+	if (!out.hasSPS || !out.hasPPS)
+		out.annexB.clear();
+	return out;
+}
+
 void WHIPOutput::Data(struct encoder_packet *packet)
 {
 	if (!packet) {
@@ -255,6 +302,10 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 				p2pFeedCounters.encoderMatched++;
 
 			if (packet->encoder == p2pVideoEncoder) {
+				const auto parameterSets = extractH264ParameterSets(
+					(const uint8_t *)packet->data, packet->size);
+				if (!parameterSets.annexB.empty())
+					p2pH264ParameterSets = parameterSets.annexB;
 				logP2PVideoNALDiag(packet); // TEMPORARY (2026-09-25) - remove once P2P decode is fixed
 				p2pSignal->ForEachPeer([&](P2PPeer &peer) {
 					if (!peer.videoTrack || !peer.videoTrack->isOpen()) {
@@ -269,12 +320,30 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 					int64_t dur = peer.videoStarted ? packet->dts_usec - peer.lastVideoTimestamp : 0;
 					peer.lastVideoTimestamp = packet->dts_usec;
 					peer.videoStarted = true;
-					std::vector<rtc::byte> sample{(rtc::byte *)packet->data,
-								      (rtc::byte *)packet->data + packet->size};
+					std::vector<rtc::byte> sample;
+					// A forced NVENC IDR does not repeat SPS/PPS. The peer joins
+					// mid-stream, so without the cached parameter sets Chrome sees
+					// plenty of H264 RTP but cannot bind/initialize a decoder
+					// (codec=null, framesDecoded=0).
+					if (packet->keyframe && parameterSets.annexB.empty() &&
+					    !p2pH264ParameterSets.empty()) {
+						sample.reserve(p2pH264ParameterSets.size() + packet->size);
+						const auto *begin = reinterpret_cast<const rtc::byte *>(p2pH264ParameterSets.data());
+						sample.insert(sample.end(), begin, begin + p2pH264ParameterSets.size());
+					}
+					sample.insert(sample.end(), (rtc::byte *)packet->data,
+						      (rtc::byte *)packet->data + packet->size);
 					auto rtp = peer.videoSrReporter->rtpConfig;
 					rtp->sequenceNumber = peer.videoSequenceNumber;
 					rtp->ssrc = peer.videoSsrc;
-					rtp->rid = "0";
+					// P2P carries one video layer and the generated answer does not
+					// advertise an RID RTP header extension. Setting rid here while
+					// ridId remains zero makes the media packetization disagree with
+					// the SDP (Chrome connects and receives the track but never
+					// assembles a decodable frame). WHIP simulcast sets both rid and
+					// ridId after negotiating the extmap; single-layer P2P needs
+					// neither.
+					rtp->rid.reset();
 					rtp->timestamp = advanceRtpTimestamp(rtp, peer.videoRtpTimestamp, dur);
 					try {
 						peer.videoTrack->send(sample);
@@ -295,14 +364,14 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 				});
 			}
 
-			// 2s rollup - fires while video keeps arriving (a live WHIP stream
-			// always does), so a repro shows the feed state at the moment a
-			// viewer is connected.
-			auto now_ms = (int64_t)(obs_get_video_frame_time() / 1000000);
-			if (now_ms - lastP2PFeedLogMs >= 2000) {
-				lastP2PFeedLogMs = now_ms;
-				size_t peers = p2pSignal->PeerCount();
-				blog(LOG_DEBUG,
+		// 2s rollup - fires while video keeps arriving (a live WHIP stream
+		// always does), so a repro shows the feed state at the moment a
+		// viewer is connected.
+		auto now_ms = (int64_t)(obs_get_video_frame_time() / 1000000);
+		if (now_ms - lastP2PFeedLogMs >= 2000) {
+			lastP2PFeedLogMs = now_ms;
+			size_t peers = p2pSignal->PeerCount();
+			blog(LOG_DEBUG,
 				     "[obs-webrtc] [p2p-feed] 2s: videoPkts=%llu encMatch=%llu peers=%zu sent=%llu skipNoTrack=%llu skipNoKey=%llu sendErr=%llu p2pEnc=%p pktEnc=%p key=%d lastTs=%u lastSeq=%u lastDts=%lld",
 				     (unsigned long long)p2pFeedCounters.videoPackets,
 				     (unsigned long long)p2pFeedCounters.encoderMatched, peers,
@@ -1087,6 +1156,14 @@ bool WHIPOutput::StartP2PSignal()
 	p2pSignal = std::make_unique<P2PSignalClient>(p2pSignalUrl, p2pToken, p2pStreamPath, videoCodec, audioCodec,
 						      generate_random_u32(), p2pStunServers, p2pMaxSessions,
 						      [this](bool force) { return AcquireP2PToken(force); });
+	// A peer that just connected needs a decodable frame immediately: the feed
+	// only starts on a keyframe (see P2PPeer::videoStarted), and a viewer that
+	// sees no frame within its grace window falls back to edge. Force one at
+	// connect time instead of waiting for the encoder's scheduled GOP.
+	p2pSignal->SetOnPeerConnected([this]() {
+		if (p2pVideoEncoder)
+			obs_encoder_request_keyframe(p2pVideoEncoder);
+	});
 	p2pSignal->Start();
 	qosPolicy = std::make_unique<UplinkQosPolicy>(UplinkQosConfig{});
 	return true;

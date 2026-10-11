@@ -140,6 +140,11 @@ private:
 	// when no H264 layer is attached, in which case P2P carries no video at
 	// all rather than an undecodable mix of layers.
 	obs_encoder_t *p2pVideoEncoder = nullptr;
+	// NVENC's initial H264 keyframe contains SPS/PPS, but a later forced IDR
+	// (requested when a P2P viewer connects) usually does not. Cache the
+	// Annex-B parameter-set NALs from the opening keyframe and prepend them to
+	// a peer's forced IDR so a mid-stream browser can initialize its decoder.
+	std::vector<uint8_t> p2pH264ParameterSets;
 
 	// TEMPORARY P2P feed diagnostics (2026-09-30): the P2P leg reaches
 	// ICE+DTLS+SRTP connected on both ends but the browser decodes no frame,

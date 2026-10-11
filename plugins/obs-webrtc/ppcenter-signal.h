@@ -69,6 +69,11 @@ public:
 	bool Start();
 	void Stop();
 	void SetOnPeerUpdated(std::function<void()> callback);
+	// Called when a peer's RTCPeerConnection reaches Connected. The publisher
+	// uses it to force a keyframe so the newly-attached viewer can start
+	// decoding immediately instead of waiting for the encoder's next scheduled
+	// IDR (the viewer falls back to edge if no frame arrives in time).
+	void SetOnPeerConnected(std::function<void()> callback);
 	size_t PeerCount();
 	void ForEachPeer(std::function<void(P2PPeer &)> callback);
 	void SendAnswer(const std::string &sessionId, const std::string &sdp);
@@ -98,6 +103,7 @@ private:
 	// number at allocation time; this is the publisher-side backstop.
 	int maxPeers = 3;
 	std::function<void()> onPeerUpdated;
+	std::function<void()> onPeerConnected;
 	std::mutex peersMutex;
 	std::map<std::string, std::shared_ptr<P2PPeer>> peers;
 	std::atomic<bool> running{false};

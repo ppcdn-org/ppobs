@@ -317,6 +317,7 @@ P2PSignalClient::P2PSignalClient(const std::string &url, const std::string &toke
 P2PSignalClient::~P2PSignalClient() { Stop(); }
 
 void P2PSignalClient::SetOnPeerUpdated(std::function<void()> callback) { onPeerUpdated = std::move(callback); }
+void P2PSignalClient::SetOnPeerConnected(std::function<void()> callback) { onPeerConnected = std::move(callback); }
 
 bool P2PSignalClient::Start()
 {
@@ -397,8 +398,29 @@ void P2PSignalClient::HandleOffer(const std::string &sessionId, const std::strin
 	CreatePeerVideo(*peer); CreatePeerAudio(*peer);
 
 	peer->pc->onStateChange([this, sessionId](rtc::PeerConnection::State state) {
-		if (state == rtc::PeerConnection::State::Connected) SendConnected(sessionId);
-		else if (state == rtc::PeerConnection::State::Failed || state == rtc::PeerConnection::State::Disconnected)
+		// Logged so a P2P connection that never reaches Connected is visible:
+		// without this a viewer silently falls back to edge and nothing in the
+		// log explains why.
+		const char *stateName = "unknown";
+		switch (state) {
+		case rtc::PeerConnection::State::New: stateName = "new"; break;
+		case rtc::PeerConnection::State::Connecting: stateName = "connecting"; break;
+		case rtc::PeerConnection::State::Connected: stateName = "connected"; break;
+		case rtc::PeerConnection::State::Disconnected: stateName = "disconnected"; break;
+		case rtc::PeerConnection::State::Failed: stateName = "failed"; break;
+		case rtc::PeerConnection::State::Closed: stateName = "closed"; break;
+		}
+		blog(LOG_INFO, "[ppobs P2P] peer %s connection state: %s", sessionId.c_str(), stateName);
+		if (state == rtc::PeerConnection::State::Connected) {
+			// Force a keyframe so this newly-attached peer can start decoding
+			// immediately instead of waiting for the encoder's next scheduled
+			// IDR (the peer holds its feed until a keyframe - see
+			// P2PPeer::videoStarted - and a viewer that gets no frame in time
+			// falls back to edge).
+			if (onPeerConnected)
+				onPeerConnected();
+			SendConnected(sessionId);
+		} else if (state == rtc::PeerConnection::State::Failed || state == rtc::PeerConnection::State::Disconnected)
 			HandleClose(sessionId);
 	});
 
