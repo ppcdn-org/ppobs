@@ -42,6 +42,15 @@ QString ParseSRTStreamName(const QString &url, const QString &appId)
 	if (comma >= 0)
 		value = value.left(comma);
 
+	// The pathname may also carry the SRT publish token as a third
+	// colon-separated segment ("<appId>/<streamName>:<token>", see
+	// rtmp-services/rtmp-custom.c's inject_ppcdn_publish_token). The appId
+	// and stream-name segments never contain ':', so the first remaining
+	// ':' starts the token. Drop it - PPCenter wants only the stream name.
+	int token = value.indexOf(':');
+	if (token >= 0)
+		value = value.left(token);
+
 	// The pathname is "<appId>/<streamName>"; PPCenter wants the stream name
 	// on its own (<appId> is sent separately). If the appId segment isn't
 	// there, keep the whole value rather than guessing.
@@ -193,9 +202,23 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 	}
 
 	std::string endpoint;
+	std::string publishToken;
+	std::string publishTokenH264;
+	std::string publishTokenHEVC;
 	try {
 		const auto decoded = nlohmann::json::parse(response);
 		endpoint = decoded.value("ppcdnPublishEndpoint", "");
+		publishToken = decoded.value("publishToken", "");
+		// Per-codec SRT tokens for an HEVC/H264 multitrack publish: each SRT
+		// connection carries its own codec path ("<appId>/<stream>/h264" or
+		// ".../hevc"), and mmx binds a token to the exact path (see
+		// ppcenter's PublishTokens). The codec-less publishToken above stays
+		// for a single-codec SRT publish.
+		const auto tokens = decoded.find("publishTokens");
+		if (tokens != decoded.end() && tokens->is_object()) {
+			publishTokenH264 = tokens->value("h264", "");
+			publishTokenHEVC = tokens->value("hevc", "");
+		}
 	} catch (const std::exception &) {
 		error = "PPCenter returned an invalid publish-node response";
 		return false;
@@ -208,6 +231,16 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 	// Write it back into the service settings so rtmp_custom_update expands
 	// the placeholder into the address the output actually connects to.
 	obs_data_set_string(settings, "ppcdn_publish_endpoint", endpoint.c_str());
+	// The SRT publish token (mmx srtPublishTokenRequired) goes into its own
+	// setting so rtmp_custom_update injects it as the streamid's third
+	// segment. Absent for RTMP or an Origin without the check, so store the
+	// value unconditionally (empty clears any stale token from a prior run).
+	obs_data_set_string(settings, "ppcdn_publish_token", publishToken.c_str());
+	// Per-codec SRT tokens, consumed by BasicOutputHandler's
+	// BuildCodecServiceSettings when it derives the /h264 and /hevc publish
+	// services of an HEVC/H264 multitrack publish.
+	obs_data_set_string(settings, "ppcdn_publish_token_h264", publishTokenH264.c_str());
+	obs_data_set_string(settings, "ppcdn_publish_token_hevc", publishTokenHEVC.c_str());
 	// Persist the resolved stream name for the P2P companion output. The
 	// settings-save path (OBSBasicSettings_Stream.cpp) fills "ppcenter_stream"
 	// with a WHIP URL-*path* parser (ParseWHIPStreamNameFromServerUrl, which

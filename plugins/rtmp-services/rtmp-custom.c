@@ -1,10 +1,13 @@
 #include <obs-module.h>
 #include <util/dstr.h>
 
+#include <string.h>
+
 struct rtmp_custom {
 	char *server, *key;
 	char *ppcenter_appid;
 	char *ppcdn_publish_endpoint;
+	char *ppcdn_publish_token;
 	bool use_auth;
 	char *username, *password;
 };
@@ -46,6 +49,59 @@ static char *expand_ppcdn_publish_endpoint(const char *server, const char *endpo
 	return url.array ? url.array : bstrdup("");
 }
 
+/* The SRT publish token (mmx's srtPublishTokenRequired) rides as the third
+ * colon-separated segment of the streamid pathname:
+ * "publish:<appId>/<stream>:<token>". PPCenter mints one per stream start and
+ * the frontend writes it into the "ppcdn_publish_token" service setting (see
+ * frontend/utility/PPCDNPublishEndpoint.cpp). Inject it here, after the
+ * {ppcenter_appid}/{ppcdn_publish_endpoint} placeholders are expanded, rather
+ * than exposing a template placeholder: a Server URL saved before the token
+ * existed still picks it up. A no-op for a missing/empty token, a URL with no
+ * "streamid=", or a streamid whose pathname is not a bare "publish:<appId>/
+ * <stream>" (the action prefix is the only expected ':' otherwise). */
+static char *inject_ppcdn_publish_token(const char *server, const char *token)
+{
+	static const char marker[] = "streamid=";
+	struct dstr url = {0};
+
+	dstr_copy(&url, server ? server : "");
+	if (!url.array)
+		return bstrdup("");
+	if (!token || !*token)
+		return url.array;
+
+	char *value = strstr(url.array, marker);
+	if (!value)
+		return url.array;
+	value += sizeof(marker) - 1;
+
+	/* The streamid value ends at the next '&' (query separator); its
+	 * pathname ends at an SRT field-list ',' when present. Insert before
+	 * whichever comes first. */
+	char *limit = strchr(value, '&');
+	if (!limit)
+		limit = value + strlen(value);
+	char *comma = strchr(value, ',');
+	if (comma && comma < limit)
+		limit = comma;
+
+	/* Expect exactly one ':' in the pathname (the "publish:"/"read:"
+	 * action prefix); a second one means a token is already present. */
+	char *first_colon = memchr(value, ':', (size_t)(limit - value));
+	if (!first_colon)
+		return url.array;
+	if (memchr(first_colon + 1, ':', (size_t)(limit - first_colon - 1)))
+		return url.array;
+
+	struct dstr out = {0};
+	dstr_ncopy(&out, url.array, (size_t)(limit - url.array));
+	dstr_cat(&out, ":");
+	dstr_cat(&out, token);
+	dstr_cat(&out, limit);
+	dstr_free(&url);
+	return out.array ? out.array : bstrdup("");
+}
+
 static const char *rtmp_custom_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -60,16 +116,20 @@ static void rtmp_custom_update(void *data, obs_data_t *settings)
 	bfree(service->key);
 	bfree(service->ppcenter_appid);
 	bfree(service->ppcdn_publish_endpoint);
+	bfree(service->ppcdn_publish_token);
 	bfree(service->username);
 	bfree(service->password);
 
 	service->ppcenter_appid = bstrdup(obs_data_get_string(settings, "ppcenter_appid"));
 	service->ppcdn_publish_endpoint = bstrdup(obs_data_get_string(settings, "ppcdn_publish_endpoint"));
+	service->ppcdn_publish_token = bstrdup(obs_data_get_string(settings, "ppcdn_publish_token"));
 	{
 		char *with_appid = expand_ppcenter_appid(obs_data_get_string(settings, "server"),
 							 service->ppcenter_appid);
-		service->server = expand_ppcdn_publish_endpoint(with_appid, service->ppcdn_publish_endpoint);
+		char *with_endpoint = expand_ppcdn_publish_endpoint(with_appid, service->ppcdn_publish_endpoint);
+		service->server = inject_ppcdn_publish_token(with_endpoint, service->ppcdn_publish_token);
 		bfree(with_appid);
+		bfree(with_endpoint);
 	}
 	service->key = bstrdup(obs_data_get_string(settings, "key"));
 	service->use_auth = obs_data_get_bool(settings, "use_auth");
@@ -85,6 +145,7 @@ static void rtmp_custom_destroy(void *data)
 	bfree(service->key);
 	bfree(service->ppcenter_appid);
 	bfree(service->ppcdn_publish_endpoint);
+	bfree(service->ppcdn_publish_token);
 	bfree(service->username);
 	bfree(service->password);
 	bfree(service);

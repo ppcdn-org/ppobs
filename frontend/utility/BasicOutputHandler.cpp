@@ -271,6 +271,19 @@ static OBSDataAutoRelease BuildCodecServiceSettings(obs_service_t *primary, cons
 		return nullptr;
 
 	obs_data_set_string(settings, "server", WithPublishCodec(server, codec).c_str());
+
+	// SRT ingest can be token-gated on the Origin (mmx srtPublishTokenRequired)
+	// and the token is bound to the exact publish path, so this codec's
+	// connection must carry *its* token, not the primary's codec-less one.
+	// These per-codec settings are filled by ResolvePPCDNPublishEndpoint (see
+	// PPCDNPublishEndpoint.cpp); empty for WHIP/RTMP or an Origin without the
+	// check, in which case the copied primary token is left untouched.
+	const char *codecTokenKey = (codec == std::string("hevc")) ? "ppcdn_publish_token_hevc"
+								   : "ppcdn_publish_token_h264";
+	const std::string codecToken = obs_data_get_string(settings, codecTokenKey);
+	if (!codecToken.empty())
+		obs_data_set_string(settings, "ppcdn_publish_token", codecToken.c_str());
+
 	return settings;
 }
 
