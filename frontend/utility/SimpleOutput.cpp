@@ -862,6 +862,15 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 	if (!multitrackVideo || !multitrackVideoActive)
 		SetupVodTrack(service);
 
+	// RTMP/FLV only carries AAC; swap in a dedicated AAC encoder when the
+	// configured streaming encoder is Opus (see PrepareRTMPAudioEncoder).
+	// audioStreaming stays Opus for StartP2PCompanion below.
+	{
+		const char *protocol = obs_service_get_protocol(service);
+		if (protocol && astrcmpi_n(protocol, RTMP_PROTOCOL, strlen(RTMP_PROTOCOL)) == 0)
+			PrepareRTMPAudioEncoder(streamOutput, service, audioStreaming, 0);
+	}
+
 	// See AdvancedOutput::StartStreaming for why this is here: encoder
 	// initialization below can synchronously open GPU-backed encoder
 	// sessions (e.g. QSV texture-sharing encoders), and we want that to

@@ -1044,6 +1044,11 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	obs_output_set_reconnect_settings(streamOutput, maxRetries, is_whip ? 0 : retryDelay);
 	if (is_rtmp) {
 		SetupVodTrack(service);
+		// RTMP/FLV only carries AAC; swap in a dedicated AAC encoder when
+		// the configured streaming encoder is Opus (see the method's
+		// comment). streamAudioEnc stays Opus for StartP2PCompanion below.
+		PrepareRTMPAudioEncoder(streamOutput, service, streamAudioEnc,
+					config_get_int(main->Config(), "AdvOut", "TrackIndex") - 1);
 	}
 
 	// Video encoder initialization below (obs_output_start ->
