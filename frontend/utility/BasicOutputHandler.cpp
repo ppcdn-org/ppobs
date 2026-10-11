@@ -524,15 +524,24 @@ BasicOutputHandler::BasicOutputHandler(OBSBasic *main_) : main(main_)
 	const bool is_whip = service_protocol && astrcmpi(service_protocol, "WHIP") == 0;
 	const bool is_srt_custom = service_protocol && astrcmpi(service_protocol, "SRT") == 0 &&
 				   strcmp(obs_service_get_id(service), "rtmp_custom") == 0;
+	// ERTMP (the custom RTMP service, i.e. an rtmp:// rtmp_custom publish)
+	// carries the same multitrack ladder as WHIP/SRT: the ABR layers ride
+	// the Enhanced RTMP multitrack messages, so a single ERTMP connection is
+	// enough for the main track and its ladder. rtmp_common (Twitch and
+	// friends) is deliberately excluded - it never gets a PPCDN ladder.
+	const bool is_rtmp_custom = service_protocol && astrcmpi(service_protocol, "rtmp") == 0 &&
+				    strcmp(obs_service_get_id(service), "rtmp_custom") == 0;
+	const bool ladder_transport = is_whip || is_srt_custom || is_rtmp_custom;
 	const int configured_layers = config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers");
-	if ((is_whip || is_srt_custom) && configured_layers > 1)
+	if (ladder_transport && configured_layers > 1)
 		whipSimulcastEncoders = make_unique<WHIPSimulcastEncoders>(4);
 
-	// Same protocol gate as the Simulcast encoders above: only WHIP and
-	// custom SRT can carry a second codec's ladder. Without it the HEVC
-	// encoders were created for every service and attached to the output,
-	// which an RTMP/MPEG-TS muxer then rejected outright.
-	const bool hevc_multitrack = (is_whip || is_srt_custom) &&
+	// Same transport gate as the Simulcast encoders above. When both H264
+	// and HEVC are enabled the two ladders can't share one publish - the
+	// ingest rejects a video-codec mix on a single connection - so they go
+	// out as two connections (the HEVC half on its own /hevc path), exactly
+	// as for custom SRT. See BuildCodecServiceSettings/SetupCompanionStream.
+	const bool hevc_multitrack = ladder_transport &&
 				     config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
 	if (hevc_multitrack)
 		whipHevcEncoders = make_unique<WHIPHevcEncoders>();
