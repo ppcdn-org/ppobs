@@ -462,48 +462,6 @@ void BasicOutputHandler::StopP2PCompanion()
 	p2pService = nullptr;
 }
 
-bool BasicOutputHandler::PrepareRTMPAudioEncoder(obs_output_t *output, obs_service_t *service,
-						 obs_encoder_t *configured, int mixerTrack)
-{
-	if (!output || !service || !configured)
-		return false;
-
-	const char *protocol = obs_service_get_protocol(service);
-	if (!protocol || astrcmpi_n(protocol, RTMP_PROTOCOL, strlen(RTMP_PROTOCOL)) != 0)
-		return false;
-
-	const char *codec = obs_encoder_get_codec(configured);
-	if (codec && strcmp(codec, "aac") == 0)
-		return false; // already AAC (e.g. rtmp_common) - nothing to do
-
-	if (mixerTrack < 0)
-		mixerTrack = 0;
-	if (mixerTrack >= MAX_AUDIO_MIXES)
-		mixerTrack = MAX_AUDIO_MIXES - 1;
-
-	rtmpAudioEnc = obs_audio_encoder_create("ffmpeg_aac", "ppcdn_rtmp_audio", nullptr, mixerTrack, nullptr);
-	if (!rtmpAudioEnc) {
-		blog(LOG_WARNING,
-		     "[PPCDN] RTMP publish needs an AAC audio encoder but creating one failed; the ingest will "
-		     "reject the '%s' audio track",
-		     codec ? codec : "?");
-		return false;
-	}
-	obs_encoder_release(rtmpAudioEnc);
-
-	obs_encoder_set_audio(rtmpAudioEnc, obs_get_audio());
-	OBSDataAutoRelease settings = obs_encoder_get_settings(configured);
-	if (settings)
-		obs_encoder_update(rtmpAudioEnc, settings);
-
-	obs_output_set_audio_encoder(output, rtmpAudioEnc, 0);
-	blog(LOG_INFO,
-	     "[PPCDN] RTMP publish: streaming audio switched to AAC ('%s' -> ffmpeg_aac); RTMP/FLV cannot carry "
-	     "'%s', so the P2P companion keeps that encoder for WebRTC.",
-	     codec ? codec : "?", codec ? codec : "?");
-	return true;
-}
-
 bool BasicOutputHandler::StartCompanionStream()
 {
 	if (!hevcStreamOutput)

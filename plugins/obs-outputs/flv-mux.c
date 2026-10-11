@@ -85,6 +85,15 @@ static void s_wa4cc(struct serializer *s, enum audio_id_t id)
 		s_w8(s, '4');
 		s_w8(s, 'a');
 		break;
+
+	/* Enhanced RTMP audio FourCC (Veovera spec): Opus carried with the
+	 * extended audio header instead of the legacy AAC SoundFormat. */
+	case AUDIO_CODEC_OPUS:
+		s_w8(s, 'O');
+		s_w8(s, 'p');
+		s_w8(s, 'u');
+		s_w8(s, 's');
+		break;
 	}
 }
 
@@ -165,6 +174,19 @@ static inline double encoder_video_codec(obs_encoder_t *encoder)
 	return 0.0;
 }
 
+/* onMetaData audiocodecid: the legacy FLV SoundFormat 10 for AAC, or the
+ * Enhanced RTMP audio FourCC as a number for codecs carried with the extended
+ * audio header (Opus here), mirroring encoder_video_codec above. */
+static inline double encoder_audio_codec(obs_encoder_t *encoder)
+{
+	const char *codec = obs_encoder_get_codec(encoder);
+
+	if (strcmp(codec, "opus") == 0)
+		return 1330799731.0; // FourCC "Opus"
+
+	return AUDIODATA_AAC;
+}
+
 /*
  * This is based on the position of `duration` and `fileSize` in
  * `build_flv_meta_data` relative to the beginning of the file
@@ -214,7 +236,7 @@ static void build_flv_meta_data(obs_output_t *context, uint8_t **output, size_t 
 	enc_num_val(&enc, end, "videodatarate", encoder_bitrate(vencoder));
 	enc_num_val(&enc, end, "framerate", video_output_get_frame_rate(video));
 
-	enc_num_val(&enc, end, "audiocodecid", AUDIODATA_AAC);
+	enc_num_val(&enc, end, "audiocodecid", encoder_audio_codec(aencoder));
 	enc_num_val(&enc, end, "audiodatarate", encoder_bitrate(aencoder));
 	enc_num_val(&enc, end, "audiosamplerate", (double)obs_encoder_get_sample_rate(aencoder));
 	enc_num_val(&enc, end, "audiosamplesize", 16.0);

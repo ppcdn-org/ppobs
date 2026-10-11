@@ -121,26 +121,6 @@ struct BasicOutputHandler {
 	void StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_t *audioEnc);
 	void StopP2PCompanion();
 
-	// Dedicated AAC encoder for an RTMP/ERTMP publish. The streaming audio
-	// encoder is frequently Opus (selected for SRT/WHIP/P2P), but the RTMP/
-	// FLV muxer only emits AAC (see plugins/obs-outputs/flv-mux.c
-	// to_audio_type()/flv_audio(), which always write an AAC tag), so an
-	// Opus payload gets muxed under an AAC tag and the ingest tears the
-	// connection down ("unable to parse MPEG4 audio config"). When the
-	// active service is RTMP with a non-AAC streaming encoder,
-	// PrepareRTMPAudioEncoder() creates this encoder and binds it to the
-	// main output, leaving the configured (Opus) encoder for the P2P
-	// companion (WebRTC needs Opus). Empty otherwise.
-	OBSEncoder rtmpAudioEnc;
-
-	// See rtmpAudioEnc. Binds a dedicated AAC encoder to output slot 0 when
-	// service is an RTMP publish and configured isn't already AAC; returns
-	// true when it swapped. mixerTrack is the 0-based audio mixer the
-	// configured streaming encoder pulls from. The caller must keep passing
-	// the original configured encoder to StartP2PCompanion().
-	bool PrepareRTMPAudioEncoder(obs_output_t *output, obs_service_t *service, obs_encoder_t *configured,
-				     int mixerTrack);
-
 	// Bytes actually sent, combined across the primary streaming output
 	// and - when HEVC/H264 multitrack is publishing over SRT/MPEG-TS,
 	// where each codec is a separate obs_output_t - its hevcStreamOutput
