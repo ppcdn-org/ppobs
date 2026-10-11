@@ -232,23 +232,31 @@ private:
 	int prevLangIndex;
 	bool prevBrowserAccel;
 
-	// Custom and WHIP share the same endpoint and key/token widgets, but
-	// each service type must retain its own values when switching between
-	// them - a Custom (SRT/RTMP) stream key and a WHIP bearer token are
-	// different secrets with different meanings, not the same field.
-	enum class StreamDestinationField { Common, Custom, WHIP };
+	// Custom, SRT, ERTMP and WHIP share the same endpoint and key/token
+	// widgets, but each service type must retain its own values when
+	// switching between them - a Custom/SRT/ERTMP stream key and a WHIP
+	// bearer token are different secrets with different meanings, not the
+	// same field. SRT and ERTMP are both "rtmp_custom" under the hood and
+	// are told apart only by their URL convention/marker (see IsSRT/
+	// IsERTMP), so each needs its own slot too - previously all three of
+	// the RTMP-custom family shared one slot and clobbered each other.
+	enum class StreamDestinationField { Common, Custom, SRT, ERTMP, WHIP };
 	StreamDestinationField lastStreamDestinationField = StreamDestinationField::Common;
 	QString customServiceEndpoint;
+	QString srtServiceEndpoint;
+	QString ertmpServiceEndpoint;
 	QString whipServiceEndpoint;
 	QString customServiceKey;
+	QString srtServiceKey;
+	QString ertmpServiceKey;
 	QString whipServiceKey;
-	// Custom's auth sub-fields are exclusive to it (WHIP never shows or
-	// uses them), so they don't need swap-on-dropdown-change treatment -
-	// just the same "remember across a closed Settings dialog, or after
-	// applying a different service in between" persistence, restored
-	// whenever Custom becomes selected. See SaveStream1Settings/
-	// LoadStream1Settings for where "Custom*"/"WHIP*" config keys are
-	// written/read.
+	// Custom's auth sub-fields are exclusive to it (SRT/ERTMP/WHIP never
+	// show or use them), so they don't need swap-on-dropdown-change
+	// treatment - just the same "remember across a closed Settings dialog,
+	// or after applying a different service in between" persistence,
+	// restored whenever Custom becomes selected. See SaveStream1Settings/
+	// LoadStream1Settings for where "Custom*"/"SRT*"/"ERTMP*"/"WHIP*"
+	// config keys are written/read.
 	bool customServiceUseAuth = false;
 	QString customServiceUsername;
 	QString customServicePassword;

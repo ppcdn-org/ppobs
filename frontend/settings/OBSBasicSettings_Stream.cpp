@@ -215,16 +215,33 @@ void OBSBasicSettings::LoadStream1Settings()
 	customServiceUseAuth = config_get_bool(main->Config(), "Stream1", "CustomUseAuth");
 	customServiceUsername = QT_UTF8(config_get_string(main->Config(), "Stream1", "CustomUsername"));
 	customServicePassword = QT_UTF8(config_get_string(main->Config(), "Stream1", "CustomPassword"));
+	srtServiceEndpoint = QT_UTF8(config_get_string(main->Config(), "Stream1", "SRTServerEndpoint"));
+	srtServiceKey = QT_UTF8(config_get_string(main->Config(), "Stream1", "SRTServerKey"));
+	ertmpServiceEndpoint = QT_UTF8(config_get_string(main->Config(), "Stream1", "ERTMPServerEndpoint"));
+	ertmpServiceKey = QT_UTF8(config_get_string(main->Config(), "Stream1", "ERTMPServerKey"));
 	whipServiceEndpoint = QT_UTF8(config_get_string(main->Config(), "Stream1", "WHIPServerEndpoint"));
 	whipServiceKey = QT_UTF8(config_get_string(main->Config(), "Stream1", "WHIPBearerToken"));
 
 	if (is_rtmp_custom) {
 		// The actually-active service is the authoritative source for
 		// its own values, overriding the persisted shadow copy above
-		// in case they've ever drifted apart.
-		customServiceEndpoint = QT_UTF8(server);
-		customServiceKey = QT_UTF8(key);
-		lastStreamDestinationField = StreamDestinationField::Custom;
+		// in case they've ever drifted apart. SRT, ERTMP and Custom
+		// each have their own slot (see SwapStreamDestinationField).
+		bool is_ertmp_active = obs_data_get_bool(settings, "is_ertmp");
+		bool is_srt_active = server && strncmp(server, "srt://", 6) == 0;
+		if (is_ertmp_active) {
+			ertmpServiceEndpoint = QT_UTF8(server);
+			ertmpServiceKey = QT_UTF8(key);
+			lastStreamDestinationField = StreamDestinationField::ERTMP;
+		} else if (is_srt_active) {
+			srtServiceEndpoint = QT_UTF8(server);
+			srtServiceKey = QT_UTF8(key);
+			lastStreamDestinationField = StreamDestinationField::SRT;
+		} else {
+			customServiceEndpoint = QT_UTF8(server);
+			customServiceKey = QT_UTF8(key);
+			lastStreamDestinationField = StreamDestinationField::Custom;
+		}
 	} else if (is_whip) {
 		whipServiceEndpoint = QT_UTF8(server);
 		whipServiceKey = QT_UTF8(bearer_token);
@@ -440,7 +457,13 @@ void OBSBasicSettings::SaveStream1Settings()
 	// after having applied Custom (or vice versa) would silently lose
 	// whichever one just stopped being active instead of merely switching
 	// away from it.
-	if (customServer) {
+	if (IsSRT()) {
+		config_set_string(main->Config(), "Stream1", "SRTServerEndpoint", QT_TO_UTF8(customEndpoint));
+		config_set_string(main->Config(), "Stream1", "SRTServerKey", QT_TO_UTF8(ui->key->text()));
+	} else if (IsERTMP()) {
+		config_set_string(main->Config(), "Stream1", "ERTMPServerEndpoint", QT_TO_UTF8(customEndpoint));
+		config_set_string(main->Config(), "Stream1", "ERTMPServerKey", QT_TO_UTF8(ui->key->text()));
+	} else if (IsCustomService()) {
 		config_set_string(main->Config(), "Stream1", "CustomServerEndpoint", QT_TO_UTF8(customEndpoint));
 		config_set_string(main->Config(), "Stream1", "CustomServerKey", QT_TO_UTF8(ui->key->text()));
 		config_set_bool(main->Config(), "Stream1", "CustomUseAuth", ui->useAuth->isChecked());
@@ -1071,6 +1094,14 @@ void OBSBasicSettings::SwapStreamDestinationField()
 		customServiceUsername = ui->authUsername->text();
 		customServicePassword = ui->authPw->text();
 		break;
+	case StreamDestinationField::SRT:
+		srtServiceEndpoint = ui->customServer->text();
+		srtServiceKey = ui->key->text();
+		break;
+	case StreamDestinationField::ERTMP:
+		ertmpServiceEndpoint = ui->customServer->text();
+		ertmpServiceKey = ui->key->text();
+		break;
 	case StreamDestinationField::WHIP:
 		whipServiceEndpoint = ui->customServer->text();
 		whipServiceKey = ui->key->text();
@@ -1079,7 +1110,18 @@ void OBSBasicSettings::SwapStreamDestinationField()
 		break;
 	}
 
-	if (IsRTMPCustomFamily()) {
+	// SRT, ERTMP and Custom are all "rtmp_custom" services (see
+	// IsRTMPCustomFamily) but each keeps its own endpoint/key slot, so
+	// switching between them must not carry one's values onto another.
+	if (IsSRT()) {
+		ui->customServer->setText(srtServiceEndpoint);
+		ui->key->setText(srtServiceKey);
+		lastStreamDestinationField = StreamDestinationField::SRT;
+	} else if (IsERTMP()) {
+		ui->customServer->setText(ertmpServiceEndpoint);
+		ui->key->setText(ertmpServiceKey);
+		lastStreamDestinationField = StreamDestinationField::ERTMP;
+	} else if (IsCustomService()) {
 		ui->customServer->setText(customServiceEndpoint);
 		ui->key->setText(customServiceKey);
 		ui->useAuth->setChecked(customServiceUseAuth);
