@@ -20,6 +20,7 @@
 #define PUBLISH_LOSS_SETTINGS_PERIOD "LossReconnectPeriodSec"
 #define PUBLISH_LOSS_SETTINGS_WINDOW "LossReconnectWindowSec"
 #define PUBLISH_LOSS_SETTINGS_THRESHOLD "LossReconnectThresholdPct"
+#define PUBLISH_LOSS_SETTINGS_GRACE "LossReconnectGraceSec"
 
 /* Samples whose own loss rate exceeds this are written to the OBS log. */
 #define PUBLISH_LOSS_LOG_THRESHOLD_PCT 0.5
@@ -31,6 +32,12 @@ struct publish_loss_config {
 	int period_sec;
 	int window_sec;
 	double threshold_pct;
+	/* Seconds after a (re)connect during which loss is not evaluated - the
+	 * initial encoder/SRT/WebRTC warm-up burst is otherwise counted as
+	 * unrecoverable loss and can force a reconnect ~one period after the
+	 * very first sample. Applies to every (re)connect, not just app start,
+	 * because the transient repeats each time. */
+	int grace_sec;
 };
 
 struct publish_loss_monitor {
@@ -38,6 +45,8 @@ struct publish_loss_monitor {
 	int64_t period_ms;
 	int64_t window_ms;
 	double threshold_pct;
+	int64_t grace_ms;
+	int64_t start_ms; /* first record() after (re)arm; 0 until then */
 	int64_t next_sample_ms;
 	uint64_t acc_lost;
 	uint64_t acc_expected;
@@ -55,6 +64,7 @@ static inline void publish_loss_config_load(struct publish_loss_config *cfg)
 	cfg->period_sec = 30;
 	cfg->window_sec = 300;
 	cfg->threshold_pct = 1.5;
+	cfg->grace_sec = 60;
 
 	config_t *conf = obs_frontend_get_app_config();
 	if (!conf)
@@ -68,6 +78,8 @@ static inline void publish_loss_config_load(struct publish_loss_config *cfg)
 		cfg->window_sec = (int)config_get_int(conf, PUBLISH_LOSS_SETTINGS_SECTION, PUBLISH_LOSS_SETTINGS_WINDOW);
 	if (config_has_user_value(conf, PUBLISH_LOSS_SETTINGS_SECTION, PUBLISH_LOSS_SETTINGS_THRESHOLD))
 		cfg->threshold_pct = config_get_double(conf, PUBLISH_LOSS_SETTINGS_SECTION, PUBLISH_LOSS_SETTINGS_THRESHOLD);
+	if (config_has_user_value(conf, PUBLISH_LOSS_SETTINGS_SECTION, PUBLISH_LOSS_SETTINGS_GRACE))
+		cfg->grace_sec = (int)config_get_int(conf, PUBLISH_LOSS_SETTINGS_SECTION, PUBLISH_LOSS_SETTINGS_GRACE);
 
 	if (cfg->period_sec < 1)
 		cfg->period_sec = 1;
@@ -75,6 +87,8 @@ static inline void publish_loss_config_load(struct publish_loss_config *cfg)
 		cfg->window_sec = cfg->period_sec;
 	if (cfg->threshold_pct <= 0.0)
 		cfg->threshold_pct = 1.5;
+	if (cfg->grace_sec < 0)
+		cfg->grace_sec = 0;
 }
 
 static inline void publish_loss_monitor_init(struct publish_loss_monitor *m, const struct publish_loss_config *cfg)
@@ -84,10 +98,12 @@ static inline void publish_loss_monitor_init(struct publish_loss_monitor *m, con
 	m->period_ms = (int64_t)cfg->period_sec * 1000;
 	m->window_ms = (int64_t)cfg->window_sec * 1000;
 	m->threshold_pct = cfg->threshold_pct;
+	m->grace_ms = (int64_t)cfg->grace_sec * 1000;
 }
 
 static inline void publish_loss_monitor_reset(struct publish_loss_monitor *m)
 {
+	m->start_ms = 0;
 	m->next_sample_ms = 0;
 	m->acc_lost = 0;
 	m->acc_expected = 0;
@@ -112,6 +128,9 @@ static inline bool publish_loss_monitor_record(struct publish_loss_monitor *m, u
 	if (!m->enable)
 		return false;
 
+	if (m->start_ms == 0)
+		m->start_ms = now_ms;
+
 	m->acc_lost += lost;
 	m->acc_expected += expected;
 
@@ -119,6 +138,20 @@ static inline bool publish_loss_monitor_record(struct publish_loss_monitor *m, u
 		m->next_sample_ms = now_ms + m->period_ms;
 		return false;
 	}
+
+	/* Warm-up grace: never evaluate during the first grace_ms after a
+	 * (re)connect, and drop (reset) anything accumulated at each sampling
+	 * boundary so a lossy opening interval can't leak into the first
+	 * post-grace window and force a reconnect. */
+	if (m->grace_ms > 0 && now_ms - m->start_ms < m->grace_ms) {
+		if (now_ms >= m->next_sample_ms) {
+			m->next_sample_ms = now_ms + m->period_ms;
+			m->acc_lost = 0;
+			m->acc_expected = 0;
+		}
+		return false;
+	}
+
 	if (now_ms < m->next_sample_ms)
 		return false;
 

@@ -2641,6 +2641,9 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	double lossReconnectThreshold = config_has_user_value(appConfig, "General", "LossReconnectThresholdPct")
 						? config_get_double(appConfig, "General", "LossReconnectThresholdPct")
 						: 1.5;
+	int lossReconnectGrace = config_has_user_value(appConfig, "General", "LossReconnectGraceSec")
+					 ? (int)config_get_int(appConfig, "General", "LossReconnectGraceSec")
+					 : 60;
 
 	loading = true;
 
@@ -2670,6 +2673,7 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	ui->lossReconnectPeriod->setValue(lossReconnectPeriod);
 	ui->lossReconnectWindow->setValue(lossReconnectWindow);
 	ui->lossReconnectThreshold->setValue(lossReconnectThreshold);
+	ui->lossReconnectGrace->setValue(lossReconnectGrace);
 
 	ui->streamDelaySec->setValue(delaySec);
 	ui->streamDelayPreserve->setChecked(preserveDelay);
@@ -3331,6 +3335,8 @@ void OBSBasicSettings::SaveAdvancedSettings()
 	if (WidgetChanged(ui->lossReconnectThreshold))
 		config_set_double(lossAppConfig, "General", "LossReconnectThresholdPct",
 				  ui->lossReconnectThreshold->value());
+	if (WidgetChanged(ui->lossReconnectGrace))
+		config_set_int(lossAppConfig, "General", "LossReconnectGraceSec", ui->lossReconnectGrace->value());
 	SaveComboData(ui->bindToIP, "Output", "BindIP");
 	SaveComboData(ui->ipFamily, "Output", "IPFamily");
 	SaveCheckBox(ui->autoRemux, "Video", "AutoRemux");
