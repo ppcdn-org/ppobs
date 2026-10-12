@@ -341,21 +341,25 @@ static bool mpegts_sample_srt_loss(struct ffmpeg_output *stream)
 	stream->loss_prev_snd_loss = snd_loss;
 	stream->loss_prev_retrans = retrans;
 
-	int64_t unrecoverable = d_loss - d_retrans;
-	if (unrecoverable < 0)
-		unrecoverable = 0;
-	int64_t expected = d_sent - d_retrans;
-	if (expected < 0)
-		expected = 0;
+	if (d_sent < 0)
+		d_sent = 0;
+	if (d_loss < 0)
+		d_loss = 0;
+	if (d_retrans < 0)
+		d_retrans = 0;
 
 	bool have_sample = false;
 	double sample_pct = 0.0;
-	bool reconnect = publish_loss_monitor_record(&stream->loss_monitor, (uint64_t)unrecoverable,
-						     (uint64_t)expected, now_ms, &have_sample, &sample_pct);
+	/* Pass the raw per-interval counters and let the monitor compute the
+	 * unrecoverable rate at period granularity - subtracting retrans within
+	 * each 1s sample and clamping biased the total upward (see
+	 * publish-loss-reconnect.h). */
+	bool reconnect = publish_loss_monitor_record(&stream->loss_monitor, (uint64_t)d_loss, (uint64_t)d_retrans,
+						     (uint64_t)d_sent, now_ms, &have_sample, &sample_pct);
 
 	if (have_sample && sample_pct > PUBLISH_LOSS_LOG_THRESHOLD_PCT)
-		info("SRT loss %.2f%% this interval (unrecovered=%lld retrans=%lld expected=%lld)", sample_pct,
-		     (long long)unrecoverable, (long long)d_retrans, (long long)expected);
+		info("SRT loss %.2f%% this interval (lost=%lld retrans=%lld sent=%lld)", sample_pct, (long long)d_loss,
+		     (long long)d_retrans, (long long)d_sent);
 
 	if (reconnect)
 		warn("SRT windowed unrecoverable loss above threshold, forcing reconnect");

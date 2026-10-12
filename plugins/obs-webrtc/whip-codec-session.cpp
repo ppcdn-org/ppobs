@@ -814,7 +814,7 @@ const char *WHIPCodecSession::RunUntilDisconnect(uint64_t generation)
 			auto delta = tracker->TakeDelta();
 			bool have_sample = false;
 			double sample_pct = 0.0;
-			bool reconnect = publish_loss_monitor_record(&loss_monitor, delta.first, delta.second,
+			bool reconnect = publish_loss_monitor_record(&loss_monitor, delta.first, 0, delta.second,
 								     now_ns / 1000000, &have_sample, &sample_pct);
 			if (have_sample && sample_pct > PUBLISH_LOSS_LOG_THRESHOLD_PCT)
 				do_log(LOG_INFO, "WHIP RTP loss %.2f%% this interval", sample_pct);

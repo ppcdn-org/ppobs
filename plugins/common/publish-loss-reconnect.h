@@ -9,10 +9,24 @@
 
 /*
  * Shared publish loss-reconnect policy for the SRT (obs-ffmpeg) and WHIP
- * (obs-webrtc) transports. Both feed per-interval (lost, expected) deltas
- * here whenever the configured sample period elapses; the monitor keeps a
- * time window of samples and reports when the window's aggregate loss rate
- * crosses the configured threshold.
+ * (obs-webrtc) transports. Both feed per-interval (lost, retransmitted,
+ * sent) deltas here whenever the configured sample period elapses; the
+ * monitor aggregates them per period and reports when the window's aggregate
+ * unrecoverable-loss rate crosses the configured threshold.
+ *
+ * Two things matter for correctness:
+ *
+ *  - Unrecoverable loss is computed once per *period*, not per raw sample.
+ *    Retransmissions lag their losses by ~one RTT, so subtracting them inside
+ *    each 1s sample and clamping negatives to zero systematically over-counts
+ *    whenever the retransmission lands just after a sample boundary (the
+ *    compensating negative is thrown away). Aggregating lost/retransmitted
+ *    over the whole period and subtracting once removes that bias.
+ *
+ *  - Nothing is evaluated until a full window of samples has accumulated
+ *    (warm-up == one window, not a fixed short grace). A short grace let a
+ *    single lossy interval right after it force a reconnect before the window
+ *    had any history to average against.
  */
 
 #define PUBLISH_LOSS_SETTINGS_SECTION "General"
@@ -20,7 +34,6 @@
 #define PUBLISH_LOSS_SETTINGS_PERIOD "LossReconnectPeriodSec"
 #define PUBLISH_LOSS_SETTINGS_WINDOW "LossReconnectWindowSec"
 #define PUBLISH_LOSS_SETTINGS_THRESHOLD "LossReconnectThresholdPct"
-#define PUBLISH_LOSS_SETTINGS_GRACE "LossReconnectGraceSec"
 
 /* Samples whose own loss rate exceeds this are written to the OBS log. */
 #define PUBLISH_LOSS_LOG_THRESHOLD_PCT 0.5
@@ -32,12 +45,6 @@ struct publish_loss_config {
 	int period_sec;
 	int window_sec;
 	double threshold_pct;
-	/* Seconds after a (re)connect during which loss is not evaluated - the
-	 * initial encoder/SRT/WebRTC warm-up burst is otherwise counted as
-	 * unrecoverable loss and can force a reconnect ~one period after the
-	 * very first sample. Applies to every (re)connect, not just app start,
-	 * because the transient repeats each time. */
-	int grace_sec;
 };
 
 struct publish_loss_monitor {
@@ -45,11 +52,11 @@ struct publish_loss_monitor {
 	int64_t period_ms;
 	int64_t window_ms;
 	double threshold_pct;
-	int64_t grace_ms;
 	int64_t start_ms; /* first record() after (re)arm; 0 until then */
 	int64_t next_sample_ms;
 	uint64_t acc_lost;
-	uint64_t acc_expected;
+	uint64_t acc_retrans;
+	uint64_t acc_sent;
 	int head;
 	int count;
 	int64_t sample_ms[PUBLISH_LOSS_MAX_SAMPLES];
@@ -64,7 +71,6 @@ static inline void publish_loss_config_load(struct publish_loss_config *cfg)
 	cfg->period_sec = 30;
 	cfg->window_sec = 300;
 	cfg->threshold_pct = 1.5;
-	cfg->grace_sec = 60;
 
 	config_t *conf = obs_frontend_get_app_config();
 	if (!conf)
@@ -78,8 +84,6 @@ static inline void publish_loss_config_load(struct publish_loss_config *cfg)
 		cfg->window_sec = (int)config_get_int(conf, PUBLISH_LOSS_SETTINGS_SECTION, PUBLISH_LOSS_SETTINGS_WINDOW);
 	if (config_has_user_value(conf, PUBLISH_LOSS_SETTINGS_SECTION, PUBLISH_LOSS_SETTINGS_THRESHOLD))
 		cfg->threshold_pct = config_get_double(conf, PUBLISH_LOSS_SETTINGS_SECTION, PUBLISH_LOSS_SETTINGS_THRESHOLD);
-	if (config_has_user_value(conf, PUBLISH_LOSS_SETTINGS_SECTION, PUBLISH_LOSS_SETTINGS_GRACE))
-		cfg->grace_sec = (int)config_get_int(conf, PUBLISH_LOSS_SETTINGS_SECTION, PUBLISH_LOSS_SETTINGS_GRACE);
 
 	if (cfg->period_sec < 1)
 		cfg->period_sec = 1;
@@ -87,8 +91,6 @@ static inline void publish_loss_config_load(struct publish_loss_config *cfg)
 		cfg->window_sec = cfg->period_sec;
 	if (cfg->threshold_pct <= 0.0)
 		cfg->threshold_pct = 1.5;
-	if (cfg->grace_sec < 0)
-		cfg->grace_sec = 0;
 }
 
 static inline void publish_loss_monitor_init(struct publish_loss_monitor *m, const struct publish_loss_config *cfg)
@@ -98,7 +100,6 @@ static inline void publish_loss_monitor_init(struct publish_loss_monitor *m, con
 	m->period_ms = (int64_t)cfg->period_sec * 1000;
 	m->window_ms = (int64_t)cfg->window_sec * 1000;
 	m->threshold_pct = cfg->threshold_pct;
-	m->grace_ms = (int64_t)cfg->grace_sec * 1000;
 }
 
 static inline void publish_loss_monitor_reset(struct publish_loss_monitor *m)
@@ -106,20 +107,23 @@ static inline void publish_loss_monitor_reset(struct publish_loss_monitor *m)
 	m->start_ms = 0;
 	m->next_sample_ms = 0;
 	m->acc_lost = 0;
-	m->acc_expected = 0;
+	m->acc_retrans = 0;
+	m->acc_sent = 0;
 	m->head = 0;
 	m->count = 0;
 }
 
 /*
- * Feed the per-interval (lost, expected) counters since the previous call.
- * Callers pass deltas, not cumulative totals. Returns true when the window's
- * aggregate loss rate exceeds the threshold, meaning the caller should force
- * a reconnect. When a full sample period has elapsed, *have_sample is set and
- * *sample_pct carries that sample's own loss rate (for logging).
+ * Feed the per-interval deltas since the previous call: lost = packets
+ * declared lost, retrans = packets retransmitted, sent = original packets
+ * sent (all as deltas, not cumulative totals; WHIP callers pass retrans=0).
+ * Returns true when the window's aggregate unrecoverable-loss rate exceeds
+ * the threshold, meaning the caller should force a reconnect. When a full
+ * sample period has elapsed, *have_sample is set and *sample_pct carries that
+ * period's own loss rate (for logging).
  */
-static inline bool publish_loss_monitor_record(struct publish_loss_monitor *m, uint64_t lost, uint64_t expected,
-					       int64_t now_ms, bool *have_sample, double *sample_pct)
+static inline bool publish_loss_monitor_record(struct publish_loss_monitor *m, uint64_t lost, uint64_t retrans,
+					       uint64_t sent, int64_t now_ms, bool *have_sample, double *sample_pct)
 {
 	if (have_sample)
 		*have_sample = false;
@@ -132,23 +136,11 @@ static inline bool publish_loss_monitor_record(struct publish_loss_monitor *m, u
 		m->start_ms = now_ms;
 
 	m->acc_lost += lost;
-	m->acc_expected += expected;
+	m->acc_retrans += retrans;
+	m->acc_sent += sent;
 
 	if (m->next_sample_ms == 0) {
 		m->next_sample_ms = now_ms + m->period_ms;
-		return false;
-	}
-
-	/* Warm-up grace: never evaluate during the first grace_ms after a
-	 * (re)connect, and drop (reset) anything accumulated at each sampling
-	 * boundary so a lossy opening interval can't leak into the first
-	 * post-grace window and force a reconnect. */
-	if (m->grace_ms > 0 && now_ms - m->start_ms < m->grace_ms) {
-		if (now_ms >= m->next_sample_ms) {
-			m->next_sample_ms = now_ms + m->period_ms;
-			m->acc_lost = 0;
-			m->acc_expected = 0;
-		}
 		return false;
 	}
 
@@ -157,22 +149,36 @@ static inline bool publish_loss_monitor_record(struct publish_loss_monitor *m, u
 
 	m->next_sample_ms = now_ms + m->period_ms;
 
+	/* Compute this period's unrecoverable loss ONCE, from the period
+	 * aggregates - not per raw sample - so retransmissions that land just
+	 * after a sample boundary can't bias the total upward. */
+	uint64_t period_lost = m->acc_lost;
+	uint64_t period_retrans = m->acc_retrans;
+	uint64_t period_sent = m->acc_sent;
+	m->acc_lost = 0;
+	m->acc_retrans = 0;
+	m->acc_sent = 0;
+
+	uint64_t period_unrecoverable = period_lost > period_retrans ? period_lost - period_retrans : 0;
+	uint64_t period_expected = period_sent > period_retrans ? period_sent - period_retrans : 0;
+
 	m->sample_ms[m->head] = now_ms;
-	m->sample_lost[m->head] = m->acc_lost;
-	m->sample_expected[m->head] = m->acc_expected;
+	m->sample_lost[m->head] = period_unrecoverable;
+	m->sample_expected[m->head] = period_expected;
 	m->head = (m->head + 1) % PUBLISH_LOSS_MAX_SAMPLES;
 	if (m->count < PUBLISH_LOSS_MAX_SAMPLES)
 		m->count++;
 
-	uint64_t period_lost = m->acc_lost;
-	uint64_t period_expected = m->acc_expected;
-	m->acc_lost = 0;
-	m->acc_expected = 0;
-
 	if (have_sample)
 		*have_sample = true;
 	if (sample_pct && period_expected)
-		*sample_pct = (double)period_lost * 100.0 / (double)period_expected;
+		*sample_pct = (double)period_unrecoverable * 100.0 / (double)period_expected;
+
+	/* Warm-up == one full window: samples keep accumulating, but nothing is
+	 * evaluated until the window spans window_ms, so a lossy opening period
+	 * can't force a reconnect before the aggregate has real history. */
+	if (now_ms - m->start_ms < m->window_ms)
+		return false;
 
 	int64_t cutoff = now_ms - m->window_ms;
 	while (m->count > 0) {
