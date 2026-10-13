@@ -1,13 +1,14 @@
-# OBS 绝对时间戳协议 (obs-abs-timestamp-protocol v1)
+# OBS 绝对时间戳协议 (obs-abs-timestamp-protocol v2)
 
-本协议描述 OBS 客户端如何获取绝对时间、如何把它打进码流、以及 WHIP 推流时如何通过
-WebRTC DataChannel 额外广播每帧时间戳，供服务端 / 播放器计算端到端推流延迟。
+本协议描述 OBS 客户端如何获取绝对时间、以及如何把它打进码流（SEI/OBU），供服务端 /
+播放器计算端到端推流延迟。时间戳只走码流内嵌这一条路径：码流内嵌对 RTMP/ERTMP、
+SRT、WHIP 推流一视同仁，不依赖任何协议专属的旁路通道（v1 曾经额外用 WHIP WebRTC
+DataChannel 广播，v2 起已移除，见第 4 节）。
 
 实现位置：
 
 - NTP 对时：[`libobs/util/ntp-clock.c`](../libobs/util/ntp-clock.c) / [`ntp-clock.h`](../libobs/util/ntp-clock.h)
 - SEI/OBU 打点：[`shared/abs-ts/abs-ts.c`](../shared/abs-ts/abs-ts.c) / [`abs-ts.h`](../shared/abs-ts/abs-ts.h)
-- WHIP DataChannel：[`plugins/obs-webrtc/whip-output.cpp`](../plugins/obs-webrtc/whip-output.cpp)
 
 ## 1. 绝对时间来源 (NTP)
 
@@ -77,49 +78,27 @@ UUID 的十六进制表示（也就是 `"OBS-ABSTS-SEI-v1"` 的 ASCII 编码）�
 上面的 UUID，命中后读后续 8 字节大端整数即为该帧的推流时间戳（ms，UTC）。同一帧的
 所有 simulcast 层（WHIP 情况下）都会各自带上这份时间戳。
 
-## 3. WHIP WebRTC DataChannel 时间戳广播
+## 3. 延迟计算示例
 
-仅 WHIP 推流时启用，作为码流内 SEI 时间戳之外的旁路通道，方便服务端不用解码/解析
-码流也能拿到时间戳。
-
-- **DataChannel label**：`"obs-timestamp"`，OBS 侧在建立 PeerConnection 时主动创建
-  （`createDataChannel`），不需要服务端 `onDataChannel` 之外做任何应答；如果服务端
-  不接这个 channel，OBS 侧发送只是静默失败（`isOpen()` 为 false 时直接跳过发送），
-  不影响正常推流。
-- **消息格式**：每一帧视频（每个 simulcast 层各发一条）发送一条 UTF-8 文本消息，
-  内容是如下结构的 JSON：
-
-  ```json
-  {"frame_no": 1234, "timestamp": 1733500000123, "rid": "0"}
-  ```
-
-  字段说明：
-
-  | 字段 | 类型 | 含义 |
-  |---|---|---|
-  | `frame_no` | uint16 (0~65535，会绕回) | 这一帧第一个 RTP 包在**该 simulcast 层自己的序列号空间**里的 RTP sequence number。和该层实际发出的 RTP 包的 `sequenceNumber` 字段是同一个计数器，只是取的是"这一帧起始"那个值 |
-  | `timestamp` | uint64，毫秒 | `ntp_clock_now_ms()` 在发送这一帧时的返回值，和第 2 节码流内嵌的是同一个时钟源、同一时刻取的值 |
-  | `rid` | string | simulcast 层标识，取值就是 RTP `rid` 扩展里用的 `"0"`、`"1"`、`"2"`……用来消歧：不同层各自独立计数，`frame_no` 在跨层时不是全局唯一的，必须配合 `rid` 才能对应到具体是哪个层的哪一帧 |
-
-  **重要**：`frame_no` 不是全局递增的"第几帧"计数器，而是 RTP 序列号本身（每层从 0
-  开始各自累加，一个编码帧可能被分片成多个 RTP 包，`frame_no` 取的是这些分片里
-  **第一个**包的序列号）。服务端如果要用 `frame_no` 去关联具体收到的 RTP 包，用它
-  匹配该分片序列里最小的那个 RTP sequence number 即可；如果服务端本来就要处理 RTP
-  jitter buffer，这个字段可以直接复用已有的 RTP 序列号比对逻辑，不需要单独维护一套
-  帧计数。
-
-### 延迟计算示例
-
-拿到某一帧在 SEI（或 DataChannel）里的 `timestamp`，用播放器本地收到 / 渲染这一帧
-时的本地 UTC 时间（需要播放端也做 NTP 或至少用足够准的系统时钟）相减，就是端到端
-推流延迟：
+拿到某一帧在 SEI 里的 `timestamp`，用播放器本地收到 / 渲染这一帧时的本地 UTC 时间
+（需要播放端也做 NTP 或至少用足够准的系统时钟）相减，就是端到端推流延迟：
 
 ```
 延迟(ms) = 播放端收到该帧的本地 UTC 毫秒时间 - 该帧携带的 timestamp
 ```
 
+服务端（RTMP/SRT/WHIP 任一摄入协议）从自己已有的 NAL/OBU 流水线里原地扫描这份
+SEI/OBU，不需要额外协商或专属通道；WHIP 摄入时同一份时间戳还会经服务端广播给同
+路径的 WHEP 观众，机制与协议无关。
+
 ## 4. 版本 / 变更
 
-- v1（本文档）：首个版本。UUID、payload 布局、DataChannel JSON schema 均为固定值；
-  后续如需变更字段，请升级 UUID 或在 JSON 里加版本号字段，不要原地破坏性修改这份
-  schema。
+- v1：首个版本。UUID、payload 布局均为固定值；额外通过 WHIP WebRTC DataChannel
+  （label `"obs-timestamp"`，JSON `{"frame_no", "timestamp", "rid"}`）广播同一时间
+  戳，作为码流内 SEI 之外的旁路，方便服务端不解码就能拿到时间戳。
+- v2（本文档）：移除 v1 的 WHIP DataChannel 旁路。原因：DataChannel 是 WebRTC/WHIP
+  专属能力，RTMP/ERTMP、SRT 摄入都没有对应的旁路通道可用；而第 2 节的码流内嵌 SEI/
+  OBU 本来就对所有摄入协议统一生效，服务端直接从各协议自己的 NAL/OBU 解析流程里取
+  即可，不需要维护第二套传输机制。时间戳传递现在只有码流内嵌这一条路径。后续如需
+  变更 SEI payload 字段，请升级 UUID 或在 payload 里加版本号字段，不要原地破坏性
+  修改这份 schema。

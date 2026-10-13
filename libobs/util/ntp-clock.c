@@ -48,9 +48,12 @@ typedef int ntp_socket_t;
 #define NTP_RETRY_INTERVAL_MS (30 * 1000)       /* retry sooner if never synced */
 
 /* A ppcenter TIME_SYNC result older than this is ignored: the obs-webrtc
- * plugin resyncs every ~45s, so 120s tolerates a couple of missed rounds
- * before falling back to the public-NTP offset. */
-#define NTP_PPCENTER_STALE_NS (120ULL * 1000000000ULL)
+ * plugin resyncs every ~10min (ppcenter-time-sync.cpp's RESYNC_INTERVAL_MS),
+ * so 20min tolerates a couple of missed rounds before falling back to the
+ * public-NTP offset. Must stay larger than RESYNC_INTERVAL_MS - if it isn't,
+ * the ppcenter-anchored offset goes stale before its own next resync and
+ * ppobs falls back to public NTP far more often than intended. */
+#define NTP_PPCENTER_STALE_NS (1200ULL * 1000000000ULL)
 
 static const char *ntp_servers[] = {
 	"time.cloudflare.com",

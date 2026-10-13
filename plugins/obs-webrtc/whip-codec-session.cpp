@@ -3,14 +3,12 @@
 
 #include <obs.hpp>
 #include <util/dstr.h>
-#include <util/ntp-clock.h>
 #ifdef _WIN32
 #include <util/windows/net-adapter-type.h>
 #endif
 
 #include <algorithm>
 #include <curl/curl.h>
-#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -275,7 +273,6 @@ void WHIPCodecSession::SendVideo(struct encoder_packet *packet)
 	if (!sending_enabled.load())
 		return;
 	std::shared_ptr<rtc::Track> local_video_track = video_track;
-	std::shared_ptr<rtc::DataChannel> local_timestamp_channel = timestamp_channel;
 	std::shared_ptr<rtc::RtcpSrReporter> local_video_sr_reporter = video_sr_reporter;
 	if (!local_video_track || !local_video_sr_reporter)
 		return;
@@ -299,19 +296,6 @@ void WHIPCodecSession::SendVideo(struct encoder_packet *packet)
 	rtp_config->rid = videoLayerState->rid;
 	rtp_config->timestamp = videoLayerState->rtpTimestamp;
 	int64_t duration = packet->dts_usec - videoLayerState->lastVideoTimestamp;
-
-	if (local_timestamp_channel && local_timestamp_channel->isOpen()) {
-		nlohmann::json ts_msg = {
-			{"frame_no", videoLayerState->sequenceNumber},
-			{"timestamp", ntp_clock_now_ms()},
-			{"rid", videoLayerState->rid},
-		};
-		try {
-			local_timestamp_channel->send(ts_msg.dump());
-		} catch (const std::exception &e) {
-			do_log(LOG_DEBUG, "timestamp_channel send failed: %s", e.what());
-		}
-	}
 
 	Send(packet->data, packet->size, duration, local_video_track, local_video_sr_reporter);
 	videoLayerState->sequenceNumber = rtp_config->sequenceNumber;
@@ -491,7 +475,6 @@ bool WHIPCodecSession::DoConnect(uint64_t generation, std::string &resourceURL)
 				peer_connection = nullptr;
 				audio_track = nullptr;
 				video_track = nullptr;
-				timestamp_channel = nullptr;
 				audio_sr_reporter = nullptr;
 				video_sr_reporter = nullptr;
 			}
@@ -511,18 +494,11 @@ bool WHIPCodecSession::DoConnect(uint64_t generation, std::string &resourceURL)
 	ConfigureAudioTrack(media_stream_id, cname);
 	ConfigureVideoTrack(media_stream_id, cname);
 
-	auto new_timestamp_channel = peer_connection->createDataChannel("obs-timestamp");
-	{
-		std::unique_lock<std::shared_mutex> lk(tracks_mutex);
-		timestamp_channel = new_timestamp_channel;
-	}
-
 	if (!IsActiveGeneration(generation)) {
 		std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 		peer_connection = nullptr;
 		audio_track = nullptr;
 		video_track = nullptr;
-		timestamp_channel = nullptr;
 		return false;
 	}
 	peer_connection->setLocalDescription();
@@ -678,7 +654,6 @@ bool WHIPCodecSession::DoConnect(uint64_t generation, std::string &resourceURL)
 			peer_connection = nullptr;
 			audio_track = nullptr;
 			video_track = nullptr;
-			timestamp_channel = nullptr;
 		}
 		ClosePeerConnectionWithTimeout(closing);
 		return false;
@@ -710,7 +685,6 @@ void WHIPCodecSession::TeardownGeneration(uint64_t generation, const std::string
 		peer_connection = nullptr;
 		audio_track = nullptr;
 		video_track = nullptr;
-		timestamp_channel = nullptr;
 		audio_sr_reporter = nullptr;
 		video_sr_reporter = nullptr;
 		video_loss_tracker = nullptr;

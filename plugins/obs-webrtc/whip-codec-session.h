@@ -219,7 +219,6 @@ private:
 	std::shared_ptr<rtc::RtcpSrReporter> video_sr_reporter;
 	std::shared_ptr<RtcpLossTracker> video_loss_tracker;
 	struct publish_loss_monitor loss_monitor;
-	std::shared_ptr<rtc::DataChannel> timestamp_channel;
 
 	std::vector<obs_encoder_t *> video_layers; // in rid order
 	std::map<obs_encoder_t *, std::shared_ptr<videoLayerState>> videoLayerStates;

@@ -18,7 +18,10 @@ namespace {
 constexpr int PROBE_SAMPLE_COUNT = 6;
 constexpr int PROBE_SPACING_MS = 150;
 constexpr int PROBE_TIMEOUT_MS = 5000;
-constexpr int RESYNC_INTERVAL_MS = 45000;
+// Keep this in sync with pplayer's DEFAULT_RESYNC_INTERVAL_MS (time-sync.mjs)
+// and with ntp-clock.c's NTP_PPCENTER_STALE_NS, which must stay larger than
+// this value or the offset looks stale before its own next resync.
+constexpr int RESYNC_INTERVAL_MS = 600000;
 constexpr int RECONNECT_DELAY_MS = 3000;
 constexpr int CONNECT_TIMEOUT_MS = 10000;
 
