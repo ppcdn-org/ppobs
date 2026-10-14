@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.28...3.30)
 
 option(ENABLE_VIRTUALCAM "Enable Windows Virtual Camera" ON)
+# See graphics-hook/CMakeLists.txt: the x86 virtual-camera module needs a
+# separate configured build_x86 tree and breaks the umbrella build when
+# absent. Off by default for 64-bit-only dev builds.
+option(PPOBS_BUILD_32BIT_HOOKS "Build the 32-bit (x86) virtualcam module via build_x86" OFF)
 if(NOT ENABLE_VIRTUALCAM)
   target_disable_feature(obs-virtualcam-module "Virtual Camera Support")
   target_disable(obs-virtualcam-module)
@@ -114,7 +118,7 @@ if(OBS_PARENT_ARCHITECTURE STREQUAL CMAKE_VS_PLATFORM_NAME)
     )
   endif()
 
-  if(CMAKE_VS_PLATFORM_NAME MATCHES "(ARM64|x64)")
+  if(CMAKE_VS_PLATFORM_NAME MATCHES "(ARM64|x64)" AND PPOBS_BUILD_32BIT_HOOKS)
     add_custom_command(
       TARGET obs-virtualcam-module
       POST_BUILD

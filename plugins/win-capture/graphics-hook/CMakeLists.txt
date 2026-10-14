@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.28...3.30)
 
+# Building the 32-bit (x86) graphics-hook requires a separate configured
+# build_x86 tree; when that tree is absent/unconfigured the umbrella
+# obs-studio target fails. Off by default so a 64-bit-only dev build does
+# not depend on it. Turn on (-DPPOBS_BUILD_32BIT_HOOKS=ON) for a release
+# that must capture 32-bit games.
+option(PPOBS_BUILD_32BIT_HOOKS "Build the 32-bit (x86) graphics-hook via build_x86" OFF)
+
 find_package(Detours REQUIRED)
 find_package(Vulkan REQUIRED)
 
@@ -64,7 +71,7 @@ if(OBS_PARENT_ARCHITECTURE STREQUAL CMAKE_VS_PLATFORM_NAME)
     )
   endif()
 
-  if(CMAKE_VS_PLATFORM_NAME MATCHES "(ARM64|x64)")
+  if(CMAKE_VS_PLATFORM_NAME MATCHES "(ARM64|x64)" AND PPOBS_BUILD_32BIT_HOOKS)
     add_custom_command(
       TARGET graphics-hook
       POST_BUILD

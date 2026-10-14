@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.28...3.30)
 
+# See graphics-hook/CMakeLists.txt for PPOBS_BUILD_32BIT_HOOKS.
+option(PPOBS_BUILD_32BIT_HOOKS "Build the 32-bit (x86) win-capture helpers via build_x86" OFF)
+
 if(NOT TARGET OBS::obfuscate)
   add_subdirectory("${CMAKE_SOURCE_DIR}/libobs" "${CMAKE_BINARY_DIR}/libobs")
 endif()
@@ -24,7 +27,7 @@ if(OBS_PARENT_ARCHITECTURE STREQUAL CMAKE_VS_PLATFORM_NAME)
     )
   endif()
 
-  if(CMAKE_VS_PLATFORM_NAME MATCHES "(ARM64|x64)")
+  if(CMAKE_VS_PLATFORM_NAME MATCHES "(ARM64|x64)" AND PPOBS_BUILD_32BIT_HOOKS)
     add_custom_command(
       TARGET inject-helper
       POST_BUILD
