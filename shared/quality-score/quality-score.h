@@ -41,8 +41,14 @@ struct SwsContext;
  * apply_interleaved_packet_offset - it zeroes dts/pts against this
  * particular output's start, not the raw-frame clock the reference tap
  * uses), so it's translated to the reference tap's clock via a
- * self-calibrating offset (see clock_offset_us below) before matching
- * against the reference ring, within roughly a frame's tolerance.
+ * self-calibrating offset (see clock_offset_us below). That offset is
+ * estimated from the minimum observed one-way delay, which is only
+ * unbiased if the minimum encode pipeline latency is ~0; encoders that
+ * buffer (e.g. NVENC lookahead) add a constant delay, so the corrected
+ * content time is systematically ahead of the true frame. To stay correct
+ * regardless, the comparison searches a bounded window of references for
+ * the best-matching one (see CompareFrame) rather than taking the nearest
+ * by timestamp.
  *
  * Both sides are downscaled to the same size (the SSIM-standard factor
  * round(min(w,h)/256), with the same fast-bilinear kernel libobs uses
@@ -151,6 +157,10 @@ private:
 	double win_ssim_sum = 0.0;
 	double win_ssim_min = 1.0;
 	double win_psnr_sum = 0.0;
+	// Running sum of (corrected content time - matched reference time) in ms,
+	// i.e. the observed encoder pipeline delay (the clock offset's bias).
+	// Logged so a drift in frame alignment is visible.
+	double win_align_sum_ms = 0.0;
 	uint32_t win_misses = 0;
 	uint32_t win_decode_errors = 0;
 	std::atomic<uint32_t> resyncs{0};

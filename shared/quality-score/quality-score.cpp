@@ -24,6 +24,15 @@ static constexpr size_t MAX_REFS = 180;
 static constexpr size_t MAX_QUEUE = 120;
 static constexpr int64_t SAMPLE_INTERVAL_US = 500000; /* 2 scored frames/s */
 static constexpr int64_t REPORT_INTERVAL_US = 10000000; /* one log line / 10s */
+/* How far back (older than the clock-corrected content time) the reference
+ * search may look. The min-latency clock-offset estimate is biased by the
+ * encoder's constant pipeline delay (e.g. NVENC lookahead), which pushes the
+ * corrected content time ahead of the true frame; matching only the nearest
+ * reference then lines frame N up against frame N+K and tanks Y-SSIM. Scanning
+ * this window and taking the best-matching reference (see CompareFrame) is
+ * self-correcting regardless of that delay, and a real quality drop still
+ * lowers the score because no reference matches better. */
+static constexpr int64_t SEARCH_BACK_US = 1000000; /* 1s */
 /* Window average below which the periodic score line is emitted as a
  * warning rather than info. The score is mean Y-SSIM x 100 against the
  * program feed, where the high 80s is ordinary streaming compression;
@@ -187,6 +196,7 @@ void QualityScorer::Start(obs_output_t *output)
 	win_ssim_sum = 0.0;
 	win_ssim_min = 1.0;
 	win_psnr_sum = 0.0;
+	win_align_sum_ms = 0.0;
 	win_misses = 0;
 	win_decode_errors = 0;
 	resyncs = 0;
@@ -410,29 +420,61 @@ void QualityScorer::CompareFrame(AVFrame *frame)
 	if (pts < next_sample_us)
 		return;
 
-	/* Pull the matching reference out of the ring. pts only increases,
-	 * so everything older than the tolerance window is dead weight.
-	 * The window is a full frame duration (not half) since the offset
-	 * above is calibrated, not exact - it tracks the minimum observed
-	 * encode/delivery latency, so a frame arriving with slightly above
-	 * that minimum reads as marginally "later" than its true content
-	 * time. */
-	RefFrame ref;
-	bool found = false;
-	{
-		std::lock_guard<std::mutex> lock(ref_mutex);
-		while (!refs.empty() && refs.front().ts_us < pts - frame_dur_us)
-			refs.pop_front();
-		if (!refs.empty() && refs.front().ts_us <= pts + frame_dur_us) {
-			ref = std::move(refs.front());
-			refs.pop_front();
-			found = true;
-		}
-	}
-
 	next_sample_us = pts + SAMPLE_INTERVAL_US;
 	if (!next_report_us)
 		next_report_us = pts + REPORT_INTERVAL_US;
+
+	/* Same fast-bilinear kernel the libobs raw-video conversion uses for
+	 * the reference tap, so a hypothetical lossless encode compares equal
+	 * instead of eating a kernel-mismatch penalty. yuv->yuv conversion
+	 * applies no range change. Scaled once, then compared against every
+	 * candidate reference below. */
+	sws = sws_getCachedContext(sws, frame->width, frame->height, (AVPixelFormat)frame->format, (int)det_width,
+				   (int)det_height, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+	if (!sws)
+		return;
+
+	uint8_t *dst[3] = {det_y.data(), det_u.data(), det_v.data()};
+	const int dst_linesize[3] = {(int)det_width, (int)(det_width / 2), (int)(det_width / 2)};
+	sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, dst_linesize);
+
+	/* Find the best-matching reference in the window. the clock offset
+	 * above comes from the minimum observed one-way delay, so it is
+	 * biased ahead of the true frame by the encoder's constant pipeline
+	 * delay; a nearest-by-timestamp match would line frame N up against
+	 * frame N+K. Searching [pts - SEARCH_BACK_US, pts + one frame] and
+	 * keeping the highest-SSIM candidate is self-correcting. pts only
+	 * increases, so references older than the window are dead weight. */
+	RefFrame ref;
+	bool found = false;
+	double chosen_ssim = 0.0;
+	{
+		std::lock_guard<std::mutex> lock(ref_mutex);
+		while (!refs.empty() && refs.front().ts_us < pts - SEARCH_BACK_US)
+			refs.pop_front();
+
+		const int64_t hi = pts + frame_dur_us;
+		double best_ssim = -1.0;
+		size_t best_idx = 0;
+		for (size_t i = 0; i < refs.size(); i++) {
+			if (refs[i].ts_us > hi)
+				break;
+			const double s = compute_ssim(refs[i].luma.data(), det_y.data(), det_width, det_height);
+			if (s > best_ssim) {
+				best_ssim = s;
+				best_idx = i;
+			}
+		}
+		if (best_ssim >= 0.0) {
+			/* How far the biased content time ran past the matched
+			 * (true) frame - i.e. the observed pipeline delay. */
+			win_align_sum_ms += (double)(pts - refs[best_idx].ts_us) / 1000.0;
+			chosen_ssim = best_ssim;
+			ref = std::move(refs[best_idx]);
+			refs.erase(refs.begin(), refs.begin() + best_idx + 1);
+			found = true;
+		}
+	}
 
 	if (!found) {
 		/* Reference already evicted (decoder lagging several seconds)
@@ -440,23 +482,9 @@ void QualityScorer::CompareFrame(AVFrame *frame)
 		 * precedes its packet). Counted, not scored. */
 		win_misses++;
 	} else {
-		/* Same fast-bilinear kernel the libobs raw-video conversion
-		 * uses for the reference tap, so a hypothetical lossless
-		 * encode compares equal instead of eating a kernel-mismatch
-		 * penalty. yuv->yuv conversion applies no range change. */
-		sws = sws_getCachedContext(sws, frame->width, frame->height, (AVPixelFormat)frame->format,
-					   (int)det_width, (int)det_height, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR,
-					   nullptr, nullptr, nullptr);
-		if (!sws)
-			return;
-
-		uint8_t *dst[3] = {det_y.data(), det_u.data(), det_v.data()};
-		const int dst_linesize[3] = {(int)det_width, (int)(det_width / 2), (int)(det_width / 2)};
-		sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, dst_linesize);
-
 		/* SSIM can go negative for structurally unrelated frames (a
 		 * mismatch, not a quality level) - floor the score at 0. */
-		const double ssim = std::max(0.0, compute_ssim(ref.luma.data(), det_y.data(), det_width, det_height));
+		const double ssim = std::max(0.0, chosen_ssim);
 		const double psnr = compute_psnr(ref.luma.data(), det_y.data(), det_width, det_height);
 
 		win_samples++;
@@ -479,11 +507,12 @@ void QualityScorer::CompareFrame(AVFrame *frame)
 
 	if (win_samples) {
 		const double avg_score = win_ssim_sum / win_samples * 100.0;
+		const double avg_align_ms = win_align_sum_ms / win_samples;
 
 		blog(avg_score < SCORE_WARN_THRESHOLD ? LOG_WARNING : LOG_INFO,
 		     "[quality-score] stream quality score: %.1f avg / %.1f min of 100 "
-		     "(Y-SSIM vs program feed, PSNR %.1f dB avg, %u samples)",
-		     avg_score, win_ssim_min * 100.0, win_psnr_sum / win_samples, win_samples);
+		     "(Y-SSIM vs program feed, PSNR %.1f dB avg, %u samples, pipeline delay %.0f ms)",
+		     avg_score, win_ssim_min * 100.0, win_psnr_sum / win_samples, win_samples, avg_align_ms);
 	}
 	if (win_misses || win_decode_errors || new_resyncs) {
 		blog(LOG_WARNING,
@@ -496,6 +525,7 @@ void QualityScorer::CompareFrame(AVFrame *frame)
 	win_ssim_sum = 0.0;
 	win_ssim_min = 1.0;
 	win_psnr_sum = 0.0;
+	win_align_sum_ms = 0.0;
 	win_misses = 0;
 	win_decode_errors = 0;
 }
