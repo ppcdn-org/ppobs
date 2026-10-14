@@ -21,8 +21,20 @@ audioshift_soundtouch_t *audioshift_soundtouch_create(uint32_t sample_rate, size
 	 * pitch, it must never alter playback speed. */
 	wrap->st.setSampleRate(sample_rate);
 	wrap->st.setChannels((uint)channels);
+	audioshift_soundtouch_set_voice_low_latency(wrap);
 	wrap->st.setPitchSemiTones(0.0f);
 	return wrap;
+}
+
+void audioshift_soundtouch_set_voice_low_latency(audioshift_soundtouch_t *st)
+{
+	/* The three values TDStretch.h carries as the "for speech processing
+	 * applications these parameters suit better" example. setSetting must
+	 * run after setSampleRate: it recomputes the window lengths from the
+	 * current rate. */
+	st->st.setSetting(SETTING_SEQUENCE_MS, 40);
+	st->st.setSetting(SETTING_SEEKWINDOW_MS, 15);
+	st->st.setSetting(SETTING_OVERLAP_MS, 8);
 }
 
 void audioshift_soundtouch_destroy(audioshift_soundtouch_t *st)
@@ -66,6 +78,11 @@ audioshift_soundtouch_t *audioshift_soundtouch_create(uint32_t sample_rate, size
 	(void)sample_rate;
 	(void)channels;
 	return nullptr;
+}
+
+void audioshift_soundtouch_set_voice_low_latency(audioshift_soundtouch_t *st)
+{
+	(void)st;
 }
 
 void audioshift_soundtouch_destroy(audioshift_soundtouch_t *st)

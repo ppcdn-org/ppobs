@@ -1444,6 +1444,14 @@ public:
 	// contrast enhancement) to every camera (dshow_input) source.
 	void ApplyClarityFilterSetting();
 
+	// Same enforcement pattern for the "Voice Template" combo
+	// ("Stream1"/"VoiceTemplate"): builds the AudioShift -> 3-Band EQ ->
+	// Compressor chain on every microphone input source
+	// (wasapi_input_capture) for the selected template, and tears it down
+	// when set to "none". Desktop/loopback capture is deliberately left
+	// alone. See docs/audioshift-design.md 6.4.
+	void ApplyVoiceTemplateSetting();
+
 	/* -------------------------------------
 	 * MARK: - OBSBasic_Schedule
 	 * -------------------------------------

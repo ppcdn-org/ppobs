@@ -21,6 +21,12 @@
 #define S_PRESET "preset"
 #define S_PITCH_SEMITONES "pitch_semitones"
 #define S_LATENCY_INFO "latency_info"
+#define S_EFFECT "effect"
+#define S_ROBOT_FREQ "robot_freq"
+#define S_ROBOT_MIX "robot_mix"
+#define S_ECHO_DELAY "echo_delay"
+#define S_ECHO_FEEDBACK "echo_feedback"
+#define S_ECHO_MIX "echo_mix"
 
 /* S_PRESET_CUSTOM / S_PRESET_MALE_TO_FEMALE / etc. come from
  * audioshift-filter.h, shared with the preset-to-semitone lookup table
@@ -37,9 +43,29 @@
 #define TEXT_LATENCY_INFO MT_("AudioShift.LatencyInfo")
 #define TEXT_LATENCY_PENDING MT_("AudioShift.LatencyPending")
 #define TEXT_UNAVAILABLE MT_("AudioShift.Unavailable")
+#define TEXT_EFFECT MT_("AudioShift.Effect")
+#define TEXT_EFFECT_NONE MT_("AudioShift.Effect.None")
+#define TEXT_EFFECT_ROBOT MT_("AudioShift.Effect.Robot")
+#define TEXT_EFFECT_ECHO MT_("AudioShift.Effect.Echo")
+#define TEXT_ROBOT_FREQ MT_("AudioShift.RobotFreq")
+#define TEXT_ROBOT_MIX MT_("AudioShift.RobotMix")
+#define TEXT_ECHO_DELAY MT_("AudioShift.EchoDelay")
+#define TEXT_ECHO_FEEDBACK MT_("AudioShift.EchoFeedback")
+#define TEXT_ECHO_MIX MT_("AudioShift.EchoMix")
 
 #define MIN_SEMITONES -12.0
 #define MAX_SEMITONES 12.0
+
+#define MIN_ROBOT_FREQ 20.0
+#define MAX_ROBOT_FREQ 100.0
+#define MIN_ECHO_DELAY_MS 30.0
+#define MAX_ECHO_DELAY_MS 400.0
+
+/* Ring-buffer capacity for the echo layer is allocated once per reconfigure
+ * for the largest delay the UI can select, so changing the delay slider at
+ * runtime is just a read-offset change, never a reallocation on the audio
+ * thread. 400ms @ 48kHz is ~77KB/channel. */
+#define AUDIOSHIFT_ECHO_CAPACITY_FRAMES(rate) ((size_t)((uint64_t)MAX_ECHO_DELAY_MS * (rate) / 1000) + 1)
 
 /* Drain chunk size for draining SoundTouch's internal FIFO each call; this is
  * not a protocol requirement (unlike RNNoise's fixed frame size in
@@ -61,14 +87,35 @@ struct audioshift_data {
 	 * audioshift_filter_audio() (audio thread). A plain scalar: a torn
 	 * read just delays the new value by one audio callback, which is
 	 * harmless here. See docs/audioshift-design.md §5.1 for why this
-	 * doesn't need a mutex. */
+	 * doesn't need a mutex. The same applies to the pending_effect_*
+	 * group below. */
 	float pending_semitones;
+
+	enum audioshift_effect pending_effect;
+	float pending_robot_freq;
+	float pending_robot_mix;
+	float pending_echo_delay_ms;
+	float pending_echo_feedback;
+	float pending_echo_mix;
 
 	/* Everything below is touched only by the audio thread. */
 	audioshift_soundtouch_t *st;
 	float applied_semitones;
 	uint32_t sample_rate;
 	size_t channels;
+
+	enum audioshift_effect applied_effect;
+	float applied_robot_freq;
+	float applied_robot_mix;
+	float applied_echo_delay_ms;
+	float applied_echo_feedback;
+	float applied_echo_mix;
+
+	/* Effect-layer state, audio thread only. */
+	float robot_phase;
+	float *echo_buffers[MAX_AUDIO_CHANNELS];
+	size_t echo_capacity;
+	size_t echo_pos;
 
 	bool create_failed;
 
@@ -103,12 +150,50 @@ static void audioshift_clear_buffers(struct audioshift_data *as)
 	deque_pop_front(&as->info_buffer, NULL, as->info_buffer.size);
 }
 
+/* Drops the effect layers' accumulated state (robot phase, echo ring) so a
+ * setting change or discontinuity can't bleed old tails into new audio. */
+static void audioshift_effect_reset(struct audioshift_data *as)
+{
+	as->robot_phase = 0.0f;
+	as->echo_pos = 0;
+
+	for (size_t c = 0; c < MAX_AUDIO_CHANNELS; c++) {
+		if (as->echo_buffers[c])
+			memset(as->echo_buffers[c], 0, as->echo_capacity * sizeof(float));
+	}
+}
+
+static void audioshift_effect_free(struct audioshift_data *as)
+{
+	for (size_t c = 0; c < MAX_AUDIO_CHANNELS; c++) {
+		bfree(as->echo_buffers[c]);
+		as->echo_buffers[c] = NULL;
+	}
+
+	as->echo_capacity = 0;
+	as->echo_pos = 0;
+	as->robot_phase = 0.0f;
+}
+
+static void audioshift_effect_reconfigure(struct audioshift_data *as, uint32_t sample_rate, size_t channels)
+{
+	audioshift_effect_free(as);
+
+	as->echo_capacity = AUDIOSHIFT_ECHO_CAPACITY_FRAMES(sample_rate);
+	for (size_t c = 0; c < channels; c++)
+		as->echo_buffers[c] = bzalloc(as->echo_capacity * sizeof(float));
+
+	audioshift_effect_reset(as);
+}
+
 static void audioshift_reset(struct audioshift_data *as)
 {
 	audioshift_clear_buffers(as);
 
 	if (as->st)
 		audioshift_soundtouch_flush(as->st);
+
+	audioshift_effect_reset(as);
 
 	as->samples_fed = 0;
 	as->samples_emitted = 0;
@@ -123,6 +208,15 @@ static void audioshift_update(void *data, obs_data_t *s)
 		as->pending_semitones = (float)obs_data_get_double(s, S_PITCH_SEMITONES);
 	else
 		as->pending_semitones = audioshift_preset_semitones(preset);
+
+	/* Effect layers. The UI stores the mix/feedback sliders as percentages;
+	 * convert once here so the audio thread only ever sees 0..1. */
+	as->pending_effect = audioshift_effect_from_string(obs_data_get_string(s, S_EFFECT));
+	as->pending_robot_freq = (float)obs_data_get_double(s, S_ROBOT_FREQ);
+	as->pending_robot_mix = (float)obs_data_get_double(s, S_ROBOT_MIX) / 100.0f;
+	as->pending_echo_delay_ms = (float)obs_data_get_double(s, S_ECHO_DELAY);
+	as->pending_echo_feedback = (float)obs_data_get_double(s, S_ECHO_FEEDBACK) / 100.0f;
+	as->pending_echo_mix = (float)obs_data_get_double(s, S_ECHO_MIX) / 100.0f;
 }
 
 static void *audioshift_create(obs_data_t *settings, obs_source_t *filter)
@@ -143,6 +237,8 @@ static void audioshift_destroy(void *data)
 
 	if (as->st)
 		audioshift_soundtouch_destroy(as->st);
+
+	audioshift_effect_free(as);
 
 	audioshift_clear_buffers(as);
 	for (size_t i = 0; i < MAX_AUDIO_CHANNELS; i++)
@@ -166,10 +262,17 @@ static void audioshift_reconfigure(struct audioshift_data *as, uint32_t sample_r
 	as->sample_rate = sample_rate;
 	as->channels = channels;
 	as->applied_semitones = as->pending_semitones;
+	as->applied_effect = as->pending_effect;
+	as->applied_robot_freq = as->pending_robot_freq;
+	as->applied_robot_mix = as->pending_robot_mix;
+	as->applied_echo_delay_ms = as->pending_echo_delay_ms;
+	as->applied_echo_feedback = as->pending_echo_feedback;
+	as->applied_echo_mix = as->pending_echo_mix;
 
 	if (as->st)
 		audioshift_soundtouch_set_pitch_semitones(as->st, as->applied_semitones);
 
+	audioshift_effect_reconfigure(as, sample_rate, channels);
 	audioshift_reset(as);
 
 	bfree(as->interleave_out);
@@ -193,6 +296,79 @@ static void audioshift_ensure_in_buf(struct audioshift_data *as, uint32_t frames
 	as->interleave_in = brealloc(as->interleave_in, (size_t)frames * as->channels * sizeof(float));
 }
 
+/* Runs the selected P1 effect over the filter's already-deinterleaved output
+ * (see the layout note in audioshift_filter_audio). Kept in-place and
+ * allocation-free: all buffers the echo layer needs were sized in
+ * audioshift_reconfigure(). */
+static void audioshift_apply_effects(struct audioshift_data *as)
+{
+	const uint32_t frames = as->output_audio.frames;
+	const size_t channels = as->channels;
+
+	if (channels == 0 || frames == 0 || as->applied_effect == AUDIOSHIFT_EFFECT_NONE)
+		return;
+
+	if (as->applied_effect == AUDIOSHIFT_EFFECT_ROBOT) {
+		const float two_pi = 6.28318530717958647692f;
+		const float mix = as->applied_robot_mix;
+		const float step = two_pi * as->applied_robot_freq / (float)as->sample_rate;
+
+		/* One carrier shared by every channel keeps the stereo image
+		 * intact; a per-channel phase would make the effect wander. */
+		for (uint32_t i = 0; i < frames; i++) {
+			const float carrier = sinf(as->robot_phase);
+
+			for (size_t c = 0; c < channels; c++) {
+				float *sample = &as->output_data.array[(size_t)c * frames + i];
+				*sample = audioshift_robot_mix(*sample, carrier, mix);
+			}
+
+			as->robot_phase += step;
+			if (as->robot_phase >= two_pi)
+				as->robot_phase -= two_pi;
+		}
+		return;
+	}
+
+	/* Echo. The delay is only a read offset into the preallocated ring, so
+	 * the delay slider never reallocates on the audio thread. */
+	if (as->echo_capacity == 0)
+		return;
+
+	size_t delay_frames = (size_t)((as->applied_echo_delay_ms / 1000.0f) * (float)as->sample_rate);
+	if (delay_frames < 1)
+		delay_frames = 1;
+	if (delay_frames >= as->echo_capacity)
+		delay_frames = as->echo_capacity - 1;
+
+	const float feedback = as->applied_echo_feedback;
+	const float mix = as->applied_echo_mix;
+
+	for (uint32_t i = 0; i < frames; i++) {
+		const size_t read_pos = (as->echo_pos + as->echo_capacity - delay_frames) % as->echo_capacity;
+
+		for (size_t c = 0; c < channels; c++) {
+			float *buf = as->echo_buffers[c];
+			if (!buf)
+				continue;
+
+			float *sample = &as->output_data.array[(size_t)c * frames + i];
+			const float dry = *sample;
+			const float delayed = buf[read_pos];
+
+			/* Soft-limit the feedback path so repeats decay
+			 * instead of accumulating past full scale. */
+			buf[as->echo_pos] = audioshift_soft_limit(dry + feedback * delayed);
+
+			*sample = audioshift_soft_limit(dry * (1.0f - mix) + delayed * mix);
+		}
+
+		as->echo_pos++;
+		if (as->echo_pos >= as->echo_capacity)
+			as->echo_pos = 0;
+	}
+}
+
 static struct obs_audio_data *audioshift_filter_audio(void *data, struct obs_audio_data *audio)
 {
 	struct audioshift_data *as = data;
@@ -214,6 +390,19 @@ static struct obs_audio_data *audioshift_filter_audio(void *data, struct obs_aud
 		as->applied_semitones = as->pending_semitones;
 		audioshift_soundtouch_set_pitch_semitones(as->st, as->applied_semitones);
 	}
+
+	/* Snapshot the effect settings. Switching layer clears the old layer's
+	 * tail; changing only its parameters does not, so dragging a slider
+	 * doesn't punch a silent gap into the stream. */
+	if (as->applied_effect != as->pending_effect) {
+		as->applied_effect = as->pending_effect;
+		audioshift_effect_reset(as);
+	}
+	as->applied_robot_freq = as->pending_robot_freq;
+	as->applied_robot_mix = as->pending_robot_mix;
+	as->applied_echo_delay_ms = as->pending_echo_delay_ms;
+	as->applied_echo_feedback = as->pending_echo_feedback;
+	as->applied_echo_mix = as->pending_echo_mix;
 
 	/* A large timestamp jump means this is effectively a new stream of
 	 * audio (source re-activated, seek, etc.); drop stale buffered state
@@ -272,6 +461,9 @@ static struct obs_audio_data *audioshift_filter_audio(void *data, struct obs_aud
 
 	as->output_audio.frames = out_info.frames;
 	as->output_audio.timestamp = out_info.timestamp - latency_ns;
+
+	audioshift_apply_effects(as);
+
 	return &as->output_audio;
 }
 
@@ -297,6 +489,32 @@ static void audioshift_defaults(obs_data_t *s)
 {
 	obs_data_set_default_string(s, S_PRESET, S_PRESET_CUSTOM);
 	obs_data_set_default_double(s, S_PITCH_SEMITONES, 0.0);
+
+	obs_data_set_default_string(s, S_EFFECT, S_EFFECT_NONE);
+	obs_data_set_default_double(s, S_ROBOT_FREQ, 30.0);
+	obs_data_set_default_double(s, S_ROBOT_MIX, 100.0);
+	obs_data_set_default_double(s, S_ECHO_DELAY, 120.0);
+	obs_data_set_default_double(s, S_ECHO_FEEDBACK, 40.0);
+	obs_data_set_default_double(s, S_ECHO_MIX, 40.0);
+}
+
+/* The effect layers are mutually exclusive; only the selected layer's
+ * parameters are enabled, mirroring audioshift_preset_modified(). */
+static bool audioshift_effect_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+
+	const char *effect = obs_data_get_string(settings, S_EFFECT);
+	bool robot = strcmp(effect, S_EFFECT_ROBOT) == 0;
+	bool echo = strcmp(effect, S_EFFECT_ECHO) == 0;
+
+	obs_property_set_enabled(obs_properties_get(props, S_ROBOT_FREQ), robot);
+	obs_property_set_enabled(obs_properties_get(props, S_ROBOT_MIX), robot);
+	obs_property_set_enabled(obs_properties_get(props, S_ECHO_DELAY), echo);
+	obs_property_set_enabled(obs_properties_get(props, S_ECHO_FEEDBACK), echo);
+	obs_property_set_enabled(obs_properties_get(props, S_ECHO_MIX), echo);
+
+	return true;
 }
 
 static obs_properties_t *audioshift_properties(void *data)
@@ -317,6 +535,44 @@ static obs_properties_t *audioshift_properties(void *data)
 		obs_properties_add_float_slider(ppts, S_PITCH_SEMITONES, TEXT_PITCH_SEMITONES, MIN_SEMITONES,
 						MAX_SEMITONES, 0.5);
 	obs_property_float_set_suffix(p, " st");
+
+	obs_property_t *effect =
+		obs_properties_add_list(ppts, S_EFFECT, TEXT_EFFECT, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(effect, TEXT_EFFECT_NONE, S_EFFECT_NONE);
+	obs_property_list_add_string(effect, TEXT_EFFECT_ROBOT, S_EFFECT_ROBOT);
+	obs_property_list_add_string(effect, TEXT_EFFECT_ECHO, S_EFFECT_ECHO);
+	obs_property_set_modified_callback(effect, audioshift_effect_modified);
+
+	obs_property_t *robot_freq =
+		obs_properties_add_float_slider(ppts, S_ROBOT_FREQ, TEXT_ROBOT_FREQ, MIN_ROBOT_FREQ, MAX_ROBOT_FREQ, 1.0);
+	obs_property_float_set_suffix(robot_freq, " Hz");
+
+	obs_property_t *robot_mix =
+		obs_properties_add_float_slider(ppts, S_ROBOT_MIX, TEXT_ROBOT_MIX, 0.0, 100.0, 1.0);
+	obs_property_float_set_suffix(robot_mix, "%");
+
+	obs_property_t *echo_delay = obs_properties_add_float_slider(ppts, S_ECHO_DELAY, TEXT_ECHO_DELAY,
+								     MIN_ECHO_DELAY_MS, MAX_ECHO_DELAY_MS, 5.0);
+	obs_property_float_set_suffix(echo_delay, " ms");
+
+	obs_property_t *echo_feedback =
+		obs_properties_add_float_slider(ppts, S_ECHO_FEEDBACK, TEXT_ECHO_FEEDBACK, 0.0, 90.0, 1.0);
+	obs_property_float_set_suffix(echo_feedback, "%");
+
+	obs_property_t *echo_mix =
+		obs_properties_add_float_slider(ppts, S_ECHO_MIX, TEXT_ECHO_MIX, 0.0, 100.0, 1.0);
+	obs_property_float_set_suffix(echo_mix, "%");
+
+	/* obs_property_set_modified_callback only fires on user interaction, so
+	 * set the initial enabled state from the live instance (same pattern as
+	 * the preset/semitone slider above). */
+	bool robot = as && as->pending_effect == AUDIOSHIFT_EFFECT_ROBOT;
+	bool echo = as && as->pending_effect == AUDIOSHIFT_EFFECT_ECHO;
+	obs_property_set_enabled(robot_freq, robot);
+	obs_property_set_enabled(robot_mix, robot);
+	obs_property_set_enabled(echo_delay, echo);
+	obs_property_set_enabled(echo_feedback, echo);
+	obs_property_set_enabled(echo_mix, echo);
 
 	/* Latency is a running fed-minus-emitted sample count (§5.2), so it only
 	 * means something once audio has actually flowed through the filter at
