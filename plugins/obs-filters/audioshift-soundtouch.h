@@ -26,6 +26,15 @@ bool audioshift_soundtouch_available(void);
 audioshift_soundtouch_t *audioshift_soundtouch_create(uint32_t sample_rate, size_t channels);
 void audioshift_soundtouch_destroy(audioshift_soundtouch_t *st);
 
+/* Switches the time-stretch windows from SoundTouch's music-oriented auto
+ * defaults (SEQUENCE_MS~82 / SEEKWINDOW_MS~28 / OVERLAP_MS=12) to the
+ * speech-optimized values its own TDStretch.h documents (40 / 15 / 8 ms).
+ * The music defaults cost 32-91 ms of added latency, which is perceptible
+ * when monitoring your own voice; the speech values cut that substantially
+ * at the cost of a little pitch-shift quality that matters far less for
+ * voice. See docs/audioshift-design.md sec 8.1. */
+void audioshift_soundtouch_set_voice_low_latency(audioshift_soundtouch_t *st);
+
 void audioshift_soundtouch_set_pitch_semitones(audioshift_soundtouch_t *st, float semitones);
 
 /* samples/out_samples are interleaved; frame counts are per-channel sample

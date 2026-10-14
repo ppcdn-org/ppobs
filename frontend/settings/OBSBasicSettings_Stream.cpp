@@ -403,6 +403,16 @@ void OBSBasicSettings::LoadStream1Settings()
 	ui->qualityScoreEnable->setChecked(config_get_bool(main->Config(), "Stream1", "QualityScore"));
 	ui->beautyFilterEnable->setChecked(config_get_bool(main->Config(), "Stream1", "BeautyFilter"));
 	ui->clarityFilterEnable->setChecked(config_get_bool(main->Config(), "Stream1", "ClarityFilter"));
+	ui->voiceTemplate->clear();
+	ui->voiceTemplate->addItem(QTStr("Basic.Settings.Stream.VoiceTemplate.None"), "none");
+	ui->voiceTemplate->addItem(QTStr("Basic.Settings.Stream.VoiceTemplate.GentleBaritone"), "gentle_baritone");
+	ui->voiceTemplate->addItem(QTStr("Basic.Settings.Stream.VoiceTemplate.SweetSoprano"), "sweet_soprano");
+	ui->voiceTemplate->addItem(QTStr("Basic.Settings.Stream.VoiceTemplate.DeepBass"), "deep_bass");
+	{
+		const char *voiceTemplate = config_get_string(main->Config(), "Stream1", "VoiceTemplate");
+		int voiceTemplateIdx = ui->voiceTemplate->findData(QString::fromUtf8(voiceTemplate));
+		ui->voiceTemplate->setCurrentIndex(voiceTemplateIdx >= 0 ? voiceTemplateIdx : 0);
+	}
 	ui->whipSimulcastTotalLayers->setValue(whipSimulcastTotalLayers);
 	ui->whipHevcH264Multitrack->setChecked(whipHevcH264Multitrack);
 	RebuildWHIPSimulcastLayerRows();
@@ -570,9 +580,11 @@ void OBSBasicSettings::SaveStream1Settings()
 	SaveCheckBox(ui->qualityScoreEnable, "Stream1", "QualityScore");
 	SaveCheckBox(ui->beautyFilterEnable, "Stream1", "BeautyFilter");
 	SaveCheckBox(ui->clarityFilterEnable, "Stream1", "ClarityFilter");
+	SaveComboData(ui->voiceTemplate, "Stream1", "VoiceTemplate");
 	main->ApplyTemporalDenoiseSetting();
 	main->ApplyBeautyFilterSetting();
 	main->ApplyClarityFilterSetting();
+	main->ApplyVoiceTemplateSetting();
 
 	auto oldWHIPSimulcastTotalLayers = config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers");
 	SaveSpinBox(ui->whipSimulcastTotalLayers, "Stream1", "WHIPSimulcastTotalLayers");

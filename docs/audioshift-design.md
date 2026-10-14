@@ -41,7 +41,7 @@
   需要独立的共振峰（formant）校正算法，`SoundTouch`（见第 3 节）不提供该能力。P0 的
   预设是"角色化"效果（机器人、卡通、低沉大叔等娱乐效果），不承诺性别转换的自然度。
 - **机器人 / 回声等附加效果层**：P0 只做纯音高变换；环形调制（机器人音）、延迟反馈
-  （空灵/山洞）等属于叠加效果，放入 P1（见 6.2 节），避免 P0 范围扩散。
+  （空灵/山洞）等属于叠加效果，P0 不做以控制范围，已在 P1 实现（见 6.2 节）。
 - **"温柔男中音""甜美女高音"一类情感化声音模板**：这类模板需要音高 + EQ + 压缩的
   组合而不是单一滤镜能给的，且涉及前端批量应用滤镜链的改动，放入 P1（见 6.4 节）。
 - **基于神经网络的音色转换**（RVC / so-vits-svc 一类的 any-to-any 音色克隆）：延迟、
@@ -258,18 +258,27 @@ filter_audio(audio):
 
 具体偏移量需在阶段 C 用真实人声试听调整，上表为初始设计值，不是最终定案。
 
-### 6.2 P1：附加效果层（不在 P0 交付范围）
+### 6.2 P1：附加效果层（已实现）
 
-在 P0 的纯音高变换稳定之后，可选叠加：
+在 P0 的纯音高变换稳定之后叠加，二者互斥（下拉单选），都作用在 SoundTouch 输出
+（滤镜自己反交织后的 per-channel 缓冲区）上，不需要新的第三方依赖：
 
-- **机器人音**：对 SoundTouch 输出做环形调制（乘以一个低频正弦载波，典型 20~60Hz），
-  需要在滤镜结构体中维护一个跨调用保持的相位累加器
-- **空灵 / 山洞回声**：简单延迟反馈（feedback delay line），复用
-  `async-delay-filter.c` 的环形缓冲思路，但增加反馈系数而不仅仅是单次延迟
+- **机器人音**：对输出做环形调制（乘以一个 20~100Hz 的低频正弦载波，默认 30Hz），
+  滤镜结构体内维护一个跨调用保持的相位累加器；立体声各声道共用同一个相位，避免
+  分声道独立调制导致的声像漂移。提供"载波频率"和"混合量"两个参数。
+- **空灵 / 山洞回声**：反馈延迟线（feedback delay line），环形缓冲思路同
+  `async-delay-filter.c`，但带反馈系数而不仅是单次延迟。缓冲在
+  `audioshift_effect_reconfigure()` 里按最大可选延迟（400ms）一次性分配，运行期改
+  延迟只是改读取偏移，不在音频线程分配内存。提供"延迟时间""反馈量""混合量"三个参数。
 
-这两者都不需要新的第三方依赖，但会引入额外的增益/削波风险（见第 8 节），P0 阶段
-**不内置限幅器**——若用户叠加效果后出现爆音，引导其在滤镜链中额外添加 OBS 自带的
-`Limiter` 滤镜，而不是在 AudioShift 内部重新实现一遍限幅逻辑。
+**关于限幅（P0 遗留的评估项）**：结论是不需要独立的限幅阶段。机器人层按构造即有界
+——`out = in*(1-mix) + in*carrier*mix` 且 `|carrier| <= 1`，峰值不超过输入本身；
+回声层容易因反馈累积过冲，用一个只在 `|x| > 0.8` 才起作用的软限幅
+（`audioshift_soft_limit()`，膝点以下逐样本透明、之上渐近到 ±1）同时约束反馈回路与
+输出，正常语音电平完全不受影响。因此不再需要引导用户额外挂 Limiter 来兜底 P1 效果。
+
+切换效果层时会清空旧层的残留状态（相位/回声尾巴）避免切换瞬间的"旧尾音"；只调该层
+参数（拖动滑块）时**不**清空，避免在音频流中打出一个静音缺口。
 
 ### 6.3 不追求的方向：自然共振峰保留变声
 
@@ -304,9 +313,78 @@ filter_audio(audio):
 
 这一层"按模板批量创建/配置滤镜"的逻辑**不属于 `plugins/obs-filters/`**，需要在
 `frontend/`（滤镜管理 UI 所在的 C++ 代码）新增一个"声音模板"入口，选中后调用 OBS
-前端已有的滤镜增删 API 依次添加/配置上述滤镜链，而不是在 libobs 插件层面处理。这部分
-前端改动的具体落点需要在阶段 E 单独勘查 `frontend/dialogs/OBSBasicFilters.cpp` 一类
-文件后再细化，本文档暂不展开。
+前端已有的滤镜增删 API 依次添加/配置上述滤镜链，而不是在 libobs 插件层面处理。
+
+**落地方案（已实现）**：不新增独立对话框，沿用本仓库既有的"自动滤镜"范式
+（`OBSBasic::ApplyTemporalDenoiseSetting()` / `ApplyBeautyFilterSetting()` /
+`ApplyClarityFilterSetting()`，见 `frontend/widgets/OBSBasic.cpp:1423` 起），做成了
+配置驱动的 `OBSBasic::ApplyVoiceTemplateSetting()`：
+
+1. **配置项**：`Stream1` / `VoiceTemplate`（字符串，默认 `"none"`），与现有
+   `TemporalDenoise`/`BeautyFilter`/`ClarityFilter` 等自动滤镜开关并列。因为要选模板
+   而不是开关，在流设置页（`frontend/forms/OBSBasicSettings.ui` 的 `streamPage`，与
+   `Basic.Settings.Stream.TemporalDenoise` 同一分组）放**下拉框**而不是复选框：
+   无 / 温柔男中音 / 甜美女高音 / 沉稳男低音。加载约
+   `frontend/settings/OBSBasicSettings_Stream.cpp:402`、保存约同文件 `:569`。
+
+2. **目标源**：只处理 Windows 麦克风输入源 `wasapi_input_capture`
+   （`plugins/win-wasapi/win-wasapi.cpp:1544`）。与现有自动滤镜的关键差异：**不能**套到
+   `wasapi_output_capture`（桌面/系统音频）——把变声链挂到游戏/音乐上只会毁掉它们，
+   这正是 §2.1 明确不承诺的用法。用 `obs_enum_sources` 遍历、按 `obs_source_get_id()`
+   过滤。
+
+3. **滤镜链与顺序**：AudioShift -> 3-Band EQ -> Compressor，均由
+   `obs_source_create_private()` 创建、`obs_source_filter_add()` 挂载的私有滤镜。
+   顺序依赖 libobs 的插入语义：`obs_source_filter_add()` 把新滤镜插到
+   `source->filters` 的**索引 0**、并把它的 `filter_target` 指向旧的 index 0
+   （`libobs/obs-source.c:3104-3107`），因此**按 AudioShift、EQ、Compressor 的先后
+   顺序 `add`，链路即 AudioShift -> EQ -> Compressor**，无需额外 reorder：
+   - AudioShift：`id="audioshift_filter"`，`preset="custom"`，`pitch_semitones=<模板>`
+   - EQ：`id="basic_eq_filter"`，`low`/`mid`/`high`（dB，-20..20；分频点固定
+     800Hz/5kHz，见 `eq-filter.c`）
+   - Compressor：`id="compressor_filter"`，
+     `ratio`/`threshold`/`attack_time`/`release_time`/`output_gain`
+   - 私有滤镜创建时带上参数 `obs_data`，`obs_source_create_private()` 会把它交给滤镜
+     的 `create`（`obs-source.c:525`），所以不需要建完再 update。
+
+4. **幂等与清理**：三个滤镜用固定名字标识（如 `"AudioShift (Voice Template)"`），
+   每次 Apply 先 `obs_source_get_filter_by_name()` 找现存实例：
+   - 模板从 A 切到 B：对已存在滤镜 `obs_data_reset()` 后按新模板填参、
+     `obs_source_update()` 就地更新，避免删了再建造成一次可听缺口；
+   - 模板切回"无"：三个滤镜逐个 `obs_source_filter_remove()`；
+   - 名字对不上的实例（用户手动添加或改过名）视为用户自建、不动——与现有
+     TemporalDenoise/Beauty/Clarity 的"只在固定名下增删"纪律一致。
+
+5. **触发点**：`OBSBasic` 构造（`OBSBasic.cpp:1410` 附近，紧跟其它 `Apply*`）、流设置
+   保存（`OBSBasicSettings_Stream.cpp:573` 附近）、开始推流
+   （`frontend/widgets/OBSBasic_Streaming.cpp:60` 附近）三处各加一行调用，与现有自动
+   滤镜完全对齐。
+
+6. **参数表**（初值，仍未真人试听验证，见 §14）：
+
+   | 模板 id | 半音 | EQ low/mid/high (dB) | Compressor ratio/threshold/attack/release/gain |
+   |---|---:|---|---|
+   | gentle_baritone | -3 | +2 / 0 / -3 | 3 / -22dB / 10ms / 200ms / +2dB |
+   | sweet_soprano | +4 | -2 / +1 / +3 | 3 / -20dB / 8ms / 150ms / +1dB |
+   | deep_bass | -5 | +3 / -1 / -4 | 4 / -24dB / 12ms / 250ms / +2dB |
+
+   数值沿用 §6.1 的设计估值口径（调研得出、非试听验证），阶段 F 的真人试听任务里一并
+   复核。
+
+7. **落点文件（均已落地）**：
+
+   ```text
+   frontend/widgets/OBSBasic.cpp                ApplyVoiceTemplateSetting() 实现 + 参数表
+   frontend/widgets/OBSBasic.hpp                方法声明
+   frontend/widgets/OBSBasic_Streaming.cpp      开始推流时调用
+   frontend/settings/OBSBasicSettings_Stream.cpp 读写 VoiceTemplate 配置、保存时调用
+   frontend/forms/OBSBasicSettings.ui            serviceAdvancedOptionsLayout 加下拉框
+   frontend/data/locale/en-US.ini / zh-CN.ini     Basic.Settings.Stream.VoiceTemplate*
+   ```
+
+8. **不覆盖**：多麦克风的差异化模板（当前一个 profile 一个模板、套用到所有麦克风源）；
+   模板链与用户手动插入的其它音频滤镜之间的先后（由用户在滤镜窗口自行调整，模板链
+   内部顺序固定）。
 
 **P2 研究方向（不承诺）**：若 P1 的"固定参数模板"听感不够稳定（不同用户原始音域差异
 导致同一模板效果飘忽），可以研究基频检测 + 自适应半音偏移——实时估计输入人声基频
@@ -323,7 +401,10 @@ filter_audio(audio):
   （选择非自定义预设时，该滑块跟随预设值但置灰，与 `noise-suppress-filter.c` 里
   "选中方法后显示/隐藏对应参数"的 `obs_property_set_modified_callback` 模式一致）
 - `Estimated Latency`：只读文本，展示当前设置下的预计算法延迟（毫秒）
-- （P1 追加）`Effect Layer`：无 / 机器人 / 空灵回声，及各自的强度参数
+- **（P1 已实现）`Effect Layer`**：下拉 无 / 机器人 / 空灵回声；选中某层时只启用该层
+  参数（沿用同一套 `obs_property_set_modified_callback` 模式）：
+  - 机器人：`Robot Carrier`（20~100 Hz）、`Robot Mix`（0~100%）
+  - 空灵回声：`Echo Delay`（30~400 ms）、`Echo Feedback`（0~90%）、`Echo Mix`（0~100%）
 
 ## 8. 性能
 
@@ -331,7 +412,10 @@ filter_audio(audio):
 
 `audioshift-bench.c`（`ENABLE_TEST_INPUT` 下的基准测试，直接驱动
 `audioshift-soundtouch.h` 的桥接层，不经过 OBS 滤镜回调）在本机（见
-`BUILD_NOTE.md` 的环境）用 48kHz、480 帧/块（对应 OBS 典型的 10ms 音频包）实测：
+`BUILD_NOTE.md` 的环境）用 48kHz、480 帧/块（对应 OBS 典型的 10ms 音频包）实测。
+
+**初始基线（未调窗口，SoundTouch 音乐默认值 `SEQUENCE_MS`≈82 /
+`SEEKWINDOW_MS`≈28 / `OVERLAP_MS`=12）：**
 
 | 配置 | 单块处理耗时（均值） | 单块处理耗时（最大值） | 算法引入延迟 |
 |---|---:|---:|---:|
@@ -340,19 +424,31 @@ filter_audio(audio):
 | 立体声 0 半音（不变调） | 17.7 µs | 87.9 µs | ~63.0 ms |
 | 单声道 +9 半音 | 23.5 µs | 129.3 µs | ~91.0 ms |
 
-CPU 占用结论：单块耗时均值在 17~33 微秒，相对 10ms（10000 微秒）的预算占比低于
-0.4%，即使取最坏观测值（222.6 微秒）也只占预算的 2.2%——**CPU 占用确认可忽略**，
-不需要为此单独做性能优化。
+**阶段 C 调节后（应用 SoundTouch `TDStretch.h` 自带的语音推荐值
+`SEQUENCE_MS`=40 / `SEEKWINDOW_MS`=15 / `OVERLAP_MS`=8，由
+`audioshift_soundtouch_set_voice_low_latency()` 在每次创建/重建实例时设置）：**
 
-算法延迟结论（**和编码前的预期不一致，需要在阶段 C 处理**）：延迟并不是一个
-数十毫秒的稳定数字，而是随半音偏移量变化，在本次实测里从 32ms 到 91ms 不等，且
-即使半音偏移为 0（不变调）也有 63ms 延迟——说明延迟主要来自 SoundTouch 默认的
-`SEQUENCE_MS`/`SEEKWINDOW_MS`/`OVERLAP_MS` 窗口设置（面向音乐场景调的默认值），
-不是音高变换本身的必然代价。90ms 级的延迟对直播场景里"边说话边通过耳返听自己"
-的场景会是能明显感知的卡顿感。阶段 C 需要评估调低这三个窗口参数（SoundTouch 文档
-里明确提到可以为语音场景调小）换取更低延迟，并重新跑一遍 `audioshift-bench.c`
-确认改善幅度，再据此决定 §7 的"预计延迟"展示文案是否需要默认提示用户"当前设置下
-延迟较高，建议调整"。
+| 配置 | 单块处理耗时（均值） | 单块处理耗时（最大值） | 算法引入延迟 |
+|---|---:|---:|---:|
+| 立体声 +9 半音 | 41.0 µs | 82.4 µs | ~36.1 ms |
+| 立体声 -12 半音 | 32.3 µs | 98.5 µs | ~32.0 ms |
+| 立体声 0 半音（不变调） | 25.1 µs | 79.0 µs | ~32.0 ms |
+| 单声道 +9 半音 | 30.1 µs | 68.9 µs | ~35.7 ms |
+
+CPU 占用结论：单块耗时均值在 17~41 微秒，相对 10ms（10000 微秒）的预算占比低于
+0.5%，即使取最坏观测值（98.5 微秒）也只占预算的约 1%——**CPU 占用确认可忽略**，
+不需要为此单独做性能优化。调小窗口后耗时略有上升（搜索窗口变短、重叠区变短，
+但处理序列变短），仍然远低于预算。
+
+算法延迟结论（**阶段 C 已处理**）：初始实测延迟随半音偏移量变化，从 32ms 到 91ms
+不等，即使半音偏移为 0 也有 63ms——确认延迟主要来自 SoundTouch 面向音乐场景调的
+默认窗口（`SEQUENCE_MS`≈82ms 是最大来源），而非音高变换本身的必然代价。按
+SoundTouch 源码 `TDStretch.h` 里明确标注的"语音处理用这组参数更合适"的取值
+（40/15/8ms）调低三个窗口后，最坏情况从 91.4ms 降到 36.1ms，四组配置收敛到
+32~36ms 的窄区间（各配置不再随半音数剧烈波动）。36ms 级延迟对"边说话边耳返监听"
+仍有轻微可感知延迟，但已从"明显卡顿"降到可用范围；这是音质与延迟的取舍点，若
+后续真人试听认为伪影不可接受，可把 `SEQUENCE_MS` 回调一档（如 50~60ms）再评估。
+§7 的"预计延迟"文案继续按运行时实测值动态显示，不需要固定提示"延迟较高"。
 
 ### 8.2 仍未验证
 
@@ -383,6 +479,9 @@ CPU 占用结论：单块耗时均值在 17~33 微秒，相对 10ms（10000 微�
 1. `get_properties`/`get_defaults`，预设下拉与半音滑块的联动
 2. 中英文 locale 词条（`AudioShift.*`，参照 `BackgroundSegmentation.*` 的命名风格）
 3. 真实人声试听，调整 6.1 表格的预设半音值
+4. **已完成**：按 §8.1 调低 SoundTouch 时域窗口
+   （`audioshift_soundtouch_set_voice_low_latency()`，40/15/8ms），把算法延迟从
+   最坏 91ms 降到 36ms 级
 
 ### 阶段 D：稳定性
 
@@ -390,11 +489,13 @@ CPU 占用结论：单块耗时均值在 17~33 微秒，相对 10ms（10000 微�
 2. 滤镜启用/禁用、预设/参数热切换时的爆音与"打滑"问题排查
 3. 异常输入（声道数突变、采样率突变、极短/静音缓冲区）的边界测试
 
-### 阶段 E（P1，不在首个发布范围内）
+### 阶段 E（P1）
 
-1. 机器人 / 空灵回声效果层
-2. 声音模板（见 6.4）：勘查 `frontend/dialogs/OBSBasicFilters.cpp` 一类文件，设计
-   "按模板批量创建/配置 AudioShift + EQ + Compressor 滤镜链"的前端入口
+1. **已完成**：机器人 / 空灵回声效果层（见 6.2/7），含限幅评估与纯逻辑单测
+2. **已完成**：声音模板（见 6.4）——按 `ApplyTemporalDenoiseSetting` 范式实现
+   `OBSBasic::ApplyVoiceTemplateSetting()`，配置项 `Stream1/VoiceTemplate`、目标源
+   `wasapi_input_capture`、固定命名的 AudioShift+EQ+Compressor 滤镜链幂等增删，
+   设置页下拉框 + 中英文词条齐备
 3. 评估是否投入共振峰保留、自适应基频锚定或神经音色转换（P2 方向，需单独立项评估）
 
 ## 10. 测试要求
@@ -452,7 +553,7 @@ CPU 占用结论：单块耗时均值在 17~33 微秒，相对 10ms（10000 微�
 
 ```text
 plugins/obs-filters/audioshift-filter.c              滤镜主体（properties、FIFO、延迟补偿）
-plugins/obs-filters/audioshift-filter.h              纯逻辑 helper（预设表、交织/反交织），供测试复用
+plugins/obs-filters/audioshift-filter.h              纯逻辑 helper（预设表、交织/反交织、效果层解析/环形调制/软限幅），供测试复用
 plugins/obs-filters/audioshift-filter-test.c         单元测试（ENABLE_TEST_INPUT），只链 .h，不链 .c
 plugins/obs-filters/audioshift-bench.c               真实 CPU/延迟基准（ENABLE_TEST_INPUT），见 8.1
 plugins/obs-filters/audioshift-soundtouch.cpp / .h   SoundTouch C++ API 的 C 封装
@@ -468,7 +569,8 @@ plugins/obs-filters/soundtouch/VENDORED-FROM.md      版本/commit/裁剪范围�
 `OBS_MODULE_USE_DEFAULT_LOCALE()` 宏之后才存在——测试程序如果链接整个
 `audioshift-filter.c`，链接器就会要求解析这个符号，而把 `obs-filters.c` 也链进来
 又会级联要求链接它 `extern` 引用的全部 ~30 个其它滤镜的 `struct obs_source_info`。
-解决办法是把三个纯逻辑函数（预设查表、交织、反交织）改成 `static inline` 直接定义在
+   解决办法是把这些纯逻辑函数（预设查表、交织/反交织、效果层解析/环形调制/软限幅）
+   改成 `static inline` 直接定义在
 头文件里（和 `libobs/util/deque.h` 的做法一致），测试程序只 `#include` 这个头文件，
 完全不需要链接 `audioshift-filter.c`/`audioshift-soundtouch.cpp`/SoundTouch。
 
@@ -488,6 +590,25 @@ plugins/obs-filters/gain-filter.c             最简单的同步音频滤镜模�
 plugins/obs-filters/compressor-filter.c       设置的互斥保护、属性 UI 模式
 plugins/obs-filters/noise-suppress-filter.c   FIFO 缓冲 + 延迟补偿 + 第三方 DSP 库接线
 plugins/obs-filters/async-delay-filter.c      延迟/环形缓冲思路（P1 回声效果参考）
+```
+
+### 12.3 P1 声音模板（已实现，落地方案见 6.4）
+
+```text
+frontend/widgets/OBSBasic.cpp                  ApplyVoiceTemplateSetting() + 模板参数表
+frontend/widgets/OBSBasic.hpp                  方法声明
+frontend/widgets/OBSBasic_Streaming.cpp        开始推流时调用
+frontend/settings/OBSBasicSettings_Stream.cpp  读写 VoiceTemplate 配置、保存时调用
+frontend/forms/OBSBasicSettings.ui             serviceAdvancedOptionsLayout 加下拉框
+frontend/data/locale/en-US.ini / zh-CN.ini      Basic.Settings.Stream.VoiceTemplate*
+```
+
+参考实现（现有自动滤镜范式，直接照抄结构）：
+
+```text
+frontend/widgets/OBSBasic.cpp:1423  ApplyTemporalDenoiseSetting()  配置驱动、obs_enum_sources、固定命名增删
+frontend/widgets/OBSBasic.cpp:1458  ApplyBeautyFilterSetting()
+frontend/widgets/OBSBasic.cpp:1497  ApplyClarityFilterSetting()
 ```
 
 ## 13. 结论
@@ -532,12 +653,24 @@ P0 不追求"自然"性别转换音质，只做娱乐向角色化变声；若后
      `build_x64/plugins/obs-filters/RelWithDebInfo/obs-filters.dll`，没有报错或
      警告。`§4.2` 里记录的 API 签名假设（`uint` 类型、`setPitchSemiTones(double)`
      重载选择等）都在真实头文件下被验证为正确，不需要修正
-- `audioshift-filter-test.c` 四项纯逻辑单元测试已跑通（退出码 0，无断言失败，见
-  10 节）
+- `audioshift-filter-test.c` 纯逻辑单元测试已跑通（退出码 0，无断言失败）：P0 的
+  预设/交织/反交织，加 P1 新增的效果 id 解析、机器人环形调制、软限幅边界（见 10 节）
 - **实际 CPU 占用与算法延迟已实测**（`audioshift-bench.c`，见 8.1 完整数据）：
-  CPU 占用在 48kHz/480 帧块下均值 17~33 微秒，远低于 10ms 预算，可忽略；算法延迟
-  实测 32~91ms（随半音偏移量变化），比"数十毫秒级"的编码前预期更高且波动更大，
-  已记录为阶段 C 需要处理的问题（调低 SoundTouch 窗口参数）而不是直接采用默认值
+  CPU 占用在 48kHz/480 帧块下均值 17~41 微秒，远低于 10ms 预算，可忽略；算法延迟
+  首轮实测 32~91ms（随半音偏移量变化），比"数十毫秒级"的编码前预期更高且波动更大，
+  已按阶段 C 用语音推荐窗口参数（40/15/8ms）处理，复测收敛到 32~36ms
+- **低延迟窗口已落地并复测**：`audioshift_soundtouch_set_voice_low_latency()`
+  在每次创建 SoundTouch 实例时设 `SEQUENCE_MS`/`SEEKWINDOW_MS`/`OVERLAP_MS`
+  为 40/15/8ms；重建 `audioshift-bench` 后实测最坏延迟 91.4ms -> 36.1ms，CPU
+  均值仍在 41 微秒以内
+- **P1 效果层已落地**：机器人（环形调制）与空灵回声（带反馈的环形缓冲）两个互斥
+  效果层，含 UI 参数联动、中英文词条、效果切换时的状态清理；限幅评估结论为"仅回声
+  回路用膝点 0.8 的软限幅即可"（见 6.2）。`obs-filters.dll` 已重新编译链接通过，
+  纯逻辑单测覆盖新增 helper（退出码 0）
+- **P1 声音模板已落地**：`OBSBasic::ApplyVoiceTemplateSetting()`
+  （`frontend/widgets/OBSBasic.cpp`）+ 设置页下拉框 + 中英文词条，按 6.4 方案实现
+  固定命名的 AudioShift+EQ+Compressor 链幂等增删。`.ui` 经 Qt autogen（uic）后
+  `obs64.exe` 重新编译链接通过，无 error/warning
 
 ### 仍未验证
 
@@ -545,7 +678,14 @@ P0 不追求"自然"性别转换音质，只做娱乐向角色化变声；若后
   验证"跑得动、延迟多少"，不能验证"听起来像不像预期的角色"；本文档编写环境没有
   音频播放能力，无法替代真人试听
 - 真实语音信号下延迟是否与合成正弦波的实测结果一致（见 8.2）
-- 长时间直播下的稳定性与内存表现
+- **P1 效果层的主观听感**：机器人载波频率/混合量、回声延迟/反馈/混合量的默认值
+  （30Hz、100%、120ms/40%/40%）与可用范围是设计估值，未经真人试听；回声在高反馈
+  下的软限幅是否产生可感知的音染，也需实际听测
+- **P1 声音模板（6.4）的 UI 与听感未实机验证**：本环境未启动 `obs64.exe`——下拉框
+  显示/持久化、只挂麦克风源（`wasapi_input_capture`）的过滤、模板热切换无爆音，以及
+  6.4 参数表的听感都需在真实 OBS 里确认
+- 长时间直播下的稳定性与内存表现（含回声环形缓冲：8 声道 × 400ms @ 48kHz 约
+  614KB/实例）
 - 滤镜在 OBS 实际界面中能否正常添加、显示属性面板、处理真实音频流——
   `audioshift-filter-test.c`/`audioshift-bench.c` 都是独立命令行程序，直接调用
   `audioshift-soundtouch.h` 或纯逻辑函数，不经过 `obs_register_source` 之后的真实

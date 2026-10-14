@@ -1,6 +1,7 @@
 #pragma once
 
 #include <obs-module.h>
+#include <math.h>
 #include <string.h>
 
 /* Pure, OBS-module-independent helpers factored out of audioshift-filter.c,
@@ -46,6 +47,60 @@ static inline float audioshift_preset_semitones(const char *preset)
 			return audioshift_presets[i].semitones;
 	}
 	return 0.0f;
+}
+
+/* ---------------------------------------------------------------- */
+/* Effect layers (P1; see docs/audioshift-design.md sections 6.2/7). The
+ * effect runs after the pitch shift, on the filter's own deinterleaved output
+ * buffer; these helpers hold the parts that don't depend on OBS or on any
+ * per-call state, so audioshift-filter-test.c can cover them. */
+
+#define S_EFFECT_NONE "none"
+#define S_EFFECT_ROBOT "robot"
+#define S_EFFECT_ECHO "echo"
+
+enum audioshift_effect {
+	AUDIOSHIFT_EFFECT_NONE = 0,
+	AUDIOSHIFT_EFFECT_ROBOT,
+	AUDIOSHIFT_EFFECT_ECHO,
+};
+
+static inline enum audioshift_effect audioshift_effect_from_string(const char *effect)
+{
+	if (effect) {
+		if (strcmp(effect, S_EFFECT_ROBOT) == 0)
+			return AUDIOSHIFT_EFFECT_ROBOT;
+		if (strcmp(effect, S_EFFECT_ECHO) == 0)
+			return AUDIOSHIFT_EFFECT_ECHO;
+	}
+	return AUDIOSHIFT_EFFECT_NONE;
+}
+
+/* Ring modulation: blend the dry signal with a copy multiplied by a low
+ * frequency carrier. mix=0 is a bit-exact passthrough; because |carrier| <= 1
+ * the result can never exceed the dry signal's own peak at any mix, so the
+ * robot layer alone cannot clip (the design doc's "does P1 need a limiter"
+ * question resolves to "no" for this layer). */
+static inline float audioshift_robot_mix(float in, float carrier, float mix)
+{
+	return in * (1.0f - mix) + in * carrier * mix;
+}
+
+/* Transparent below +-knee, then approaches +-1 asymptotically, so a feedback
+ * delay's repeats cannot run away into hard clipping. Only the echo layer
+ * uses it. */
+#define AUDIOSHIFT_SOFT_LIMIT_KNEE 0.8f
+
+static inline float audioshift_soft_limit(float x)
+{
+	const float knee = AUDIOSHIFT_SOFT_LIMIT_KNEE;
+	const float sign = x < 0.0f ? -1.0f : 1.0f;
+	const float magnitude = x < 0.0f ? -x : x;
+
+	if (magnitude < knee)
+		return x;
+
+	return sign * (knee + (1.0f - knee) * tanhf((magnitude - knee) / (1.0f - knee)));
 }
 
 static inline void audioshift_interleave(const struct obs_audio_data *audio, size_t channels, float *out)
