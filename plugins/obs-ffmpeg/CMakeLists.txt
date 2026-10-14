@@ -9,6 +9,12 @@ endif()
 
 include(cmake/dependencies.cmake)
 
+if(ENABLE_NEW_MPEGTS_OUTPUT)
+  find_package(Websocketpp 0.8 REQUIRED)
+  find_package(Asio 1.12.1 REQUIRED)
+  find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
+endif()
+
 add_library(obs-ffmpeg MODULE)
 add_library(OBS::ffmpeg ALIAS obs-ffmpeg)
 
@@ -23,6 +29,8 @@ target_sources(
     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:obs-ffmpeg-rist.h>
     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:obs-ffmpeg-srt.h>
     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:obs-ffmpeg-url.h>
+    $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:srt-degrade-client.cpp>
+    $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:srt-degrade-client.h>
     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:obs-ffmpeg-vaapi.c>
     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:vaapi-utils.c>
     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:vaapi-utils.h>
@@ -50,6 +58,9 @@ target_compile_definitions(
     $<$<BOOL:${ENABLE_FFMPEG_LOGGING}>:ENABLE_FFMPEG_LOGGING>
     $<$<BOOL:${ENABLE_FFMPEG_NVENC}>:ENABLE_FFMPEG_NVENC>
     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:NEW_MPEGTS_OUTPUT>
+    $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:ASIO_STANDALONE>
+    $<$<AND:$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>,$<PLATFORM_ID:Windows>>:_WEBSOCKETPP_CPP11_STL_>
+    $<$<AND:$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>,$<PLATFORM_ID:Windows>>:_WIN32_WINNT=0x0603>
 )
 
 target_link_libraries(
@@ -74,6 +85,11 @@ target_link_libraries(
     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:Libdrm::Libdrm>
     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:Librist::Librist>
     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:Libsrt::Libsrt>
+    $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:Websocketpp::Websocketpp>
+    $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:Asio::Asio>
+    $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:OpenSSL::SSL>
+    $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:OpenSSL::Crypto>
+    $<$<AND:$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>,$<PLATFORM_ID:Windows>>:iphlpapi>
 )
 
 if(OS_WINDOWS)

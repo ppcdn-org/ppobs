@@ -27,6 +27,7 @@
 #include "obs-ffmpeg-compat.h"
 #include "obs-ffmpeg-rist.h"
 #include "obs-ffmpeg-srt.h"
+#include "srt-degrade-client.h"
 #include <libavutil/channel_layout.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/mastering_display_metadata.h>
@@ -441,8 +442,25 @@ static inline int connect_mpegts_url(struct ffmpeg_output *stream, bool is_rist)
 	else
 		stream->has_connected = true;
 
-	if (!is_rist)
+	if (!is_rist) {
 		mpegts_srt_loss_arm(stream);
+
+		/* Degrade WS control channel (see srt-degrade-client.h), picked by
+		 * whichever codec this connection actually carries - setup_video_
+		 * settings() (earlier in set_config()'s call chain) has already
+		 * resolved stream->ff_data.config.video_encoder by this point.
+		 * Either string may be empty (no whipTracks entry for this codec,
+		 * e.g. the Origin has no WebRTC base URL), in which case
+		 * srt_degrade_register() just leaves this output without a
+		 * degrade channel. */
+		const char *codec = stream->ff_data.config.video_encoder;
+		const bool is_hevc = codec && strcmp(codec, "hevc") == 0;
+		srt_degrade_register(stream->output, codec,
+				     is_hevc ? stream->ff_data.config.degrade_ws_url_hevc
+					     : stream->ff_data.config.degrade_ws_url_h264,
+				     is_hevc ? stream->ff_data.config.degrade_ws_token_hevc
+					     : stream->ff_data.config.degrade_ws_token_h264);
+	}
 
 	return 0;
 fail:
@@ -1008,6 +1026,20 @@ static bool fetch_service_info(struct ffmpeg_output *stream, struct ffmpeg_cfg *
 	config->is_srt = is_srt(config->url);
 	config->srt_pkt_size = 0; /* use default, which is usually 1316 for mpegts */
 
+	/* Degrade WS credentials (see srt-degrade-client.h): obs_service_get_settings
+	 * addrefs the service's own live settings object rather than cloning it
+	 * (see libobs/obs-service.c), so the returned strings stay valid for as
+	 * long as the service itself does - safe to release immediately, same
+	 * as every other config->* string here sourced via connect-info. */
+	{
+		obs_data_t *degrade_settings = obs_service_get_settings(service);
+		config->degrade_ws_url_h264 = obs_data_get_string(degrade_settings, "ppcdn_degrade_ws_url_h264");
+		config->degrade_ws_token_h264 = obs_data_get_string(degrade_settings, "ppcdn_degrade_ws_token_h264");
+		config->degrade_ws_url_hevc = obs_data_get_string(degrade_settings, "ppcdn_degrade_ws_url_hevc");
+		config->degrade_ws_token_hevc = obs_data_get_string(degrade_settings, "ppcdn_degrade_ws_token_hevc");
+		obs_data_release(degrade_settings);
+	}
+
 	/* parse pkt_size option */
 	const char *p;
 	char buf[1024];
@@ -1054,6 +1086,27 @@ static bool setup_video_settings(struct ffmpeg_output *stream, struct ffmpeg_cfg
 		uint32_t divisor = obs_encoder_get_frame_rate_divisor(vencoder);
 		config->video_gop_sizes[i] = keyint_sec ? keyint_sec * ovi.fps_num / (ovi.fps_den * divisor) : 250;
 		obs_data_release(settings);
+	}
+
+	/* Degrade-driven layer trim (see srt-degrade-client.h): a prior
+	 * TARGET_STATE may have asked for fewer layers than are actually
+	 * attached to this output. Drop the top (highest-bitrate) slots first,
+	 * keeping the lowest N - same "cut from the top, keep the bottom"
+	 * convention WHIP's ladder trim uses (whip-output.cpp's
+	 * collectVideoLayers/TargetLayers). 0 means no target yet (or nothing
+	 * to trim): every collected layer stays, matching today's behavior. */
+	{
+		int target_layers = srt_degrade_target_layers(stream->output);
+		if (target_layers > 0 && (size_t)target_layers < video_encoder_count) {
+			size_t to_drop = video_encoder_count - (size_t)target_layers;
+			for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS && to_drop > 0; i++) {
+				if (!config->video_encoders[i])
+					continue;
+				config->video_encoders[i] = NULL;
+				to_drop--;
+			}
+			video_encoder_count = (size_t)target_layers;
+		}
 	}
 
 	/* Every layer of a simulcast ladder must use the same codec. Mixing
@@ -1278,6 +1331,14 @@ static void ffmpeg_mpegts_full_stop(void *data)
 static void stop(void *data, bool signal, uint64_t ts)
 {
 	struct ffmpeg_output *stream = data;
+
+	/* Symmetric with connect_mpegts_url()'s srt_degrade_register(): this is
+	 * the one teardown path every stop (user-initiated, destroy, or this
+	 * client's own restart-to-apply-a-layer-cut) funnels through - see
+	 * ffmpeg_mpegts_destroy(), which always calls this before freeing the
+	 * stream. A no-op if this output was never registered (e.g. RIST, or no
+	 * degrade credentials were ever configured for it). */
+	srt_degrade_unregister(stream->output);
 
 	/* Gate on write_thread_active, not just active(): `running` can already
 	 * be false while the write thread is still alive, and freeing the

@@ -50,6 +50,20 @@ struct ffmpeg_cfg {
 	bool is_srt;
 	bool is_rist;
 	int srt_pkt_size;
+#ifdef NEW_MPEGTS_OUTPUT
+	/* Degrade WS control-channel credentials for this publish's codec, read
+	 * from service settings ("ppcdn_degrade_ws_url_h264" etc., written by
+	 * ResolvePPCDNPublishEndpoint - see srt-degrade-client.h). Only one pair
+	 * is actually used per connection (picked by video_encoder once it's
+	 * known), but both are fetched up front in fetch_service_info() since
+	 * setup_video_settings() runs after it and resolves the codec. Empty
+	 * when the Origin has no WebRTC base URL configured - that connection
+	 * just runs without a degrade channel, same as before this existed. */
+	const char *degrade_ws_url_h264;
+	const char *degrade_ws_token_h264;
+	const char *degrade_ws_url_hevc;
+	const char *degrade_ws_token_hevc;
+#endif
 };
 
 struct ffmpeg_audio_info {

@@ -108,6 +108,29 @@ QString ParseRTMPStreamName(const QString &url)
 	return segments.last();
 }
 
+// DegradeWsURLFromWhipURL turns a per-codec WHIP publish URL into its degrade
+// WS control URL, identical to WsDegradeClient::whip_to_ws
+// (plugins/obs-webrtc/degrade-client.cpp) - duplicated here rather than
+// shared because obs-ffmpeg (which actually opens this connection, see
+// srt-degrade-client.cpp) is a separate plugin module from obs-webrtc and
+// this frontend code links against neither. Returns empty on an unexpected
+// shape rather than guessing.
+std::string DegradeWsURLFromWhipURL(std::string url)
+{
+	while (!url.empty() && url.back() == '/')
+		url.pop_back();
+	if (url.rfind("https://", 0) == 0)
+		url = "wss://" + url.substr(8);
+	else if (url.rfind("http://", 0) == 0)
+		url = "ws://" + url.substr(7);
+	else
+		return "";
+	const size_t whipAt = url.rfind("/whip");
+	if (whipAt == std::string::npos || whipAt + 5 != url.size())
+		return "";
+	return url.substr(0, whipAt) + "/ws/whip";
+}
+
 // ppobs's "ppcenter_url" setting may be the bare origin
 // ("https://api.pp-cdn.org") or the full publish endpoint; this returns the
 // publish endpoint either way so the SRT node request below POSTs to the right
@@ -178,6 +201,15 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 		{"appSecret", appSecret},
 		{"streamName", streamName.toStdString()},
 		{"protocol", protocol},
+		// Always requested, same as every WHIP publish (see
+		// ppcenter-client.cpp's ppcenter_build_publish_json): gets back a
+		// per-codec WHIP-style bearer token this SRT/RTMP publish doesn't
+		// otherwise have, used only to open the degrade WS control channel
+		// (docs/design/publish-degrade-protocol.zh-CN.md §6.1) - it never
+		// switches transport. Omitted from the response (whipTracks stays
+		// unset) when the picked Origin has no WebRTC base URL configured;
+		// handled as a plain "degrade unavailable" case below, not an error.
+		{"capabilities", nlohmann::json::array({"whip-hevc-h264"})},
 	};
 	if (!region.empty())
 		body["requestRegion"] = region;
@@ -205,6 +237,8 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 	std::string publishToken;
 	std::string publishTokenH264;
 	std::string publishTokenHEVC;
+	std::string degradeWsURLH264, degradeWsTokenH264;
+	std::string degradeWsURLHEVC, degradeWsTokenHEVC;
 	try {
 		const auto decoded = nlohmann::json::parse(response);
 		endpoint = decoded.value("ppcdnPublishEndpoint", "");
@@ -218,6 +252,22 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 		if (tokens != decoded.end() && tokens->is_object()) {
 			publishTokenH264 = tokens->value("h264", "");
 			publishTokenHEVC = tokens->value("hevc", "");
+		}
+		// whipTracks (requested via "whip-hevc-h264" above): per-codec WHIP
+		// URL + bearer token, absent when the Origin has no WebRTC base URL
+		// configured. Turn the WHIP URL into its degrade WS URL here -
+		// obs-ffmpeg's SRT output just needs a ready wss:// URL, it never
+		// parses a WHIP URL itself.
+		const auto whipTracks = decoded.find("whipTracks");
+		if (whipTracks != decoded.end() && whipTracks->is_object()) {
+			if (const auto h264 = whipTracks->find("h264"); h264 != whipTracks->end()) {
+				degradeWsURLH264 = DegradeWsURLFromWhipURL(h264->value("url", ""));
+				degradeWsTokenH264 = h264->value("bearerToken", "");
+			}
+			if (const auto hevc = whipTracks->find("hevc"); hevc != whipTracks->end()) {
+				degradeWsURLHEVC = DegradeWsURLFromWhipURL(hevc->value("url", ""));
+				degradeWsTokenHEVC = hevc->value("bearerToken", "");
+			}
 		}
 	} catch (const std::exception &) {
 		error = "PPCenter returned an invalid publish-node response";
@@ -241,6 +291,14 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 	// services of an HEVC/H264 multitrack publish.
 	obs_data_set_string(settings, "ppcdn_publish_token_h264", publishTokenH264.c_str());
 	obs_data_set_string(settings, "ppcdn_publish_token_hevc", publishTokenHEVC.c_str());
+	// Degrade WS control-channel credentials, read by obs-ffmpeg-mpegts.c's
+	// fetch_service_info() (see srt-degrade-client.cpp). Empty when the
+	// Origin has no WebRTC base URL - that output just runs without the
+	// degrade connection, same as today, rather than failing the publish.
+	obs_data_set_string(settings, "ppcdn_degrade_ws_url_h264", degradeWsURLH264.c_str());
+	obs_data_set_string(settings, "ppcdn_degrade_ws_token_h264", degradeWsTokenH264.c_str());
+	obs_data_set_string(settings, "ppcdn_degrade_ws_url_hevc", degradeWsURLHEVC.c_str());
+	obs_data_set_string(settings, "ppcdn_degrade_ws_token_hevc", degradeWsTokenHEVC.c_str());
 	// Persist the resolved stream name for the P2P companion output. The
 	// settings-save path (OBSBasicSettings_Stream.cpp) fills "ppcenter_stream"
 	// with a WHIP URL-*path* parser (ParseWHIPStreamNameFromServerUrl, which
