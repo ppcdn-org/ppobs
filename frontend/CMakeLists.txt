@@ -30,6 +30,10 @@ if(NOT TARGET OBS::abs-ts)
   add_subdirectory("${CMAKE_SOURCE_DIR}/shared/abs-ts" abs-ts)
 endif()
 
+if(NOT TARGET OBS::quality-score)
+  add_subdirectory("${CMAKE_SOURCE_DIR}/shared/quality-score" quality-score)
+endif()
+
 add_executable(obs-studio)
 add_executable(OBS::studio ALIAS obs-studio)
 
@@ -45,6 +49,7 @@ target_link_libraries(
     OBS::json11
     OBS::bpm
     OBS::abs-ts
+    OBS::quality-score
 )
 
 include(cmake/ui-components.cmake)

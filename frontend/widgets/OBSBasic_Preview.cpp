@@ -231,13 +231,14 @@ static obs_source_t *CreateQualityScoreLabel(float pixelRatio)
 	return obs_source_create_private(text_source_id, "Preview quality score label", settings);
 }
 
-/* Signal callback from the WHIP output's quality scorer thread - only
- * stores the value; all Qt/graphics work happens in
- * DrawQualityScoreLabel on the graphics thread. */
-void OBSBasic::OnQualityScore(void *data, calldata_t *cd)
+/* Sink callback from the QualityScorer's decode thread - only stores the
+ * value; all Qt/graphics work happens in DrawQualityScoreLabel on the
+ * graphics thread. */
+void OBSBasic::OnQualityScore(void *data, float score, float psnr)
 {
+	(void)psnr;
 	OBSBasic *window = static_cast<OBSBasic *>(data);
-	window->qualityScoreValue.store((float)calldata_float(cd, "score"));
+	window->qualityScoreValue.store(score);
 	window->qualityScoreUpdateNs.store(os_gettime_ns());
 }
 

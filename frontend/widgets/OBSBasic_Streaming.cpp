@@ -257,18 +257,26 @@ void OBSBasic::StreamingStart()
 	OBSOutputAutoRelease output = obs_frontend_get_streaming_output();
 	ui->statusbar->StreamStarted(output);
 
-	// Quality score overlay in the preview: only WHIP outputs declare
-	// the "quality_score" signal, so gate on protocol to avoid a
-	// "signal not found" warning for every other output type. The
-	// format string is (re)cached here, on the UI thread, before the
-	// scorer thread can possibly reach the graphics-thread reader.
+	// Quality score overlay in the preview. Protocol-independent: score
+	// whichever output is publishing (SRT/RTMP/WHIP) - the scorer taps the
+	// output's own encoded packets and the program feed, so it is not tied
+	// to any transport. Enabled unless the user turned it off: the service
+	// setting wins when set, else the Settings > Stream checkbox (default
+	// on). The format string is (re)cached here, on the UI thread, before
+	// the scorer thread can possibly reach the graphics-thread reader.
 	{
+		bool enabled = true;
 		obs_service_t *service_obj = GetService();
-		const char *protocol = service_obj ? obs_service_get_protocol(service_obj) : nullptr;
-		if (protocol && strcmp(protocol, "WHIP") == 0) {
+		OBSDataAutoRelease service_settings = service_obj ? obs_service_get_settings(service_obj) : nullptr;
+		if (service_settings && obs_data_has_user_value(service_settings, "quality_score"))
+			enabled = obs_data_get_bool(service_settings, "quality_score");
+		else if (config_has_user_value(Config(), "Stream1", "QualityScore"))
+			enabled = config_get_bool(Config(), "Stream1", "QualityScore");
+
+		if (enabled) {
 			qualityScoreFormat = QTStr("Basic.Main.QualityScore");
-			qualityScoreSignal.Connect(obs_output_get_signal_handler(output), "quality_score",
-						   OnQualityScore, this);
+			qualityScorer.SetSink(OnQualityScore, this);
+			qualityScorer.Start(output);
 		}
 	}
 
@@ -371,7 +379,7 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 
 	ui->statusbar->StreamStopped();
 
-	qualityScoreSignal.Disconnect();
+	qualityScorer.Stop();
 	qualityScoreUpdateNs = 0;
 
 	emit StreamingStopped();

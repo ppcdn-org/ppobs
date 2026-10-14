@@ -16,18 +16,27 @@ struct AVPacket;
 struct SwsContext;
 
 /*
- * Full-reference quality score for the WHIP stream.
+ * Protocol-independent full-reference quality score for the outgoing
+ * stream.
  *
- * Answers "how much picture quality does the encode cost?" by decoding
- * the top simulcast layer's packets right back (FFmpeg avcodec) and
- * comparing each decoded frame against the exact program frame that
- * produced it - the same composited feed the encoders see, tapped via
- * obs_add_raw_video_callback2. The program feed is by definition the
- * 100-point reference; the score is mean Y-SSIM x 100, so a lossless
- * encode scores 100 and heavier compression scores progressively
+ * Answers "how much picture quality does the encode cost?" for ANY output
+ * (SRT, RTMP, WHIP) by decoding the output's top layer's packets right
+ * back (FFmpeg avcodec) and comparing each decoded frame against the exact
+ * program frame that produced it - the same composited feed the encoders
+ * see, tapped via obs_add_raw_video_callback2. The program feed is by
+ * definition the 100-point reference; the score is mean Y-SSIM x 100, so a
+ * lossless encode scores 100 and heavier compression scores progressively
  * lower. PSNR is logged alongside. One log line every 10 seconds.
  *
- * Frame matching: encoder_packet.dts_usec is in the WHIP output's own
+ * This used to live in the obs-webrtc plugin and only scored WHIP because
+ * it was fed from WHIPOutput::Data(). It is now a standalone component: it
+ * registers its OWN obs_output_add_packet_callback on the output passed to
+ * Start(), so it works for every output type (the frontend attaches it to
+ * whichever output is publishing). The measurement itself was always
+ * transport-independent - it compares the encoder's input to the encoder's
+ * output - only the wiring used to be WHIP-specific.
+ *
+ * Frame matching: encoder_packet.dts_usec is in the output's own
  * interleaving-relative clock (see obs-output.c
  * apply_interleaved_packet_offset - it zeroes dts/pts against this
  * particular output's start, not the raw-frame clock the reference tap
@@ -43,19 +52,34 @@ struct SwsContext;
  */
 class QualityScorer {
 public:
+	// Per-sample score sink, invoked on the scorer's decode thread. Kept as
+	// a plain function pointer + param (not std::function) so SetSink
+	// before Start is race-free against the running thread.
+	using ScoreSink = void (*)(void *param, float score, float psnr);
+
 	~QualityScorer();
 
-	// Call after obs_output_initialize_encoders(); reads layer 0's codec
-	// and dimensions. No-op if already started or the codec has no
-	// decoder available.
+	// Install the per-sample sink. Call before Start().
+	void SetSink(ScoreSink cb, void *param)
+	{
+		sink = cb;
+		sink_param = param;
+	}
+
+	// Call after the output's encoders are initialized (e.g. from the
+	// output's "start" signal). Reads layer 0's codec and dimensions,
+	// registers the packet tap and the reference tap. No-op if already
+	// started or the codec has no decoder available.
 	void Start(obs_output_t *output);
 	void Stop();
 
-	// Called from WHIPOutput::Data() for every video packet; filters to
-	// the scored (top) layer internally. Copies the packet and returns.
+private:
+	static void PacketTap(obs_output_t *output, struct encoder_packet *packet,
+			      struct encoder_packet_time *pkt_time, void *param);
+	// Called from the packet tap for every video packet; filters to the
+	// scored (top) layer internally. Copies the packet and returns.
 	void OnPacket(struct encoder_packet *packet);
 
-private:
 	static void RawVideo(void *param, struct video_data *frame);
 	void DecodeLoop();
 	void DrainDecoder();
@@ -66,12 +90,15 @@ private:
 		std::vector<uint8_t> luma; // packed det_width x det_height
 	};
 
+	ScoreSink sink = nullptr;
+	void *sink_param = nullptr;
+
 	// Reference ring: written by the raw video callback (video thread),
 	// consumed by the decode thread.
 	std::mutex ref_mutex;
 	std::deque<RefFrame> refs;
 
-	// Packet queue: written by OnPacket (encoder thread), drained by the
+	// Packet queue: written by PacketTap (encoder thread), drained by the
 	// decode thread. wait_keyframe lives under the same lock because an
 	// overflow resync (clear queue, wait for next IDR) touches both.
 	std::mutex queue_mutex;
@@ -85,7 +112,7 @@ private:
 	std::thread decode_thread;
 
 	const obs_encoder_t *target_encoder = nullptr;
-	obs_output_t *score_output = nullptr; // valid while started; for the quality_score signal
+	obs_output_t *score_output = nullptr; // valid while started; for the packet tap + raw callback
 
 	// packet->dts_usec is NOT the same clock as the reference tap's
 	// frame->timestamp: outputs with both audio and video encoders go
@@ -95,13 +122,13 @@ private:
 	// os_gettime_ns()-based clock the raw video callback uses. Both
 	// clocks tick at the same real rate, just offset by an unknown
 	// constant, so it's recovered by comparing each packet's dts_usec
-	// against os_gettime_ns() at arrival time (OnPacket, encoder
+	// against os_gettime_ns() at arrival time (PacketTap, encoder
 	// thread) and keeping the running minimum - the same
 	// minimum-filter trick NTP uses to estimate one-way delay: arrival
 	// time is (true content time + encode/delivery latency), and
 	// latency has a hard lower bound but only ever adds jitter above
 	// it, so the minimum observed gap converges on the true constant
-	// offset. Written from OnPacket(), read from CompareFrame()
+	// offset. Written from PacketTap(), read from CompareFrame()
 	// (decode thread) - atomic for cross-thread visibility.
 	std::atomic<int64_t> clock_offset_us{INT64_MAX};
 	uint32_t det_width = 0;

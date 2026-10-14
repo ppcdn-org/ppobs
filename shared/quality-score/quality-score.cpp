@@ -113,14 +113,24 @@ QualityScorer::~QualityScorer()
 	Stop();
 }
 
+void QualityScorer::PacketTap(obs_output_t *output, struct encoder_packet *packet,
+			      struct encoder_packet_time *pkt_time, void *param)
+{
+	(void)output;
+	(void)pkt_time;
+	static_cast<QualityScorer *>(param)->OnPacket(packet);
+}
+
 void QualityScorer::Start(obs_output_t *output)
 {
 	if (started)
 		return;
+	if (!output)
+		return;
 
 	obs_encoder_t *encoder = obs_output_get_video_encoder2(output, 0);
 	if (!encoder) {
-		blog(LOG_WARNING, "[obs-webrtc] quality scorer: no video encoder on layer 0, not starting");
+		blog(LOG_WARNING, "[quality-score] no video encoder on layer 0, not starting");
 		return;
 	}
 
@@ -128,7 +138,7 @@ void QualityScorer::Start(obs_output_t *output)
 	const AVCodecID codec_id = codec_id_from_name(codec);
 	const AVCodec *avdec = codec_id != AV_CODEC_ID_NONE ? avcodec_find_decoder(codec_id) : nullptr;
 	if (!avdec) {
-		blog(LOG_WARNING, "[obs-webrtc] quality scorer: no decoder available for codec '%s', not starting",
+		blog(LOG_WARNING, "[quality-score] no decoder available for codec '%s', not starting",
 		     codec ? codec : "(null)");
 		return;
 	}
@@ -136,7 +146,7 @@ void QualityScorer::Start(obs_output_t *output)
 	const uint32_t enc_width = obs_encoder_get_width(encoder);
 	const uint32_t enc_height = obs_encoder_get_height(encoder);
 	if (!enc_width || !enc_height) {
-		blog(LOG_WARNING, "[obs-webrtc] quality scorer: encoder has no dimensions yet, not starting");
+		blog(LOG_WARNING, "[quality-score] encoder has no dimensions yet, not starting");
 		return;
 	}
 
@@ -145,7 +155,7 @@ void QualityScorer::Start(obs_output_t *output)
 		return;
 	decoder->thread_count = 2;
 	if (avcodec_open2(decoder, avdec, nullptr) < 0) {
-		blog(LOG_WARNING, "[obs-webrtc] quality scorer: failed to open %s decoder, not starting", codec);
+		blog(LOG_WARNING, "[quality-score] failed to open %s decoder, not starting", codec);
 		avcodec_free_context(&decoder);
 		return;
 	}
@@ -184,6 +194,11 @@ void QualityScorer::Start(obs_output_t *output)
 	consecutive_errors = 0;
 	refs.clear();
 
+	/* Protocol-independent: tap this output's encoded packets directly,
+	 * whatever its type (SRT/RTMP/WHIP). Register before the thread so
+	 * OnPacket's started check holds once both are up. */
+	obs_output_add_packet_callback(output, PacketTap, this);
+
 	running = true;
 	decode_thread = std::thread(&QualityScorer::DecodeLoop, this);
 	started = true;
@@ -200,7 +215,7 @@ void QualityScorer::Start(obs_output_t *output)
 	obs_add_raw_video_callback2(&conversion, 1, RawVideo, this);
 
 	blog(LOG_INFO,
-	     "[obs-webrtc] quality scorer started: decoding %s layer 0 (%ux%u), comparing at %ux%u, "
+	     "[quality-score] scorer started: decoding %s layer 0 (%ux%u), comparing at %ux%u, "
 	     "%lld samples/s (program feed = 100)",
 	     codec, enc_width, enc_height, det_width, det_height, (long long)(1000000 / SAMPLE_INTERVAL_US));
 }
@@ -211,8 +226,11 @@ void QualityScorer::Stop()
 		return;
 	started = false;
 
-	/* Removal waits for in-flight callbacks; RawVideo takes ref_mutex,
-	 * so don't hold it here. */
+	/* Remove the packet tap first so OnPacket stops being called, then the
+	 * reference tap (removal waits for in-flight callbacks; RawVideo takes
+	 * ref_mutex, so don't hold it here). */
+	if (score_output)
+		obs_output_remove_packet_callback(score_output, PacketTap, this);
 	obs_remove_raw_video_callback(RawVideo, this);
 
 	{
@@ -242,7 +260,7 @@ void QualityScorer::Stop()
 
 	target_encoder = nullptr;
 	score_output = nullptr;
-	blog(LOG_INFO, "[obs-webrtc] quality scorer stopped");
+	blog(LOG_INFO, "[quality-score] scorer stopped");
 }
 
 void QualityScorer::OnPacket(struct encoder_packet *packet)
@@ -330,7 +348,7 @@ void QualityScorer::RawVideo(void *param, struct video_data *frame)
 
 void QualityScorer::DecodeLoop()
 {
-	os_set_thread_name("obs-webrtc: quality scorer");
+	os_set_thread_name("quality scorer");
 
 	while (true) {
 		AVPacket *pkt = nullptr;
@@ -354,7 +372,7 @@ void QualityScorer::DecodeLoop()
 			win_decode_errors++;
 			if (++consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
 				blog(LOG_ERROR,
-				     "[obs-webrtc] quality scorer: %u consecutive decode errors, giving up "
+				     "[quality-score] scorer: %u consecutive decode errors, giving up "
 				     "(stream itself is unaffected)",
 				     consecutive_errors);
 				dead = true;
@@ -386,7 +404,7 @@ void QualityScorer::CompareFrame(AVFrame *frame)
 
 	const int64_t offset = clock_offset_us.load(std::memory_order_relaxed);
 	if (offset == INT64_MAX)
-		return; // OnPacket() hasn't calibrated the clock offset yet
+		return; // PacketTap() hasn't calibrated the clock offset yet
 
 	const int64_t pts = frame->pts + offset;
 	if (pts < next_sample_us)
@@ -446,16 +464,9 @@ void QualityScorer::CompareFrame(AVFrame *frame)
 		win_ssim_min = std::min(win_ssim_min, ssim);
 		win_psnr_sum += psnr;
 
-		/* Per-sample score for the frontend's preview overlay. The
-		 * output outlives this thread (Stop() joins it before the
-		 * output is torn down), so score_output stays valid here. */
-		uint8_t stack[128];
-		calldata_t data;
-		calldata_init_fixed(&data, stack, sizeof(stack));
-		calldata_set_ptr(&data, "output", score_output);
-		calldata_set_float(&data, "score", ssim * 100.0);
-		calldata_set_float(&data, "psnr", psnr);
-		signal_handler_signal(obs_output_get_signal_handler(score_output), "quality_score", &data);
+		/* Per-sample score for the frontend's preview overlay. */
+		if (sink)
+			sink(sink_param, (float)(ssim * 100.0), (float)psnr);
 	}
 
 	if (pts < next_report_us)
@@ -470,13 +481,13 @@ void QualityScorer::CompareFrame(AVFrame *frame)
 		const double avg_score = win_ssim_sum / win_samples * 100.0;
 
 		blog(avg_score < SCORE_WARN_THRESHOLD ? LOG_WARNING : LOG_INFO,
-		     "[obs-webrtc] stream quality score: %.1f avg / %.1f min of 100 "
+		     "[quality-score] stream quality score: %.1f avg / %.1f min of 100 "
 		     "(Y-SSIM vs program feed, PSNR %.1f dB avg, %u samples)",
 		     avg_score, win_ssim_min * 100.0, win_psnr_sum / win_samples, win_samples);
 	}
 	if (win_misses || win_decode_errors || new_resyncs) {
 		blog(LOG_WARNING,
-		     "[obs-webrtc] quality scorer: %u unmatched samples, %u decode errors, %u queue resyncs "
+		     "[quality-score] scorer: %u unmatched samples, %u decode errors, %u queue resyncs "
 		     "in the last window",
 		     win_misses, win_decode_errors, new_resyncs);
 	}

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "quality-score.h"
 #include "whip-codec-session.h"
 
 #include <obs-module.h>
@@ -215,12 +214,6 @@ private:
 	std::string encoder_report_url;
 	std::string encoder_report_body;
 	bool encoder_report_pending = false;
-
-	// Full-reference quality score (program feed = 100) for the top
-	// layer; started from Start() based on the service's "quality_score"
-	// setting, fed from Data(). Always scored against the H264 top
-	// layer, matching pre-multitrack behavior.
-	QualityScorer quality_scorer;
 
 	// Reconnect timing, configurable from Settings > Output > Advanced;
 	// forwarded into every WHIPCodecSession::Config.

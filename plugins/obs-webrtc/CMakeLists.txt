@@ -11,16 +11,13 @@ find_package(CURL REQUIRED)
 find_package(Websocketpp 0.8 REQUIRED)
 find_package(Asio 1.12.1 REQUIRED)
 find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
-# avcodec/swscale: quality-score.cpp decodes the stream's own top layer
-# back and compares it against the program feed.
-find_package(FFmpeg REQUIRED avcodec avutil swscale)
 
 add_library(obs-webrtc MODULE)
 add_library(OBS::webrtc ALIAS obs-webrtc)
 
 target_sources(
   obs-webrtc
-  PRIVATE obs-webrtc.cpp nat-probe.cpp nat-probe.h ppcenter-client.cpp ppcenter-client.h ppcenter-signal-message.cpp ppcenter-signal-message.h ppcenter-signal-outgoing.cpp ppcenter-signal-outgoing.h ppcenter-websocket-frame.cpp ppcenter-websocket-frame.h ppcenter-websocket-utils.cpp ppcenter-websocket-utils.h ppcenter-time-sync.cpp ppcenter-time-sync.h ppcenter-time-sync-utils.cpp ppcenter-time-sync-utils.h ppcenter-signal.cpp ppcenter-signal.h device-registration.cpp device-registration.h encoder-report.cpp encoder-report.h uplink-qos-policy.cpp uplink-qos-policy.h whip-output.cpp whip-output.h whip-codec-session.cpp whip-codec-session.h whip-service.cpp whip-service.h whip-utils.h degrade-client.cpp degrade-client.h quality-score.cpp quality-score.h
+  PRIVATE obs-webrtc.cpp nat-probe.cpp nat-probe.h ppcenter-client.cpp ppcenter-client.h ppcenter-signal-message.cpp ppcenter-signal-message.h ppcenter-signal-outgoing.cpp ppcenter-signal-outgoing.h ppcenter-websocket-frame.cpp ppcenter-websocket-frame.h ppcenter-websocket-utils.cpp ppcenter-websocket-utils.h ppcenter-time-sync.cpp ppcenter-time-sync.h ppcenter-time-sync-utils.cpp ppcenter-time-sync-utils.h ppcenter-signal.cpp ppcenter-signal.h device-registration.cpp device-registration.h encoder-report.cpp encoder-report.h uplink-qos-policy.cpp uplink-qos-policy.h whip-output.cpp whip-output.h whip-codec-session.cpp whip-codec-session.h whip-service.cpp whip-service.h whip-utils.h degrade-client.cpp degrade-client.h
 )
 
 target_include_directories(obs-webrtc PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../common")
@@ -41,9 +38,6 @@ target_link_libraries(
           Asio::Asio
           OpenSSL::SSL
           OpenSSL::Crypto
-           FFmpeg::avcodec
-           FFmpeg::avutil
-           FFmpeg::swscale
            $<$<PLATFORM_ID:Windows>:iphlpapi>
 )
 

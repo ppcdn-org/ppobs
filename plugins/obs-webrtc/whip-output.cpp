@@ -40,11 +40,6 @@ bool multitrackEnabled(obs_output_t *output)
 
 WHIPOutput::WHIPOutput(obs_data_t *, obs_output_t *output_, bool p2pOnly) : output(output_), p2p_only(p2pOnly)
 {
-	// Declared at output creation so the frontend can connect before
-	// streaming starts; emitted per scored sample from the quality
-	// scorer's decode thread (see quality-score.cpp).
-	signal_handler_add(obs_output_get_signal_handler(output),
-			   "void quality_score(ptr output, float score, float psnr)");
 }
 
 WHIPOutput::~WHIPOutput()
@@ -72,21 +67,12 @@ bool WHIPOutput::Start()
 	if (start_stop_thread.joinable())
 		start_stop_thread.join();
 
-	{
-		obs_service_t *service = obs_output_get_service(output);
-		OBSDataAutoRelease service_settings = service ? obs_service_get_settings(service) : nullptr;
-		if (service_settings && obs_data_get_bool(service_settings, "quality_score"))
-			quality_scorer.Start(output);
-	}
-
 	start_stop_thread = std::thread(&WHIPOutput::StartThread, this, generation);
 	return true;
 }
 
 void WHIPOutput::Stop(bool signal)
 {
-	quality_scorer.Stop();
-
 #ifdef WHIP_DEGRADE_ACTIVE
 	WsDegradeClient::Instance().UnregisterOutput();
 #endif
@@ -278,8 +264,6 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 			});
 		}
 	} else if (packet->type == OBS_ENCODER_VIDEO) {
-		quality_scorer.OnPacket(packet);
-
 		// Route to exactly the one session that owns this encoder -
 		// H264 layers and HEVC layers are always disjoint encoder
 		// sets (see Setup()).

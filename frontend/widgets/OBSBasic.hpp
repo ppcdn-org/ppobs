@@ -32,6 +32,7 @@
 
 #include <obs-frontend-internal.hpp>
 #include <obs.hpp>
+#include <quality-score.h>
 #include <qt-wrappers.hpp>
 
 #include <graphics/matrix4.h>
@@ -816,18 +817,20 @@ private:
 
 	float dpi = 1.0;
 
-	/* WHIP stream quality score overlay. Drawn onto the preview display
-	 * only (from RenderMain), never into the video mix, so the outgoing
-	 * stream and recordings are untouched. The value arrives via the
-	 * "quality_score" signal the obs-webrtc output emits from its
-	 * scorer thread; the label source is created/updated/rendered on
-	 * the graphics thread (same pattern as the preview spacing labels). */
+	/* Stream quality score overlay. Protocol-independent: the frontend
+	 * scores whichever output is publishing (SRT/RTMP/WHIP) via a single
+	 * QualityScorer attached at StreamingStart. Drawn onto the preview
+	 * display only (from RenderMain), never into the video mix, so the
+	 * outgoing stream and recordings are untouched. The per-sample value
+	 * arrives on the scorer's decode thread through the sink set on
+	 * qualityScorer; the label source is created/updated/rendered on the
+	 * graphics thread (same pattern as the preview spacing labels). */
 	OBSSourceAutoRelease qualityScoreLabel;
-	OBSSignal qualityScoreSignal;
+	QualityScorer qualityScorer;
 	std::atomic<float> qualityScoreValue{0.0f};
 	std::atomic<uint64_t> qualityScoreUpdateNs{0};
 	float qualityScoreShown = -1.0f; // graphics thread: value currently in the label text
-	QString qualityScoreFormat;      // set on the UI thread before the signal connects
+	QString qualityScoreFormat;      // set on the UI thread before the scorer starts
 
 	void DrawBackdrop(float cx, float cy);
 	void InitPrimitives();
@@ -848,7 +851,7 @@ private:
 
 	float GetDevicePixelRatio();
 
-	static void OnQualityScore(void *data, calldata_t *cd);
+	static void OnQualityScore(void *data, float score, float psnr);
 	void DrawQualityScoreLabel();
 
 	void UpdatePreviewOverflowSettings();
