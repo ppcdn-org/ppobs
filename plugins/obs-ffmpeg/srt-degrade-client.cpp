@@ -1,4 +1,5 @@
 #include "srt-degrade-client.h"
+#include "publish-loss-reconnect.h"
 
 #include <obs.hpp>
 #include <nlohmann/json.hpp>
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -109,6 +111,22 @@ struct Channel {
 	// restart_to_apply.
 	bool restart_to_apply = false;
 
+	// Fast-reconnect window fed by mmx's own LOSS_SAMPLE pushes (the
+	// receive-side, normalized unrecoverable loss rate - see
+	// internal/degrade/degrade.go's LossSampleMsg) instead of this output's
+	// own sender-side srt_bstats(): same shared policy/thresholds as
+	// obs-ffmpeg-mpegts.c's local monitor (plugins/common/
+	// publish-loss-reconnect.h), just fed a trustworthy number instead of
+	// one that reads systematically worse than WHIP's RTCP-derived one for
+	// the same real loss. Armed fresh on every Register() call (mirrors
+	// mpegts_srt_loss_arm's per-connect re-arm - a loss window from the
+	// previous SRT connection must not count against this one). While this
+	// is live (the channel connected and therefore receiving samples),
+	// obs-ffmpeg-mpegts.c's own local monitor stands down - see
+	// srt_degrade_connected()'s doc comment.
+	struct publish_loss_monitor loss_monitor {};
+	bool loss_monitor_armed = false;
+
 	std::unique_ptr<client_t> client;
 	std::thread worker;
 	std::atomic<bool> running{true};
@@ -132,6 +150,7 @@ public:
 		      const std::string &token);
 	void Unregister(obs_output_t *output);
 	int TargetLayers(obs_output_t *output) const;
+	bool IsConnected(obs_output_t *output) const;
 
 private:
 	Channel *GetOrCreateLocked(obs_output_t *output, const std::string &codec);
@@ -141,6 +160,8 @@ private:
 	bool ShouldReconnectLocked(const Channel &ch) const;
 	void ApplyIfNeeded(Channel *ch, const TargetState &target);
 	void ApplyBitrateLocked(Channel &ch, int bitrate_percent, bool live);
+	void HandleLossSample(Channel *ch, uint64_t unrecoverable_delta, uint64_t expected_delta);
+	bool RestartOutput(Channel *ch, const char *reason);
 
 	mutable std::mutex mtx;
 	std::unordered_map<obs_output_t *, std::unique_ptr<Channel>> channels;
@@ -231,7 +252,12 @@ Channel *SrtDegradeRegistry::GetOrCreateLocked(obs_output_t *output, const std::
 
 		try {
 			auto j = nlohmann::json::parse(payload);
-			if (j.contains("type") && j["type"] == "ALERT") {
+			if (!j.contains("type"))
+				return;
+			if (j["type"] == "LOSS_SAMPLE") {
+				HandleLossSample(chp, j.value("unrecoverable_delta", (uint64_t)0),
+						 j.value("expected_delta", (uint64_t)0));
+			} else if (j["type"] == "ALERT") {
 				do_log(LOG_INFO, "ALERT path=%s reason=%s", j.value("path", "").c_str(),
 				       j.value("reason", "").c_str());
 			}
@@ -336,6 +362,15 @@ void SrtDegradeRegistry::Register(obs_output_t *output, const std::string &codec
 	if (counted > ch->max_layers)
 		ch->max_layers = counted;
 
+	// Fresh window every (re)connect - see loss_monitor's doc comment. Called
+	// on every Register(), which obs-ffmpeg-mpegts.c's connect_mpegts_url()
+	// does on every successful libsrt_open(), same point it arms its own
+	// local monitor.
+	struct publish_loss_config cfg;
+	publish_loss_config_load(&cfg);
+	publish_loss_monitor_init(&ch->loss_monitor, &cfg);
+	ch->loss_monitor_armed = true;
+
 	ConfigureChannelLocked(*ch, ws_url, token);
 }
 
@@ -392,6 +427,13 @@ int SrtDegradeRegistry::TargetLayers(obs_output_t *output) const
 	return it->second->target.layers;
 }
 
+bool SrtDegradeRegistry::IsConnected(obs_output_t *output) const
+{
+	std::lock_guard<std::mutex> lk(mtx);
+	auto it = channels.find(output);
+	return it != channels.end() && (bool)it->second->conn;
+}
+
 // A bitrate-only change is applied in place via obs_encoder_update(), which
 // per obs-encoder.c is safe on an already-active encoder. A layer-count
 // change restarts the output; setup_video_settings() then reads
@@ -399,7 +441,6 @@ int SrtDegradeRegistry::TargetLayers(obs_output_t *output) const
 // are (re)created.
 void SrtDegradeRegistry::ApplyIfNeeded(Channel *ch, const TargetState &target)
 {
-	obs_output_t *out_copy = nullptr;
 	bool layer_changed = false;
 	TargetState prev;
 	bool prev_set = false;
@@ -446,16 +487,41 @@ void SrtDegradeRegistry::ApplyIfNeeded(Channel *ch, const TargetState &target)
 			return;
 		}
 
+	}
+
+	char reason[96];
+	snprintf(reason, sizeof(reason), "apply codec=%s layers=%d", ch->codec.c_str(), ch->target.layers);
+	if (!RestartOutput(ch, reason)) {
+		// Didn't go inactive in time: roll back the optimistic state update
+		// so the idempotency check at the top doesn't swallow mmx's retry
+		// (it resends TARGET_STATE on its own schedule).
+		std::lock_guard<std::mutex> lk(mtx);
+		ch->target = prev;
+		ch->target_set = prev_set;
+		ch->last_pct = prev_pct;
+	}
+}
+
+// Stops then restarts ch->output, waiting (bounded) for it to go fully
+// inactive before starting it again. Sets restart_to_apply before stopping
+// so the symmetric srt_degrade_unregister() (obs-ffmpeg-mpegts.c's stop(),
+// which obs_output_stop() below re-enters synchronously or asynchronously
+// depending on the output type) knows this is a self-triggered restart and
+// keeps this channel's target/max_layers/loss_monitor alive instead of
+// clearing them. Shared by ApplyIfNeeded (a layer-count change) and
+// HandleLossSample (the fast-reconnect window tripping) - the only
+// difference between the two call sites is what they roll back if this
+// returns false.
+bool SrtDegradeRegistry::RestartOutput(Channel *ch, const char *reason)
+{
+	obs_output_t *out_copy;
+	{
+		std::lock_guard<std::mutex> lk(mtx);
 		out_copy = ch->output;
-		// obs_output_stop() below eventually re-enters this class via
-		// srt_degrade_unregister() (obs-ffmpeg-mpegts.c's stop()), on
-		// whatever thread the async stop command runs on: tell it this is
-		// our own restart so it keeps the target we just set for
-		// setup_video_settings() to trim to.
 		ch->restart_to_apply = true;
 	}
 
-	do_log(LOG_INFO, "Stopping output to apply codec=%s layers=%d", ch->codec.c_str(), ch->target.layers);
+	do_log(LOG_INFO, "Stopping output [%s]: %s", ch->codec.c_str(), reason);
 	obs_output_stop(out_copy);
 
 	const int max_wait_ms = 5000;
@@ -465,19 +531,48 @@ void SrtDegradeRegistry::ApplyIfNeeded(Channel *ch, const TargetState &target)
 		waited_ms += 20;
 	}
 	if (obs_output_active(out_copy)) {
-		do_log(LOG_WARNING,
-		       "output did not go inactive within %dms, skipping this TARGET_STATE (will retry on next message)",
-		       max_wait_ms);
+		do_log(LOG_WARNING, "output [%s] did not go inactive within %dms, giving up on this restart",
+		       ch->codec.c_str(), max_wait_ms);
 		std::lock_guard<std::mutex> lk(mtx);
-		ch->target = prev;
-		ch->target_set = prev_set;
-		ch->last_pct = prev_pct;
 		ch->restart_to_apply = false;
-		return;
+		return false;
 	}
 
-	do_log(LOG_INFO, "Starting output (codec=%s layers=%d)", ch->codec.c_str(), ch->target.layers);
+	do_log(LOG_INFO, "Starting output [%s]", ch->codec.c_str());
 	obs_output_start(out_copy);
+	return true;
+}
+
+// Fast-reconnect window fed by mmx's receive-side LOSS_SAMPLE pushes - see
+// Channel::loss_monitor's doc comment on why this exists alongside
+// obs-ffmpeg-mpegts.c's own sender-side one. Reuses the exact same shared
+// policy (plugins/common/publish-loss-reconnect.h) obs-ffmpeg-mpegts.c and
+// WHIP's whip-codec-session.cpp already use, just fed a different (more
+// trustworthy) number - unrecoverable_delta is already net of
+// retransmission (see LossSampleMsg's doc comment in degrade.go), so this
+// passes retrans=0, same convention WHIP's own local monitor already uses
+// for the same reason.
+void SrtDegradeRegistry::HandleLossSample(Channel *ch, uint64_t unrecoverable_delta, uint64_t expected_delta)
+{
+	if (!ch->loss_monitor_armed)
+		return;
+
+	bool have_sample = false;
+	double sample_pct = 0.0;
+	bool reconnect = publish_loss_monitor_record(&ch->loss_monitor, unrecoverable_delta, 0, expected_delta,
+						     (int64_t)(os_gettime_ns() / 1000000), &have_sample, &sample_pct);
+
+	if (have_sample && sample_pct > PUBLISH_LOSS_LOG_THRESHOLD_PCT)
+		do_log(LOG_INFO, "mmx-reported loss %.2f%% this interval (codec=%s, unrecoverable=%llu/%llu)",
+		       sample_pct, ch->codec.c_str(), (unsigned long long)unrecoverable_delta,
+		       (unsigned long long)expected_delta);
+
+	if (!reconnect)
+		return;
+
+	do_log(LOG_WARNING, "mmx-reported windowed unrecoverable loss above threshold (codec=%s), forcing reconnect",
+	       ch->codec.c_str());
+	RestartOutput(ch, "mmx-reported unrecoverable loss above local window threshold");
 }
 
 void SrtDegradeRegistry::ApplyBitrateLocked(Channel &ch, int bitrate_percent, bool live)
@@ -550,4 +645,11 @@ int srt_degrade_target_layers(obs_output_t *output)
 	if (!output)
 		return 0;
 	return SrtDegradeRegistry::Instance().TargetLayers(output);
+}
+
+bool srt_degrade_connected(obs_output_t *output)
+{
+	if (!output)
+		return false;
+	return SrtDegradeRegistry::Instance().IsConnected(output);
 }

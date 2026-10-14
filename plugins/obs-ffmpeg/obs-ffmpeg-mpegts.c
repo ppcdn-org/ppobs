@@ -961,7 +961,17 @@ static void *write_thread(void *data)
 			break;
 		}
 
-		if (mpegts_sample_srt_loss(stream)) {
+		/* Always sample/log (keeps the window warm and visible in the log
+		 * for diagnosis), but only act on it while the degrade channel is
+		 * down - see srt_degrade_connected's doc comment. When it's
+		 * connected, mmx's own receive-side ULR is already deciding when to
+		 * reconnect (degrade.go's terminal case forces one via a latency
+		 * raise once the ladder bottoms out), computed from a different,
+		 * typically more pessimistic measurement than this local
+		 * srt_bstats()-derived one - deferring to it instead of also acting
+		 * here avoids two differently-tuned judges fighting over the same
+		 * decision. */
+		if (mpegts_sample_srt_loss(stream) && !srt_degrade_connected(stream->output)) {
 			obs_output_signal_stop(stream->output, OBS_OUTPUT_DISCONNECTED);
 			break;
 		}

@@ -74,7 +74,9 @@ bool WHIPOutput::Start()
 void WHIPOutput::Stop(bool signal)
 {
 #ifdef WHIP_DEGRADE_ACTIVE
-	WsDegradeClient::Instance().UnregisterOutput();
+	// Not for a P2P-only companion - see the matching guard in StartThread().
+	if (!p2p_only)
+		WsDegradeClient::Instance().UnregisterOutput();
 #endif
 
 	std::lock_guard<std::mutex> l(start_stop_mutex);
@@ -1097,13 +1099,25 @@ void WHIPOutput::StartThread(uint64_t generation)
 	running = true;
 
 #ifdef WHIP_DEGRADE_ACTIVE
-	// Registered for both the normal WHIP output and the P2P-only
-	// companion that backs an SRT (or any non-WHIP) publish. One control
-	// channel per codec published (HEVC/H264 multitrack => two), each
-	// derived from the WHIP endpoint Setup() resolved from ppcenter for
-	// that codec.
-	WsDegradeClient::Instance().RegisterOutput(output, degrade_url_h264, degrade_token_h264,
-						   degrade_url_hevc, degrade_token_hevc);
+	// Not for a P2P-only companion backing an SRT (or RTMP) publish: that
+	// case used to be this registration's only reason to resolve
+	// degrade_url_h264/token_h264 at all (see the comment above this
+	// method's p2p_only branch), back when ppcenter never minted a
+	// whipTracks entry for a non-WHIP protocol, so it was silently a no-op
+	// (ConfigureChannelLocked requires a non-empty URL+token). Now that
+	// ppcenter does mint one for SRT (see docs/design/
+	// publish-degrade-protocol.zh-CN.md and plugins/obs-ffmpeg/
+	// srt-degrade-client.h, which registers the *real* SRT output's full
+	// ladder directly), this registration would just fight that one for
+	// the same per-path WS slot - this client's codecEncoders() only ever
+	// sees this companion's single shared base-layer encoder, so it can't
+	// represent the actual ladder anyway. Still skipped for an RTMP
+	// companion (no RTMP-side degrade client exists yet) rather than
+	// re-enabling the old single-encoder behavior just for that case.
+	if (!p2p_only) {
+		WsDegradeClient::Instance().RegisterOutput(output, degrade_url_h264, degrade_token_h264,
+							   degrade_url_hevc, degrade_token_hevc);
+	}
 #endif
 }
 
