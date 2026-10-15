@@ -49,6 +49,16 @@ struct ffmpeg_cfg {
 	const char *encrypt_passphrase;
 	bool is_srt;
 	bool is_rist;
+	// ERTSP (Enhanced RTSP) publish - unlike is_srt/is_rist, this never
+	// triggers the custom URLContext/AVIOContext path (connect_mpegts_url,
+	// loss monitoring, degrade WS companion): it goes through the same
+	// generic avio_open2() path as plain udp/tcp/http (see
+	// proto_is_allowed), letting avformat's own "rtsp" protocol/muxer
+	// handle the ANNOUNCE/RECORD handshake and RTP packetization, same as
+	// a plain "ffmpeg -f rtsp rtsp://user:pass@host/path" publish. Only
+	// used to pick the output format ("rtsp" instead of "mpegts" - see
+	// ffmpeg_mpegts_data_init) and to admit the URL in proto_is_allowed.
+	bool is_rtsp;
 	int srt_pkt_size;
 #ifdef NEW_MPEGTS_OUTPUT
 	/* Degrade WS control-channel credentials for this publish's codec, read

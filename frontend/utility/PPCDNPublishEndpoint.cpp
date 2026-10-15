@@ -73,15 +73,17 @@ QString ParseSRTStreamName(const QString &url, const QString &appId)
 	return value.trimmed();
 }
 
-// CustomLadderProtocol returns "srt"/"rtmp" for a custom rtmp_custom service
-// whose configured Server URL scheme is one PPCenter can dynamically resolve
-// an Origin address for (see ResolvePPCDNPublishEndpoint), or "" for
-// anything else - WHIP, rtmp_common, or a custom service whose URL resolved
-// to a protocol this feature doesn't cover (RIST/RTMPS). "rtmp" covers both
-// the "ERTMP" service preset and a plain "自定义/Custom" rtmp:// URL alike:
-// they're otherwise indistinguishable at this layer (see
-// OBSBasicSettings_Stream.cpp's ListOpt::ERTMP comment), and both get the
-// same dynamic-resolution behavior when they carry the placeholder.
+// CustomLadderProtocol returns "srt"/"rtmp"/"rtsp" for a custom rtmp_custom
+// service whose configured Server URL scheme is one PPCenter can
+// dynamically resolve an Origin address for (see
+// ResolvePPCDNPublishEndpoint), or "" for anything else - WHIP, rtmp_common,
+// or a custom service whose URL resolved to a protocol this feature doesn't
+// cover (RIST/RTMPS). "rtmp" covers both the "ERTMP" service preset and a
+// plain "自定义/Custom" rtmp:// URL alike: they're otherwise indistinguishable
+// at this layer (see OBSBasicSettings_Stream.cpp's ListOpt::ERTMP comment),
+// and both get the same dynamic-resolution behavior when they carry the
+// placeholder. "rtsp" (ERTSP) resolves differently from the other two - see
+// the "rtsp" branch below and PPCDN_ERTSP_DEFAULT_PUBLISH_URL's comment.
 std::string CustomLadderProtocol(obs_service_t *service)
 {
 	const char *protocol = obs_service_get_protocol(service);
@@ -92,6 +94,8 @@ std::string CustomLadderProtocol(obs_service_t *service)
 		return "srt";
 	if (astrcmpi(protocol, "rtmp") == 0)
 		return "rtmp";
+	if (astrcmpi(protocol, "rtsp") == 0)
+		return "rtsp";
 	return "";
 }
 
@@ -183,14 +187,25 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 		return false;
 	}
 
-	// Resolve the stream name from the *expanded* URL (the app id segment is
-	// already substituted there by rtmp_custom_update). SRT packs it into the
-	// "?streamid=publish:<appId>/<stream>" query; RTMP's path is plainly
-	// "<appId>/<stream>" with nothing to strip (see ParseRTMPStreamName).
-	const char *expanded = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
-	const QString expandedUrl = QT_UTF8(expanded && *expanded ? expanded : rawServer);
-	const QString streamName = protocol == "srt" ? ParseSRTStreamName(expandedUrl, QT_UTF8(appID.c_str()))
-						      : ParseRTMPStreamName(expandedUrl);
+	// Resolve the stream name. SRT packs it into the
+	// "?streamid=publish:<appId>/<stream>" query of the *expanded* URL (the
+	// app id segment is already substituted there by rtmp_custom_update);
+	// RTMP's path is plainly "<appId>/<stream>" with nothing to strip (see
+	// ParseRTMPStreamName). ERTSP's Server field is nothing but the
+	// {ppcdn_publish_endpoint} placeholder (see
+	// PPCDN_ERTSP_DEFAULT_PUBLISH_URL) - there's no path to parse a stream
+	// name out of, so it comes from the Stream Key field instead (reused for
+	// this purpose - see OBSBasicSettings_Stream.cpp's IsERTSP handling).
+	QString streamName;
+	if (protocol == "rtsp") {
+		const char *key = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_STREAM_ID);
+		streamName = QT_UTF8(key ? key : "").trimmed();
+	} else {
+		const char *expanded = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
+		const QString expandedUrl = QT_UTF8(expanded && *expanded ? expanded : rawServer);
+		streamName = protocol == "srt" ? ParseSRTStreamName(expandedUrl, QT_UTF8(appID.c_str()))
+						: ParseRTMPStreamName(expandedUrl);
+	}
 	if (streamName.isEmpty()) {
 		error = "Cannot determine the stream name from the configured URL";
 		return false;
@@ -201,16 +216,19 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 		{"appSecret", appSecret},
 		{"streamName", streamName.toStdString()},
 		{"protocol", protocol},
-		// Always requested, same as every WHIP publish (see
-		// ppcenter-client.cpp's ppcenter_build_publish_json): gets back a
-		// per-codec WHIP-style bearer token this SRT/RTMP publish doesn't
-		// otherwise have, used only to open the degrade WS control channel
-		// (docs/design/publish-degrade-protocol.zh-CN.md §6.1) - it never
-		// switches transport. Omitted from the response (whipTracks stays
-		// unset) when the picked Origin has no WebRTC base URL configured;
-		// handled as a plain "degrade unavailable" case below, not an error.
-		{"capabilities", nlohmann::json::array({"whip-hevc-h264"})},
 	};
+	// Requested for every WHIP-capable SRT/RTMP publish (see
+	// ppcenter-client.cpp's ppcenter_build_publish_json): gets back a
+	// per-codec WHIP-style bearer token that publish doesn't otherwise have,
+	// used only to open the degrade WS control channel
+	// (docs/design/publish-degrade-protocol.zh-CN.md §6.1) - it never
+	// switches transport. Omitted from the response (whipTracks stays unset)
+	// when the picked Origin has no WebRTC base URL configured; handled as a
+	// plain "degrade unavailable" case below, not an error. ERTSP has no P2P
+	// or degrade companion (see the ERTSP cross-repo plan's confirmed
+	// scope), so it never requests this.
+	if (protocol != "rtsp")
+		body["capabilities"] = nlohmann::json::array({"whip-hevc-h264"});
 	if (!region.empty())
 		body["requestRegion"] = region;
 
@@ -278,9 +296,18 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 		return false;
 	}
 
-	// Write it back into the service settings so rtmp_custom_update expands
-	// the placeholder into the address the output actually connects to.
-	obs_data_set_string(settings, "ppcdn_publish_endpoint", endpoint.c_str());
+	// Write it back into the service settings. For SRT/RTMP this is a bare
+	// host[:port] substituted into the {ppcdn_publish_endpoint} placeholder
+	// by rtmp_custom_update. ERTSP is different: PPCenter's answer is
+	// already a *complete* rtsp://user:token@host:port/path URL (the token
+	// has to ride as Basic Auth userinfo at the very front, which a
+	// mid-template substitution can't produce - see
+	// PPCDN_ERTSP_DEFAULT_PUBLISH_URL's comment), so it overwrites "server"
+	// directly instead of filling in the placeholder fragment.
+	if (protocol == "rtsp")
+		obs_data_set_string(settings, "server", endpoint.c_str());
+	else
+		obs_data_set_string(settings, "ppcdn_publish_endpoint", endpoint.c_str());
 	// The SRT publish token (mmx srtPublishTokenRequired) goes into its own
 	// setting so rtmp_custom_update injects it as the streamid's third
 	// segment. Absent for RTMP or an Origin without the check, so store the

@@ -62,6 +62,7 @@ enum class ListOpt : int {
 	Custom,
 	WHIP,
 	ERTMP,
+	ERTSP,
 };
 
 enum class Section : int {
@@ -99,20 +100,36 @@ inline bool OBSBasicSettings::IsERTMP() const
 	return ui->service->currentData().toInt() == (int)ListOpt::ERTMP;
 }
 
-// IsRTMPCustomFamily groups the three ListOpt entries that are all, under
+// ERTSP (Enhanced RTSP) is the fourth "rtmp_custom" family member: an
+// rtsp:// publish, told apart from Custom the same way SRT is - by its
+// rtsp:// Server URL prefix, no marker needed (see LoadStream1Settings).
+// Unlike SRT/ERTMP it never carries a Simulcast/multitrack ladder (see
+// IsWHIPSimulcast below and AllowsMultiTrack, which only matches "srt"/
+// "rist") and has no P2P/degrade companion - a single plain connection,
+// mirroring a non-multitrack Custom publish.
+inline bool OBSBasicSettings::IsERTSP() const
+{
+	return ui->service->currentData().toInt() == (int)ListOpt::ERTSP;
+}
+
+// IsRTMPCustomFamily groups the four ListOpt entries that are all, under
 // the hood, the same "rtmp_custom" service/output (see SaveStream1Settings'
 // service_id selection) - differing only in default URL template and
 // Simulcast-ladder presentation, never in what gets created. Used
 // throughout this file wherever Custom-or-SRT was previously checked, since
-// ERTMP always belongs in that same bucket.
+// ERTMP/ERTSP always belong in that same bucket.
 bool OBSBasicSettings::IsRTMPCustomFamily() const
 {
-	return IsCustomService() || IsERTMP() || IsSRT();
+	return IsCustomService() || IsERTMP() || IsSRT() || IsERTSP();
 }
 
+// ERTSP never offers a Simulcast ladder (no multitrack, no dual H264/HEVC
+// companion - see the ERTSP cross-repo plan's confirmed scope), so it's
+// excluded here even though it's otherwise a full IsRTMPCustomFamily
+// member; every other family member (WHIP/SRT/Custom/ERTMP) is unaffected.
 bool OBSBasicSettings::IsWHIPSimulcast() const
 {
-	return IsWHIP() || IsRTMPCustomFamily();
+	return (IsWHIP() || IsRTMPCustomFamily()) && !IsERTSP();
 }
 
 void OBSBasicSettings::UpdateWHIPSimulcastControls()
@@ -219,6 +236,8 @@ void OBSBasicSettings::LoadStream1Settings()
 	srtServiceKey = QT_UTF8(config_get_string(main->Config(), "Stream1", "SRTServerKey"));
 	ertmpServiceEndpoint = QT_UTF8(config_get_string(main->Config(), "Stream1", "ERTMPServerEndpoint"));
 	ertmpServiceKey = QT_UTF8(config_get_string(main->Config(), "Stream1", "ERTMPServerKey"));
+	ertspServiceEndpoint = QT_UTF8(config_get_string(main->Config(), "Stream1", "ERTSPServerEndpoint"));
+	ertspServiceKey = QT_UTF8(config_get_string(main->Config(), "Stream1", "ERTSPServerKey"));
 	whipServiceEndpoint = QT_UTF8(config_get_string(main->Config(), "Stream1", "WHIPServerEndpoint"));
 	whipServiceKey = QT_UTF8(config_get_string(main->Config(), "Stream1", "WHIPBearerToken"));
 
@@ -229,6 +248,7 @@ void OBSBasicSettings::LoadStream1Settings()
 		// each have their own slot (see SwapStreamDestinationField).
 		bool is_ertmp_active = obs_data_get_bool(settings, "is_ertmp");
 		bool is_srt_active = server && strncmp(server, "srt://", 6) == 0;
+		bool is_ertsp_active = server && strncmp(server, "rtsp://", 7) == 0;
 		if (is_ertmp_active) {
 			ertmpServiceEndpoint = QT_UTF8(server);
 			ertmpServiceKey = QT_UTF8(key);
@@ -237,6 +257,10 @@ void OBSBasicSettings::LoadStream1Settings()
 			srtServiceEndpoint = QT_UTF8(server);
 			srtServiceKey = QT_UTF8(key);
 			lastStreamDestinationField = StreamDestinationField::SRT;
+		} else if (is_ertsp_active) {
+			ertspServiceEndpoint = QT_UTF8(server);
+			ertspServiceKey = QT_UTF8(key);
+			lastStreamDestinationField = StreamDestinationField::ERTSP;
 		} else {
 			customServiceEndpoint = QT_UTF8(server);
 			customServiceKey = QT_UTF8(key);
@@ -251,19 +275,21 @@ void OBSBasicSettings::LoadStream1Settings()
 	}
 
 	if (is_rtmp_custom) {
-		// SRT, ERTMP and Custom all use rtmp_custom as the service type.
-		// SRT is told apart by its srt:// server URL prefix; ERTMP's
-		// server URL (rtmp://) looks exactly like a plain Custom one, so
-		// it instead carries its own "is_ertmp" marker (see
-		// SaveStream1Settings) - checked first since a URL-prefix sniff
-		// can't distinguish it.
+		// SRT, ERTMP, ERTSP and Custom all use rtmp_custom as the service
+		// type. SRT and ERTSP are told apart by their srt:// / rtsp://
+		// server URL prefix; ERTMP's server URL (rtmp://) looks exactly
+		// like a plain Custom one, so it instead carries its own
+		// "is_ertmp" marker (see SaveStream1Settings) - checked first
+		// since a URL-prefix sniff can't distinguish it.
 		{
 			int idx = ui->service->findData(
 				obs_data_get_bool(settings, "is_ertmp")
 					? (int)ListOpt::ERTMP
 					: (server && strncmp(server, "srt://", 6) == 0)
 						  ? (int)ListOpt::SRT
-						  : (int)ListOpt::Custom);
+						  : (server && strncmp(server, "rtsp://", 7) == 0)
+							    ? (int)ListOpt::ERTSP
+							    : (int)ListOpt::Custom);
 			ui->service->setCurrentIndex(idx >= 0 ? idx : 0);
 		}
 		lastServiceIdx = ui->service->currentIndex();
@@ -458,6 +484,9 @@ void OBSBasicSettings::SaveStream1Settings()
 	} else if (IsERTMP() && customEndpoint.isEmpty()) {
 		customEndpoint = PPCDN_ERTMP_DEFAULT_PUBLISH_URL;
 		ui->customServer->setText(customEndpoint);
+	} else if (IsERTSP() && customEndpoint.isEmpty()) {
+		customEndpoint = PPCDN_ERTSP_DEFAULT_PUBLISH_URL;
+		ui->customServer->setText(customEndpoint);
 	}
 
 	// Persist this service type's own endpoint/key (and Custom's auth
@@ -473,6 +502,9 @@ void OBSBasicSettings::SaveStream1Settings()
 	} else if (IsERTMP()) {
 		config_set_string(main->Config(), "Stream1", "ERTMPServerEndpoint", QT_TO_UTF8(customEndpoint));
 		config_set_string(main->Config(), "Stream1", "ERTMPServerKey", QT_TO_UTF8(ui->key->text()));
+	} else if (IsERTSP()) {
+		config_set_string(main->Config(), "Stream1", "ERTSPServerEndpoint", QT_TO_UTF8(customEndpoint));
+		config_set_string(main->Config(), "Stream1", "ERTSPServerKey", QT_TO_UTF8(ui->key->text()));
 	} else if (IsCustomService()) {
 		config_set_string(main->Config(), "Stream1", "CustomServerEndpoint", QT_TO_UTF8(customEndpoint));
 		config_set_string(main->Config(), "Stream1", "CustomServerKey", QT_TO_UTF8(ui->key->text()));
@@ -1019,14 +1051,19 @@ void OBSBasicSettings::LoadServices(bool showAll)
 				     QVariant((int)ListOpt::ShowAll));
 	}
 
-	// Ordered SRT, WHIP, ERTMP, Custom... - inserted back-to-front so each
-	// insertItem(0, ...) doesn't have to account for the ones before it.
-	// ERTMP needs no obs_is_output_protocol_registered gate (unlike WHIP,
-	// an optional plugin): it's the base RTMP output, always built in.
+	// Ordered SRT, ERTSP, WHIP, ERTMP, Custom... - inserted back-to-front so
+	// each insertItem(0, ...) doesn't have to account for the ones before
+	// it. ERTMP needs no obs_is_output_protocol_registered gate (unlike
+	// WHIP, an optional plugin): it's the base RTMP output, always built
+	// in. ERTSP is gated the same way WHIP is: its output (obs-ffmpeg's
+	// "RTSP" protocol) is a plugin feature, not always built in.
 	ui->service->insertItem(0, QTStr("Basic.AutoConfig.StreamPage.Service.Custom"), QVariant((int)ListOpt::Custom));
 	ui->service->insertItem(0, QTStr("ERTMP"), QVariant((int)ListOpt::ERTMP));
 	if (obs_is_output_protocol_registered("WHIP")) {
 		ui->service->insertItem(0, QTStr("WHIP"), QVariant((int)ListOpt::WHIP));
+	}
+	if (obs_is_output_protocol_registered("RTSP")) {
+		ui->service->insertItem(0, QTStr("ERTSP"), QVariant((int)ListOpt::ERTSP));
 	}
 	ui->service->insertItem(0, QTStr("SRT"), QVariant((int)ListOpt::SRT));
 
@@ -1114,6 +1151,10 @@ void OBSBasicSettings::SwapStreamDestinationField()
 		ertmpServiceEndpoint = ui->customServer->text();
 		ertmpServiceKey = ui->key->text();
 		break;
+	case StreamDestinationField::ERTSP:
+		ertspServiceEndpoint = ui->customServer->text();
+		ertspServiceKey = ui->key->text();
+		break;
 	case StreamDestinationField::WHIP:
 		whipServiceEndpoint = ui->customServer->text();
 		whipServiceKey = ui->key->text();
@@ -1122,7 +1163,7 @@ void OBSBasicSettings::SwapStreamDestinationField()
 		break;
 	}
 
-	// SRT, ERTMP and Custom are all "rtmp_custom" services (see
+	// SRT, ERTMP, ERTSP and Custom are all "rtmp_custom" services (see
 	// IsRTMPCustomFamily) but each keeps its own endpoint/key slot, so
 	// switching between them must not carry one's values onto another.
 	if (IsSRT()) {
@@ -1133,6 +1174,10 @@ void OBSBasicSettings::SwapStreamDestinationField()
 		ui->customServer->setText(ertmpServiceEndpoint);
 		ui->key->setText(ertmpServiceKey);
 		lastStreamDestinationField = StreamDestinationField::ERTMP;
+	} else if (IsERTSP()) {
+		ui->customServer->setText(ertspServiceEndpoint);
+		ui->key->setText(ertspServiceKey);
+		lastStreamDestinationField = StreamDestinationField::ERTSP;
 	} else if (IsCustomService()) {
 		ui->customServer->setText(customServiceEndpoint);
 		ui->key->setText(customServiceKey);
@@ -1271,6 +1316,9 @@ QString OBSBasicSettings::FindProtocol()
 {
 	if (IsSRT())
 		return QString("SRT");
+
+	if (IsERTSP())
+		return QString("RTSP");
 
 	if (IsERTMP())
 		return QString("RTMP");

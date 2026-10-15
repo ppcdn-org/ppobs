@@ -219,6 +219,7 @@ static const char *rtmp_custom_password(void *data)
 #define RTMPS_PREFIX "rtmps://"
 #define SRT_PREFIX "srt://"
 #define RIST_PREFIX "rist://"
+#define RTSP_PREFIX "rtsp://"
 
 static const char *rtmp_custom_get_protocol(void *data)
 {
@@ -232,6 +233,12 @@ static const char *rtmp_custom_get_protocol(void *data)
 
 	if (strncmp(service->server, RIST_PREFIX, strlen(RIST_PREFIX)) == 0)
 		return "RIST";
+
+	/* ERTSP (Enhanced RTSP) - see frontend/utility/PPCDNPublishEndpoint.cpp's
+	 * CustomLadderProtocol and the ERTSP cross-repo design. Unambiguous
+	 * like SRT/RIST, no "is_ertsp"-style marker needed. */
+	if (strncmp(service->server, RTSP_PREFIX, strlen(RTSP_PREFIX)) == 0)
+		return "RTSP";
 
 	return "RTMP";
 }
