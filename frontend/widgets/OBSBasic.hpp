@@ -635,7 +635,6 @@ private slots:
 	void on_toggleListboxToolbars_toggled(bool visible);
 	void on_toggleStatusBar_toggled(bool visible);
 
-	void on_autoConfigure_triggered();
 	void on_stats_triggered();
 	void on_idianPlayground_triggered();
 
@@ -679,7 +678,6 @@ private:
 	{
 		if (ui->profileMenu->isEnabled() || force) {
 			ui->profileMenu->setEnabled(false);
-			ui->autoConfigure->setEnabled(false);
 			App()->IncrementSleepInhibition();
 			UpdateProcessPriority();
 
@@ -705,7 +703,6 @@ private:
 	{
 		if (!outputHandler->Active() && !ui->profileMenu->isEnabled()) {
 			ui->profileMenu->setEnabled(true);
-			ui->autoConfigure->setEnabled(true);
 			App()->DecrementSleepInhibition();
 			ClearProcessPriority();
 

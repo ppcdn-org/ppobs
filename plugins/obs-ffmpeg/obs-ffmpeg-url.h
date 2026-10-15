@@ -10,7 +10,6 @@
 
 #define HTTP_PROTO "http"
 #define RIST_PROTO "rist"
-#define RTSP_PROTO "rtsp"
 #define SRT_PROTO "srt"
 #define TCP_PROTO "tcp"
 #define UDP_PROTO "udp"

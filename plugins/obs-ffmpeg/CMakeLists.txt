@@ -37,6 +37,7 @@ target_sources(
     obs-ffmpeg-audio-encoders.c
     obs-ffmpeg-av1.c
     obs-ffmpeg-compat.h
+    obs-ffmpeg-ertsp.c
     obs-ffmpeg-formats.h
     obs-ffmpeg-openh264.c
     obs-ffmpeg-hls-mux.c

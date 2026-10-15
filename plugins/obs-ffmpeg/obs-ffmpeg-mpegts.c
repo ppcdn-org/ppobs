@@ -74,21 +74,11 @@ static bool is_srt(const char *url)
 	return !strncmp(url, SRT_PROTO, sizeof(SRT_PROTO) - 1);
 }
 
-// is_ertsp mirrors is_srt/is_rist, but ERTSP never takes the custom
-// URLContext path those two use (see struct ffmpeg_cfg's is_rtsp comment) -
-// it's admitted through proto_is_allowed below instead, same as plain
-// udp/tcp/http.
-static bool is_ertsp(const char *url)
-{
-	return !strncmp(url, RTSP_PROTO, sizeof(RTSP_PROTO) - 1);
-}
-
 static bool proto_is_allowed(struct ffmpeg_output *stream)
 {
 	return !strncmp(stream->ff_data.config.url, UDP_PROTO, sizeof(UDP_PROTO) - 1) ||
 	       !strncmp(stream->ff_data.config.url, TCP_PROTO, sizeof(TCP_PROTO) - 1) ||
-	       !strncmp(stream->ff_data.config.url, HTTP_PROTO, sizeof(HTTP_PROTO) - 1) ||
-	       !strncmp(stream->ff_data.config.url, RTSP_PROTO, sizeof(RTSP_PROTO) - 1);
+	       !strncmp(stream->ff_data.config.url, HTTP_PROTO, sizeof(HTTP_PROTO) - 1);
 }
 
 static bool new_stream(struct ffmpeg_data *data, AVStream **stream, const char *name)
@@ -747,15 +737,10 @@ bool ffmpeg_mpegts_data_init(struct ffmpeg_output *stream, struct ffmpeg_data *d
 
 	avformat_network_init();
 
-	// ERTSP publishes through avformat's own "rtsp" muxer (ANNOUNCE/RECORD
-	// + RTP packetization) instead of mpegts - see struct ffmpeg_cfg's
-	// is_rtsp comment.
-	const AVOutputFormat *output_format = data->config.is_rtsp ? av_guess_format("rtsp", NULL, NULL)
-								    : av_guess_format("mpegts", NULL, "video/M2PT");
+	const AVOutputFormat *output_format = av_guess_format("mpegts", NULL, "video/M2PT");
 
 	if (output_format == NULL) {
-		ffmpeg_mpegts_log_error(LOG_WARNING, data, "Couldn't set output format to %s",
-					data->config.is_rtsp ? "rtsp" : "mpegts");
+		ffmpeg_mpegts_log_error(LOG_WARNING, data, "Couldn't set output format to mpegts");
 		goto fail;
 	} else {
 		info("Output format name and long_name: %s, %s", output_format->name ? output_format->name : "unknown",
@@ -1049,7 +1034,6 @@ static bool fetch_service_info(struct ffmpeg_output *stream, struct ffmpeg_cfg *
 	config->format_mime_type = "video/M2PT";
 	config->is_rist = is_rist(config->url);
 	config->is_srt = is_srt(config->url);
-	config->is_rtsp = is_ertsp(config->url);
 	config->srt_pkt_size = 0; /* use default, which is usually 1316 for mpegts */
 
 	/* Degrade WS credentials (see srt-degrade-client.h): obs_service_get_settings
@@ -1773,12 +1757,7 @@ struct obs_output_info ffmpeg_mpegts_muxer = {
 	.id = "ffmpeg_mpegts_muxer",
 	.flags = OBS_OUTPUT_AV | OBS_OUTPUT_ENCODED | OBS_OUTPUT_MULTI_TRACK | OBS_OUTPUT_MULTI_TRACK_VIDEO |
 		 OBS_OUTPUT_SERVICE,
-	// RTSP (ERTSP): unlike SRT/RIST it carries no custom URLContext/loss
-	// monitor/degrade-companion path - see struct ffmpeg_cfg's is_rtsp
-	// comment. GetStreamOutputType's generic third-party protocol fallback
-	// (frontend/utility/BasicOutputHandler.cpp) picks this output for it
-	// automatically; no dispatch-code changes needed there.
-	.protocols = "SRT;RIST;RTSP",
+	.protocols = "SRT;RIST",
 #ifdef ENABLE_HEVC
 	.encoded_video_codecs = "h264;hevc",
 #else

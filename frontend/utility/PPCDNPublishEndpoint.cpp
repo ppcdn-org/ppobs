@@ -191,15 +191,24 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 	// "?streamid=publish:<appId>/<stream>" query of the *expanded* URL (the
 	// app id segment is already substituted there by rtmp_custom_update);
 	// RTMP's path is plainly "<appId>/<stream>" with nothing to strip (see
-	// ParseRTMPStreamName). ERTSP's Server field is nothing but the
-	// {ppcdn_publish_endpoint} placeholder (see
-	// PPCDN_ERTSP_DEFAULT_PUBLISH_URL) - there's no path to parse a stream
-	// name out of, so it comes from the Stream Key field instead (reused for
-	// this purpose - see OBSBasicSettings_Stream.cpp's IsERTSP handling).
+	// ParseRTMPStreamName). ERTSP's Server field is meant to carry nothing
+	// but the {ppcdn_publish_endpoint} placeholder (see
+	// PPCDN_ERTSP_DEFAULT_PUBLISH_URL) with the stream name in the Stream
+	// Key field instead - but a user coming from SRT/ERTMP muscle memory
+	// will reasonably type the same ".../{ppcenter_appid}/B01-frontView"
+	// shape into the Server field instead (confirmed in the field: this
+	// leaves the Key field empty and fails closed here with no stream
+	// name found). Rather than only fail with an explanation, fall back to
+	// parsing it out of the URL the same way RTMP does when the Key field
+	// is empty, so either way of entering it works.
 	QString streamName;
 	if (protocol == "rtsp") {
 		const char *key = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_STREAM_ID);
 		streamName = QT_UTF8(key ? key : "").trimmed();
+		if (streamName.isEmpty()) {
+			const char *expanded = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
+			streamName = ParseRTMPStreamName(QT_UTF8(expanded && *expanded ? expanded : rawServer));
+		}
 	} else {
 		const char *expanded = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
 		const QString expandedUrl = QT_UTF8(expanded && *expanded ? expanded : rawServer);
@@ -207,15 +216,24 @@ bool ResolvePPCDNPublishEndpoint(obs_service_t *service, std::string &error)
 						: ParseRTMPStreamName(expandedUrl);
 	}
 	if (streamName.isEmpty()) {
-		error = "Cannot determine the stream name from the configured URL";
+		error = "Cannot determine the stream name - enter it in the Stream Key field, or in the Server URL "
+			"as .../{ppcenter_appid}/<name>";
 		return false;
 	}
 
+	// ppcenter's publish-requests API spells this protocol "ertsp" (see
+	// publish_v1.go's publishProtocolERTSP) - "rtsp" is only this file's own
+	// internal identifier (matching the service's rtmp_custom_get_protocol
+	// string), used for the URL-scheme-based branches below. Sending "rtsp"
+	// verbatim fails ppcenter's protocol-enum validation with a 400 (found
+	// in the field: the stream-name fix above let the request actually
+	// reach ppcenter, surfacing this as the very next failure).
+	const std::string wireProtocol = protocol == "rtsp" ? "ertsp" : protocol;
 	nlohmann::json body = {
 		{"appId", appID},
 		{"appSecret", appSecret},
 		{"streamName", streamName.toStdString()},
-		{"protocol", protocol},
+		{"protocol", wireProtocol},
 	};
 	// Requested for every WHIP-capable SRT/RTMP publish (see
 	// ppcenter-client.cpp's ppcenter_build_publish_json): gets back a

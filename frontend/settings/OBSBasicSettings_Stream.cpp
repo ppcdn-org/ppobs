@@ -304,12 +304,11 @@ void OBSBasicSettings::LoadStream1Settings()
 	} else {
 		int idx = ui->service->findText(service);
 		if (idx == -1) {
-			// Past the three special entries (SRT, WHIP, Custom...) -
-			// this is a saved rtmp_common service name no longer in the
-			// list (e.g. a platform that's since been removed).
-			if (service && *service)
-				ui->service->insertItem(3, service);
-			idx = 3;
+			// ppobs only ships SRT / WHIP / ERTMP; a saved rtmp_common
+			// service (Twitch, YouTube, ...) is no longer offered, so
+			// fall back to the first entry (SRT) instead of re-adding
+			// the removed platform.
+			idx = 0;
 		}
 		ui->service->setCurrentIndex(idx);
 		lastServiceIdx = idx;
@@ -1019,51 +1018,22 @@ void OBSBasicSettings::UpdateKeyLink()
 
 void OBSBasicSettings::LoadServices(bool showAll)
 {
-	obs_properties_t *props = obs_get_service_properties("rtmp_common");
-
-	OBSDataAutoRelease settings = obs_data_create();
-
-	obs_data_set_bool(settings, "show_all", showAll);
-
-	obs_property_t *prop = obs_properties_get(props, "show_all");
-	obs_property_modified(prop, settings);
+	/* ppobs only offers the PPCDN live transports - SRT, WHIP and ERTMP.
+	 * Every rtmp_common service (Twitch, YouTube, ...), the generic
+	 * "Custom" entry, ERTSP, and the "Show all" expander are intentionally
+	 * filtered out. showAll is kept for signature compatibility but no
+	 * longer has anything to reveal. */
+	(void)showAll;
 
 	ui->service->blockSignals(true);
 	ui->service->clear();
 
-	QStringList names;
-
-	obs_property_t *services = obs_properties_get(props, "service");
-	size_t services_count = obs_property_list_item_count(services);
-	for (size_t i = 0; i < services_count; i++) {
-		const char *name = obs_property_list_item_string(services, i);
-		names.push_back(name);
-	}
-
-	if (showAll)
-		names.sort(Qt::CaseInsensitive);
-
-	for (QString &name : names)
-		ui->service->addItem(name);
-
-	if (!showAll) {
-		ui->service->addItem(QTStr("Basic.AutoConfig.StreamPage.Service.ShowAll"),
-				     QVariant((int)ListOpt::ShowAll));
-	}
-
-	// Ordered SRT, ERTSP, WHIP, ERTMP, Custom... - inserted back-to-front so
-	// each insertItem(0, ...) doesn't have to account for the ones before
-	// it. ERTMP needs no obs_is_output_protocol_registered gate (unlike
-	// WHIP, an optional plugin): it's the base RTMP output, always built
-	// in. ERTSP is gated the same way WHIP is: its output (obs-ffmpeg's
-	// "RTSP" protocol) is a plugin feature, not always built in.
-	ui->service->insertItem(0, QTStr("Basic.AutoConfig.StreamPage.Service.Custom"), QVariant((int)ListOpt::Custom));
+	/* Inserted back-to-front so the final order is SRT, WHIP, ERTMP.
+	 * ERTMP needs no obs_is_output_protocol_registered gate (it's the base
+	 * RTMP output, always built in); WHIP is an optional plugin. */
 	ui->service->insertItem(0, QTStr("ERTMP"), QVariant((int)ListOpt::ERTMP));
 	if (obs_is_output_protocol_registered("WHIP")) {
 		ui->service->insertItem(0, QTStr("WHIP"), QVariant((int)ListOpt::WHIP));
-	}
-	if (obs_is_output_protocol_registered("RTSP")) {
-		ui->service->insertItem(0, QTStr("ERTSP"), QVariant((int)ListOpt::ERTSP));
 	}
 	ui->service->insertItem(0, QTStr("SRT"), QVariant((int)ListOpt::SRT));
 
@@ -1072,8 +1042,6 @@ void OBSBasicSettings::LoadServices(bool showAll)
 		if (idx != -1)
 			ui->service->setCurrentIndex(idx);
 	}
-
-	obs_properties_destroy(props);
 
 	ui->service->blockSignals(false);
 }
@@ -2281,6 +2249,15 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 		acodecs = (const char **)output_acodecs.Get();
 	}
 
+	/* SRT / WHIP / ERTMP deliver audio over a live transport we only support
+	 * with Opus, so restrict the *stream* audio codec to Opus and filter every
+	 * other codec (AAC, ...) out of the picker. Recording encoders keep the
+	 * full list - they write a local file, not the live service. */
+	static const char *opusOnlyAcodecs[] = {"opus", nullptr};
+	const char **streamAcodecs = acodecs;
+	if (IsSRT() || IsWHIP() || IsERTMP())
+		streamAcodecs = opusOnlyAcodecs;
+
 	QSignalBlocker s1(ui->simpleOutStrEncoder);
 	QSignalBlocker s2(ui->advOutEncoder);
 	QSignalBlocker s3(ui->simpleOutStrAEncoder);
@@ -2321,7 +2298,7 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 		}
 
 		if (obs_get_encoder_type(type) == OBS_ENCODER_AUDIO) {
-			if (service_supports_codec(acodecs, codec))
+			if (service_supports_codec(streamAcodecs, codec))
 				ui->advOutAEncoder->addItem(qName, qType);
 			if (!streamOnly)
 				ui->advOutRecAEncoder->addItem(qName, qType);
@@ -2390,10 +2367,10 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 	}
 #endif
 #endif
-	if (service_supports_encoder(acodecs, "CoreAudio_AAC") || service_supports_encoder(acodecs, "libfdk_aac") ||
-	    service_supports_encoder(acodecs, "ffmpeg_aac"))
+	if (service_supports_encoder(streamAcodecs, "CoreAudio_AAC") || service_supports_encoder(streamAcodecs, "libfdk_aac") ||
+	    service_supports_encoder(streamAcodecs, "ffmpeg_aac"))
 		ui->simpleOutStrAEncoder->addItem(QTStr("Basic.Settings.Output.Simple.Codec.AAC.Default"), "aac");
-	if (service_supports_encoder(acodecs, "ffmpeg_opus"))
+	if (service_supports_encoder(streamAcodecs, "ffmpeg_opus"))
 		ui->simpleOutStrAEncoder->addItem(QTStr("Basic.Settings.Output.Simple.Codec.Opus"), "opus");
 #undef ENCODER_STR
 

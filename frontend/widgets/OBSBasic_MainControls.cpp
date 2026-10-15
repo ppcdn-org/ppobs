@@ -618,14 +618,6 @@ void OBSBasic::on_actionMainRedo_triggered()
 	undo_s.redo();
 }
 
-void OBSBasic::on_autoConfigure_triggered()
-{
-	AutoConfig test(this);
-	test.setModal(true);
-	test.show();
-	test.exec();
-}
-
 void OBSBasic::on_stats_triggered()
 {
 	if (!stats.isNull()) {

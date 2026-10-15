@@ -402,6 +402,19 @@ void BasicOutputHandler::StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_
 	if (serviceId && strcmp(serviceId, "whip_custom") == 0)
 		return;
 
+	// ERTSP never attempts P2P (see the ERTSP cross-repo plan's confirmed
+	// scope - no NAT probe, no capability toggle, same as pplayer's read
+	// side). Without this check the companion blindly inherited the
+	// primary service's resolved "server" setting - for ERTSP a complete
+	// rtsp://user:pass@host:port/path URL - and tried to open it as a WHIP
+	// endpoint, failing immediately with a nonsensical "Protocol not
+	// found"/connect error logged under the companion's own name (found in
+	// the field: this fired for every ERTSP publish attempt until this
+	// check existed).
+	const char *protocol = obs_service_get_protocol(primary);
+	if (protocol && astrcmpi(protocol, "RTSP") == 0)
+		return;
+
 	// Only a PPCDN publish (ppcenter configured) has anywhere to signal to.
 	OBSDataAutoRelease serviceSettings = obs_service_get_settings(primary);
 	if (!serviceSettings || !*obs_data_get_string(serviceSettings, "ppcenter_url"))

@@ -962,7 +962,6 @@
     <property name="title">
      <string>Basic.MainMenu.Tools</string>
     </property>
-    <addaction name="autoConfigure"/>
     <addaction name="idianPlayground"/>
     <addaction name="actionOpenPluginManager"/>
     <addaction name="separator"/>
@@ -2046,16 +2045,6 @@
   <action name="idianPlayground">
    <property name="text">
     <string>Idian Playground</string>
-   </property>
-  </action>
-  <action name="autoConfigure2">
-   <property name="text">
-    <string>Basic.AutoConfig</string>
-   </property>
-  </action>
-  <action name="autoConfigure">
-   <property name="text">
-    <string>Basic.AutoConfig</string>
    </property>
   </action>
   <action name="actionOpenPluginManager">
