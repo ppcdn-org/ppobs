@@ -194,8 +194,32 @@ obs64.exe
 
 - **控制与数据同管道**：`HELLO/READY`（协商头像包、分辨率、帧率）、`AUDIO`（16kHz 单声道
   float32 分块）、`FRAME`（BGRA + 该帧对应的音频时间戳）、`STAT`（实测推理耗时、丢帧数）、
-  `BYE`。256×256 BGRA @25fps 只有 6.4MB/s，管道足够；共享内存（Windows file mapping）
-  留作 P1 优化。
+  `LOG`（worker 的日志行转进 obs.log）、`ERROR`、`BYE`。256×256 BGRA @25fps 只有
+  6.4MB/s，管道足够；共享内存（Windows file mapping）留作 P1 优化。
+
+#### 6.2.1 线格式与方向（阶段 C 已落地）
+
+权威定义在 `plugins/obs-avatar/avatar-sidecar-protocol.h`。几个在实现时定下来的点：
+
+- **插件是管道的服务端，worker 是客户端。** 这个方向是刻意选的：从 Python 连一个命名管道
+  就是 `open(r"\\.\pipe\name", "r+b")`，而*创建*一个则需要 pywin32。于是 worker 侧的传输
+  层零第三方依赖，同时访问控制归 OS 管，而不是任何本机进程都能连的 localhost 端口。
+- **字节流 + 自带长度分帧**，不用消息模式管道（`PIPE_TYPE_MESSAGE`）：消息模式在 Python
+  的 `open()` 这一侧没有对应物。
+- 消息头 8 字节：`uint32` 负载长度、`uint16` 类型、`uint16` 保留**必须为 0**。保留字段将来
+  赋予含义时，老读端会直接拒收而不是误读。
+- **类型字段不在分帧层校验**：更新的 worker 发来没见过的类型，正确反应是读掉负载并忽略，
+  而不是拆掉一条本来好用的管道。只有长度和保留字段是读端必须据此行动的。
+- 一切整数小端，逐字节读写，不 memcpy 结构体 —— 两端是不同语言不同编译器，结构体填充和
+  主机字节序不能参与进来。Python 侧用 `struct.pack("<...")` 说同一套。
+- 帧尺寸校验用 64 位算术：`width * height * 4` 在 uint32 能表达的范围内就会溢出，一个溢出
+  后恰好等于 `payload_len` 的乘积会把远小于声明尺寸的缓冲交给调用方。
+- **所有管道 I/O 用 overlapped**，不是为了吞吐（6.4MB/s 用不着），而是为了退出确定：阻塞
+  I/O 下停在 `ConnectNamedPipe` 或 `ReadFile` 里的读线程只能靠取消别人的同步 I/O 来放行，
+  那件事做错一点 OBS 就会在退出时挂住。现在每个等待都是 `{io 事件, 停止事件}` 的
+  `WaitForMultipleObjects`，停止就是一次 `SetEvent`。
+- 两端的字节级 fixture 是**同一组**：`avatar-protocol-test.c` 和 worker 的 `--selftest` 各
+  自钉同样几串字节。两种语言对不上是这个协议最可能出的故障，所以它是唯一从两侧都测的东西。
 - **worker 的实现可替换**：P0 直接包装 MuseTalk 官方实时推理脚本（Python），最快拿到
   可用闭环；P1 换 TensorRT／C++ worker；P2 若 ONNX 导出成功，可做成进程内引擎而协议不变。
 - **生命周期归插件管**：源启用时拉起 worker，源禁用／删除时结束；worker 异常退出按退避
@@ -360,11 +384,23 @@ VAE 解码 + 融合，端到端预计 **150~400ms**。也就是说，当播出�
 - viseme 判定 + 口型合成 + idle 动画
 - 验收：动物头像随说话开合，CPU 占用可忽略，不需要显卡
 
-### 阶段 C：sidecar 与模式 A
-- 管道协议与客户端、worker 生命周期管理
-- `tools/musetalk-sidecar/` 包装官方实时推理
-- 头像准备流程与缓存校验
+### 阶段 C：sidecar 与模式 A（骨架完成）
+- 线格式与分帧（`avatar-sidecar-protocol.h`），见 6.2.1 ✅
+- 引擎接口 `avatar-engine.h`：模式 A / B 的共同契约，源不需要知道任何一侧的内部 ✅
+- 插件侧客户端 `avatar-engine-sidecar.c`：overlapped 命名管道服务端、握手、音频外发、
+  帧入队、断线后等 worker 回来 ✅
+- `tools/musetalk-sidecar/`：worker 骨架，含零依赖的 stub 引擎（口型跟电平开合）和
+  `--selftest` ✅
+- 环回测试 `avatar-sidecar-loopback-test`：编入真客户端、拉起真 worker，跑完整握手、音频
+  外发、帧回传、BYE 退出 ✅（实测握手成功、2 秒音频产出 50 帧、0 丢弃、worker 退出码 0）
+- 待做：把引擎接到源上（动态纹理上传、模式选择属性、陈旧帧处理）
+- 待做：worker 进程的拉起与退避重拉（`worker_command` 已留好，目前手动启动）
+- 待做：`MuseTalkEngine` 真实推理与头像准备流程
 - 验收：真人头像口型与语音对应，持续 30 分钟不崩
+
+**stub 引擎的用处**不是好看，而是让整条链路在 3.4GB 权重到位之前就能验证：取音 → 重采样
+→ 管道 → 帧 → 上屏。盯着那张嘴对自己说话还能直接看出端到端延迟，正是阶段 D 要补偿的那个数。
+它同时是模式 A 失效时的兜底形态的雏形。
 
 ### 阶段 D：对齐与稳定性
 - 延迟测量、自动同步偏移、摄像头共存提示
@@ -378,12 +414,27 @@ VAE 解码 + 融合，端到端预计 **150~400ms**。也就是说，当播出�
 
 ## 12. 测试要求
 
+> **`assert()` 在本仓库的测试里是空操作。** RelWithDebInfo 定义了 `NDEBUG`，`assert()`
+> 随之消失，于是测试程序照常运行、照常退出 0、什么也没验证 —— 看起来和通过一模一样
+> （征兆通常是"只在 assert 里被读到的局部变量未被引用"这种警告）。本模块的测试改用
+> `avatar-test-check.h` 里的 `CHECK`，那是一个真的分支。`plugins/obs-filters/` 下现有的
+> 几个测试仍在用 `assert()`，同样受影响，但不在本功能的改动范围内。
+
 ### 自动化测试（照 `audioshift-filter-test.c` / `matting-models-test.c` 的形状）
-- viseme 判定：给定合成音频，口型序列稳定、无抖动、静音段闭口
+- viseme 判定：给定合成音频，口型序列稳定、无抖动、静音段闭口（阶段 B）
 - 音频重采样：48k/44.1k 多声道 → 16k 单声道，长度与相位正确
-- 环形缓冲：溢出丢旧、读写并发无数据竞争
-- sidecar 协议：消息编解码、半包／粘包、对端异常关闭
-- 时间戳对齐：给定延迟，偏移计算正确
+- 环形缓冲：溢出丢旧、读写并发无数据竞争 ✅ `avatar-audio-tap-test`
+- sidecar 协议：分帧、负载校验、保留字段、未知类型前向兼容、尺寸溢出 ✅
+  `avatar-protocol-test`（字节级 fixture 与 worker 的 `--selftest` 是同一组）
+- 两端真实会话：握手、音频外发、帧回传、BYE 退出 ✅ `avatar-sidecar-loopback-test`
+- 时间戳对齐：给定延迟，偏移计算正确（阶段 D）
+
+**环回测试里真正值得写的那一条断言**：从"大声"音频窗生成的帧，和从静音窗生成的帧，必须
+不同，而且必须差在嘴上（实测 3726 像素 vs 0 像素）。只断言"有帧回来"会在音频被完全忽略的
+情况下照样通过 —— 那恰恰是这条链路最容易出的故障。
+
+环回测试需要运行时有 Python。缺了解释器时它**显式 SKIP 并打印原因**（已实测），不是静默
+跳过也不是失败：构建 OBS 的机器不一定装了 Python，但一个悄悄跳过的测试比没有测试更坏。
 
 ### 功能测试（需人工在 OBS 里验证）
 - 真人头像、动物头像、卡通头像各一例
@@ -423,6 +474,21 @@ plugins/obs-avatar/
   avatar-audio-tap-test.c         环形缓冲与电平换算单测（ENABLE_TEST_INPUT 时构建）
   data/locale/en-US.ini
   data/locale/zh-CN.ini
+```
+
+阶段 C 新增：
+
+```text
+plugins/obs-avatar/
+  avatar-sidecar-protocol.h       线格式：分帧、小端读写、负载校验（见 6.2.1）
+  avatar-engine.h                 引擎接口（vtable），模式 A / B 的共同契约
+  avatar-engine-sidecar.c / .h    模式 A：overlapped 命名管道服务端与会话
+  avatar-protocol-test.c          分帧与负载校验单测，含字节级 fixture
+  avatar-sidecar-loopback-test.c  真客户端 + 真 worker 的完整会话测试
+  avatar-test-check.h             NDEBUG 下仍然有效的 CHECK（见第 12 节的说明）
+tools/musetalk-sidecar/
+  ppobs_avatar_worker.py          worker 骨架：stub 引擎 + --selftest
+  README.md                       怎么跑、权重放哪、许可证阻断项
 ```
 
 环形缓冲与电平计算刻意写成 `avatar-audio-tap.h` 里的 `static inline`，这样单测不需要
