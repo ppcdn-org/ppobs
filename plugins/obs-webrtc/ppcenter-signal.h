@@ -74,6 +74,11 @@ public:
 	// decoding immediately instead of waiting for the encoder's next scheduled
 	// IDR (the viewer falls back to edge if no frame arrives in time).
 	void SetOnPeerConnected(std::function<void()> callback);
+	// Called when a peer's browser asks for a keyframe with RTCP PLI/FIR on
+	// the P2P video track (join, packet loss, decoder resync). The publisher
+	// forces an IDR so the peer can recover immediately instead of waiting
+	// out the encoder's scheduled GOP.
+	void SetOnKeyFrameRequest(std::function<void()> callback);
 	size_t PeerCount();
 	void ForEachPeer(std::function<void(P2PPeer &)> callback);
 	void SendAnswer(const std::string &sessionId, const std::string &sdp);
@@ -104,6 +109,7 @@ private:
 	int maxPeers = 3;
 	std::function<void()> onPeerUpdated;
 	std::function<void()> onPeerConnected;
+	std::function<void()> onKeyFrameRequest;
 	std::mutex peersMutex;
 	std::map<std::string, std::shared_ptr<P2PPeer>> peers;
 	std::atomic<bool> running{false};

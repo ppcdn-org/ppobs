@@ -2,6 +2,7 @@
 #include "ppcenter-signal-message.h"
 #include "ppcenter-signal-outgoing.h"
 #include "ppcenter-websocket-utils.h"
+#include "whip-codec-session.h"
 
 #include <rtc/websocket.hpp>
 
@@ -318,6 +319,7 @@ P2PSignalClient::~P2PSignalClient() { Stop(); }
 
 void P2PSignalClient::SetOnPeerUpdated(std::function<void()> callback) { onPeerUpdated = std::move(callback); }
 void P2PSignalClient::SetOnPeerConnected(std::function<void()> callback) { onPeerConnected = std::move(callback); }
+void P2PSignalClient::SetOnKeyFrameRequest(std::function<void()> callback) { onKeyFrameRequest = std::move(callback); }
 
 bool P2PSignalClient::Start()
 {
@@ -474,6 +476,17 @@ void P2PSignalClient::CreatePeerVideo(P2PPeer &peer)
 		auto pk = std::make_shared<rtc::H264RtpPacketizer>(rtc::H264RtpPacketizer::Separator::StartSequence, rtpConfig, MAX_VIDEO_FRAGMENT_SIZE);
 		peer.videoSrReporter = std::make_shared<rtc::RtcpSrReporter>(rtpConfig);
 		pk->addToChain(peer.videoSrReporter); pk->addToChain(std::make_shared<rtc::RtcpNackResponder>(VIDEO_NACK_BUFFER_SIZE));
+		// A browser receiver asks for a keyframe with RTCP PLI/FIR on join,
+		// after loss, or when its decoder needs a resync. The WHIP path
+		// already routes that to the encoder; without the same wiring on the
+		// P2P track the request is dropped and the viewer waits for the next
+		// scheduled IDR (up to a full GOP) even though NACK could not help.
+		auto lossTracker = std::make_shared<RtcpLossTracker>();
+		lossTracker->on_key_frame_request = [this]() {
+			if (onKeyFrameRequest)
+				onKeyFrameRequest();
+		};
+		pk->addToChain(lossTracker);
 		peer.videoTrack->setMediaHandler(pk);
 	}
 }

@@ -1169,6 +1169,13 @@ bool WHIPOutput::StartP2PSignal()
 		if (p2pVideoEncoder)
 			obs_encoder_request_keyframe(p2pVideoEncoder);
 	});
+	// A P2P viewer's own PLI/FIR (join, loss beyond the NACK window, decoder
+	// reset) must reach the encoder just like an edge viewer's PLI does via
+	// the WHIP path's RtcpLossTracker. Otherwise it waits up to a full GOP.
+	p2pSignal->SetOnKeyFrameRequest([this]() {
+		if (p2pVideoEncoder)
+			obs_encoder_request_keyframe(p2pVideoEncoder);
+	});
 	p2pSignal->Start();
 	qosPolicy = std::make_unique<UplinkQosPolicy>(UplinkQosConfig{});
 	return true;
