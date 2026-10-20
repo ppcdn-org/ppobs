@@ -31,6 +31,12 @@ public:
 	// Returns the (lost, expected) deltas since the previous call and resets.
 	std::pair<uint64_t, uint64_t> TakeDelta();
 
+	// Called once per incoming RTCP compound that contains a PLI or FIR, i.e.
+	// a receiver asking for an immediate keyframe. The WHIP session wires this
+	// to obs_encoder_request_keyframe for every video layer, so an edge viewer
+	// connecting does not have to wait out the encoder's GOP.
+	std::function<void()> on_key_frame_request;
+
 	void incoming(rtc::message_vector &messages, const rtc::message_callback &send) override;
 
 private:

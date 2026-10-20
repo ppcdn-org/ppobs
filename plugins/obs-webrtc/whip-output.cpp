@@ -74,7 +74,9 @@ bool WHIPOutput::Start()
 void WHIPOutput::Stop(bool signal)
 {
 #ifdef WHIP_DEGRADE_ACTIVE
-	WsDegradeClient::Instance().UnregisterOutput();
+	// Not for a P2P-only companion - see the matching guard in StartThread().
+	if (!p2p_only)
+		WsDegradeClient::Instance().UnregisterOutput();
 #endif
 
 	std::lock_guard<std::mutex> l(start_stop_mutex);
@@ -103,78 +105,6 @@ static uint32_t advanceRtpTimestamp(const std::shared_ptr<rtc::RtpPacketizationC
 	return lastTimestamp + rtp->secondsToTimestamp(static_cast<double>(durationUsec) / (1000.0 * 1000.0));
 }
 
-// TEMPORARY diagnostic (2026-09-25): the P2P leg still fails to decode in the
-// browser (framesReceived=0) even though the RTP header is well-formed on the
-// wire and the sender setup is correct. The remaining suspect is the NAL
-// bitstream format handed to libdatachannel's H264RtpPacketizer, which is built
-// with Separator::StartSequence and therefore expects Annex-B start codes
-// (00 00 00 01 / 00 00 01). If OBS hands us AVCC (4-byte big-endian length
-// prefixes) in this SRT/rtmp_custom-companion scenario, the packetizer
-// mis-parses and the browser can never assemble a frame. This dumps the first
-// few video AUs' structure so we can see the actual format + NAL types +
-// whether SPS/PPS ride with the keyframe. Logged at Debug only (off at the
-// default log level). Remove once P2P decode is fixed.
-static void logP2PVideoNALDiag(const struct encoder_packet *packet)
-{
-	static int logged = 0;
-	if (logged >= 6)
-		return;
-	const uint8_t *d = (const uint8_t *)packet->data;
-	size_t n = packet->size;
-	if (n < 5)
-		return;
-	logged++;
-
-	const bool annexb4 = (d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 1);
-	const bool annexb3 = (d[0] == 0 && d[1] == 0 && d[2] == 1);
-	const char *fmt = annexb4 ? "AnnexB(4)" : (annexb3 ? "AnnexB(3)" : "AVCC?");
-
-	char head[64];
-	snprintf(head, sizeof(head), "%02x %02x %02x %02x %02x %02x %02x %02x", d[0], d[1], d[2], d[3],
-		 d[4], d[5 < n ? 5 : 4], d[6 < n ? 6 : 4], d[7 < n ? 7 : 4]);
-
-	// Walk NAL units and collect their types.
-	char nals[256] = {0};
-	size_t np = 0;
-	if (annexb4 || annexb3) {
-		size_t i = 0;
-		while (i + 3 < n && np < sizeof(nals) - 8) {
-			size_t sc = 0;
-			if (i + 3 < n && d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 0 && d[i + 3] == 1)
-				sc = 4;
-			else if (i + 2 < n && d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1)
-				sc = 3;
-			if (sc == 0) {
-				i++;
-				continue;
-			}
-			size_t nalStart = i + sc;
-			if (nalStart >= n)
-				break;
-			int t = d[nalStart] & 0x1f;
-			np += snprintf(nals + np, sizeof(nals) - np, "%d ", t);
-			i = nalStart + 1;
-		}
-	} else {
-		// Interpret as AVCC: [4-byte len][NAL]...
-		size_t i = 0;
-		while (i + 4 < n && np < sizeof(nals) - 8) {
-			uint32_t len = (uint32_t(d[i]) << 24) | (uint32_t(d[i + 1]) << 16) |
-				       (uint32_t(d[i + 2]) << 8) | uint32_t(d[i + 3]);
-			if (len == 0 || i + 4 + len > n) {
-				np += snprintf(nals + np, sizeof(nals) - np, "(len=%u bad)", len);
-				break;
-			}
-			int t = d[i + 4] & 0x1f;
-			np += snprintf(nals + np, sizeof(nals) - np, "%d ", t);
-			i += 4 + len;
-		}
-	}
-	// NAL types: 7=SPS 8=PPS 5=IDR 1=nonIDR 6=SEI 9=AUD
-	blog(LOG_DEBUG, "[obs-webrtc] [p2p-naldiag] #%d key=%d size=%zu fmt=%s head=[%s] nalTypes=[%s]", logged,
-	     packet->keyframe ? 1 : 0, n, fmt, head, nals);
-}
-
 static size_t h264StartCodeLength(const uint8_t *data, size_t size, size_t at)
 {
 	if (at + 3 < size && data[at] == 0 && data[at + 1] == 0 && data[at + 2] == 0 && data[at + 3] == 1)
@@ -199,6 +129,37 @@ struct H264ParameterSets {
 	std::vector<uint8_t> annexB;
 };
 
+// libdatachannel's H264RtpPacketizer is built with Separator::StartSequence, so
+// the P2P feed must hand it Annex-B (00 00 00 01) NAL units. The WHIP/SRT
+// encoders already emit that, but the RTMP/ERTMP primary encoder hands OBS
+// AVCC (4-byte big-endian length prefixes) - the same packets the FLV mux
+// consumes. Feeding those straight to the packetizer makes Chrome receive RTP
+// but never assemble a decodable frame. Normalize here; an empty result means
+// the packet was neither recognized Annex-B nor a valid AVCC chain, so the
+// caller falls back to the original bytes.
+static std::vector<uint8_t> h264PacketToAnnexB(const uint8_t *data, size_t size)
+{
+	if (size >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
+		return std::vector<uint8_t>(data, data + size);
+	if (size >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1)
+		return std::vector<uint8_t>(data, data + size);
+
+	std::vector<uint8_t> out;
+	size_t i = 0;
+	while (i + 4 <= size) {
+		uint32_t len = (uint32_t(data[i]) << 24) | (uint32_t(data[i + 1]) << 16) |
+			       (uint32_t(data[i + 2]) << 8) | uint32_t(data[i + 3]);
+		if (len == 0 || i + 4 + len > size) {
+			out.clear();
+			return out;
+		}
+		out.insert(out.end(), {0, 0, 0, 1});
+		out.insert(out.end(), data + i + 4, data + i + 4 + len);
+		i += 4 + len;
+	}
+	return out;
+}
+
 static H264ParameterSets extractH264ParameterSets(const uint8_t *data, size_t size)
 {
 	H264ParameterSets out;
@@ -220,6 +181,20 @@ static H264ParameterSets extractH264ParameterSets(const uint8_t *data, size_t si
 	if (!out.hasSPS || !out.hasPPS)
 		out.annexB.clear();
 	return out;
+}
+
+// Parameter sets may come from either a packet (already Annex-B by this
+// point) or the encoder's own extra data. The latter is Annex-B for OBS's
+// encoders, but tolerate AVCC just in case a future encoder differs.
+static std::vector<uint8_t> extractH264ParameterSetsAny(const uint8_t *data, size_t size)
+{
+	auto sets = extractH264ParameterSets(data, size);
+	if (!sets.annexB.empty())
+		return sets.annexB;
+	auto annexB = h264PacketToAnnexB(data, size);
+	if (annexB.empty())
+		return {};
+	return extractH264ParameterSets(annexB.data(), annexB.size()).annexB;
 }
 
 void WHIPOutput::Data(struct encoder_packet *packet)
@@ -278,29 +253,40 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 		// resolutions' NAL units into one SSRC/sequence-number stream,
 		// which no decoder can make sense of.
 		if (p2pSignal) {
-			// TEMPORARY P2P feed diagnostics (2026-09-30) - logged at Debug
-			// only, so a normal run's log stays readable; remove once the feed
-			// regression is understood.
-			p2pFeedCounters.videoPackets++;
-			if (packet->encoder == p2pVideoEncoder)
-				p2pFeedCounters.encoderMatched++;
-
 			if (packet->encoder == p2pVideoEncoder) {
-				const auto parameterSets = extractH264ParameterSets(
-					(const uint8_t *)packet->data, packet->size);
+				const auto annexB = h264PacketToAnnexB((const uint8_t *)packet->data, packet->size);
+				const uint8_t *videoData = annexB.empty() ? (const uint8_t *)packet->data : annexB.data();
+				const size_t videoSize = annexB.empty() ? packet->size : annexB.size();
+				const auto parameterSets = extractH264ParameterSets(videoData, videoSize);
 				if (!parameterSets.annexB.empty())
 					p2pH264ParameterSets = parameterSets.annexB;
-				logP2PVideoNALDiag(packet); // TEMPORARY (2026-09-25) - remove once P2P decode is fixed
+				// The RTMP/ERTMP primary encoder's first packet has its
+				// SPS/PPS stripped into obs_encoder_get_extra_data()
+				// (libobs' obs_extract_avc_headers), and repeat_headers is
+				// false for non-WHIP services, so no packet ever carries
+				// them. A P2P viewer joining mid-stream then gets RTP but
+				// no decodable frame. Pull them from the encoder's own
+				// extra data once it is available (after the first packet).
+				if (p2pH264ParameterSets.empty() && packet->keyframe) {
+					uint8_t *extraData = nullptr;
+					size_t extraSize = 0;
+					if (obs_encoder_get_extra_data(p2pVideoEncoder, &extraData, &extraSize) &&
+					    extraData && extraSize) {
+						auto fromExtra = extractH264ParameterSetsAny(extraData, extraSize);
+						if (!fromExtra.empty()) {
+							p2pH264ParameterSets = std::move(fromExtra);
+							blog(LOG_INFO,
+							     "[obs-webrtc] [p2p] cached SPS/PPS from encoder extra data (%zu bytes)",
+							     p2pH264ParameterSets.size());
+						}
+					}
+				}
 				p2pSignal->ForEachPeer([&](P2PPeer &peer) {
-					if (!peer.videoTrack || !peer.videoTrack->isOpen()) {
-						p2pFeedCounters.skippedNoTrack++;
+					if (!peer.videoTrack || !peer.videoTrack->isOpen())
 						return;
-					}
 					// Start this peer's feed on a keyframe - see P2PPeer::videoStarted.
-					if (!peer.videoStarted && !packet->keyframe) {
-						p2pFeedCounters.skippedNoKey++;
+					if (!peer.videoStarted && !packet->keyframe)
 						return;
-					}
 					int64_t dur = peer.videoStarted ? packet->dts_usec - peer.lastVideoTimestamp : 0;
 					peer.lastVideoTimestamp = packet->dts_usec;
 					peer.videoStarted = true;
@@ -311,12 +297,12 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 					// (codec=null, framesDecoded=0).
 					if (packet->keyframe && parameterSets.annexB.empty() &&
 					    !p2pH264ParameterSets.empty()) {
-						sample.reserve(p2pH264ParameterSets.size() + packet->size);
+						sample.reserve(p2pH264ParameterSets.size() + videoSize);
 						const auto *begin = reinterpret_cast<const rtc::byte *>(p2pH264ParameterSets.data());
 						sample.insert(sample.end(), begin, begin + p2pH264ParameterSets.size());
 					}
-					sample.insert(sample.end(), (rtc::byte *)packet->data,
-						      (rtc::byte *)packet->data + packet->size);
+					sample.insert(sample.end(), (rtc::byte *)videoData,
+						      (rtc::byte *)videoData + videoSize);
 					auto rtp = peer.videoSrReporter->rtpConfig;
 					rtp->sequenceNumber = peer.videoSequenceNumber;
 					rtp->ssrc = peer.videoSsrc;
@@ -331,43 +317,11 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 					rtp->timestamp = advanceRtpTimestamp(rtp, peer.videoRtpTimestamp, dur);
 					try {
 						peer.videoTrack->send(sample);
-						p2pFeedCounters.sent++;
-						p2pFeedCounters.lastRtpTimestamp = rtp->timestamp;
-						p2pFeedCounters.lastSequenceNumber = rtp->sequenceNumber;
-						p2pFeedCounters.lastDtsUsec = packet->dts_usec;
-					} catch (const std::exception &e) {
-						p2pFeedCounters.sendErrors++;
-						if (p2pFeedCounters.sendErrors <= 5)
-							blog(LOG_DEBUG, "[obs-webrtc] [p2p-feed] videoTrack->send() threw: %s",
-							     e.what());
 					} catch (...) {
-						p2pFeedCounters.sendErrors++;
 					}
 					peer.videoSequenceNumber = rtp->sequenceNumber;
 					peer.videoRtpTimestamp = rtp->timestamp;
 				});
-			}
-
-		// 2s rollup - fires while video keeps arriving (a live WHIP stream
-		// always does), so a repro shows the feed state at the moment a
-		// viewer is connected.
-		auto now_ms = (int64_t)(obs_get_video_frame_time() / 1000000);
-		if (now_ms - lastP2PFeedLogMs >= 2000) {
-			lastP2PFeedLogMs = now_ms;
-			size_t peers = p2pSignal->PeerCount();
-			blog(LOG_DEBUG,
-				     "[obs-webrtc] [p2p-feed] 2s: videoPkts=%llu encMatch=%llu peers=%zu sent=%llu skipNoTrack=%llu skipNoKey=%llu sendErr=%llu p2pEnc=%p pktEnc=%p key=%d lastTs=%u lastSeq=%u lastDts=%lld",
-				     (unsigned long long)p2pFeedCounters.videoPackets,
-				     (unsigned long long)p2pFeedCounters.encoderMatched, peers,
-				     (unsigned long long)p2pFeedCounters.sent,
-				     (unsigned long long)p2pFeedCounters.skippedNoTrack,
-				     (unsigned long long)p2pFeedCounters.skippedNoKey,
-				     (unsigned long long)p2pFeedCounters.sendErrors,
-				     (void *)p2pVideoEncoder, (void *)packet->encoder, packet->keyframe ? 1 : 0,
-				     (unsigned)p2pFeedCounters.lastRtpTimestamp,
-				     (unsigned)p2pFeedCounters.lastSequenceNumber,
-				     (long long)p2pFeedCounters.lastDtsUsec);
-				p2pFeedCounters = P2PFeedCounters{};
 			}
 		}
 	}
@@ -399,6 +353,28 @@ bool WHIPOutput::Init()
 		watchdog_stall_sec = watchdog_interval_sec;
 
 	enable_pacing = obs_data_get_bool(output_settings, "whip_enable_pacing");
+	p2pEnabled = !obs_data_has_user_value(output_settings, "ppcdn_p2p_enabled") ||
+		     obs_data_get_bool(output_settings, "ppcdn_p2p_enabled");
+	p2pLocalMaxSessions = (int)obs_data_get_int(output_settings, "ppcdn_p2p_max_sessions");
+	if (!obs_data_has_user_value(output_settings, "ppcdn_p2p_max_sessions") ||
+	    p2pLocalMaxSessions <= 0)
+		p2pLocalMaxSessions = 3;
+	if (!p2pEnabled) {
+		// The output object is reused across starts. Clear everything the
+		// previous run may have left behind (including a direct-publish run,
+		// which never populates the ppcenter request below).
+		p2pToken.clear();
+		p2pSignalUrl.clear();
+		p2pStreamPath.clear();
+		p2pStunServers.clear();
+		natProbeUrl.clear();
+		natProbeAppId.clear();
+		natProbeAppSecret.clear();
+		natProbeStreamName.clear();
+		natProbeClientId.clear();
+		natProbeId.clear();
+		lastNatProbeRefreshMs = 0;
+	}
 
 	// Finite reconnect budget only in multitrack mode - see the design
 	// doc's "双轨重连超过配置上限时，停止整组输出". A single-session (no
@@ -732,6 +708,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 						 obs_data_get_string(service_settings, "ppcenter_secret"),
 						 obs_data_get_string(service_settings, "ppcenter_stream"),
 						 obs_data_get_string(service_settings, "ppcenter_region")};
+		request.max_p2p_sessions = p2pLocalMaxSessions;
 		// Register this device's hardware identity with ppcenter before
 		// publishing. The server enforces a per-user device binding limit and
 		// rejects publishes from unregistered devices (HTTP 403). Registration
@@ -748,24 +725,39 @@ bool WHIPOutput::Setup(uint64_t generation)
 			do_log(LOG_INFO, "device registered: deviceId=%s", deviceId.c_str());
 		}
 		request.device_id = deviceId;
-		natProbeUrl = request.url;
-		natProbeAppId = request.app_id;
-		natProbeAppSecret = request.app_secret;
-		natProbeStreamName = request.stream_name;
-		natProbeClientId = deviceId;
-		// /1,000,000 to match CheckNatProbeRefresh()'s own conversion (ns -> ms) -
-		// this baseline and that function's now_ms must be in the same unit or
-		// the first comparison is meaningless.
-		lastNatProbeRefreshMs = (int64_t)(obs_get_video_frame_time() / 1000000);
-		const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name, natProbeClientId);
-		if (probe.succeeded) {
-			request.nat_probe_id = probe.probe_id;
-			natProbeId = probe.probe_id;
-			do_log(LOG_INFO, "P2P publisher NAT probe registered");
+		if (p2pEnabled) {
+			natProbeUrl = request.url;
+			natProbeAppId = request.app_id;
+			natProbeAppSecret = request.app_secret;
+			natProbeStreamName = request.stream_name;
+			natProbeClientId = deviceId;
+			// /1,000,000 to match CheckNatProbeRefresh()'s own conversion (ns -> ms) -
+			// this baseline and that function's now_ms must be in the same unit or
+			// the first comparison is meaningless.
+			lastNatProbeRefreshMs = (int64_t)(obs_get_video_frame_time() / 1000000);
+			const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret,
+							     request.stream_name, natProbeClientId);
+			if (probe.succeeded) {
+				request.nat_probe_id = probe.probe_id;
+				natProbeId = probe.probe_id;
+				do_log(LOG_INFO, "P2P publisher NAT probe registered");
+			} else {
+				// NAT probing is an optional P2P optimization. Publishing must
+				// continue normally; ppcenter will naturally choose edge-only.
+				do_log(LOG_WARNING,
+				       "P2P publisher NAT probe failed; continuing with edge-only fallback");
+			}
 		} else {
-			// NAT probing is an optional P2P optimization. Publishing must
-			// continue normally; ppcenter will naturally choose edge-only.
-			do_log(LOG_WARNING, "P2P publisher NAT probe failed; continuing with edge-only fallback");
+			// The output object is reused across starts, so drop any probe
+			// state left by a previous run with P2P enabled.
+			natProbeUrl.clear();
+			natProbeAppId.clear();
+			natProbeAppSecret.clear();
+			natProbeStreamName.clear();
+			natProbeClientId.clear();
+			natProbeId.clear();
+			lastNatProbeRefreshMs = 0;
+			do_log(LOG_INFO, "P2P disabled in Settings > Advanced: skipping NAT probe and signaling");
 		}
 		std::string error;
 		if (!ppcenter_resolve_publish(request, resp, error)) {
@@ -775,16 +767,31 @@ bool WHIPOutput::Setup(uint64_t generation)
 			return false;
 		}
 	}
-	p2pToken = resp.signal_token;
-	p2pSignalUrl = resp.signal_url;
-	p2pStreamPath = request.app_id + "/" + request.stream_name;
-	p2pStunServers = std::move(resp.stun_servers);
-	if (p2pStunServers.empty())
-		p2pStunServers.emplace_back("stun:stun.l.google.com:19302");
-	// Platform play setting: how many simultaneous P2P peers this publisher
-	// may carry. ppcenter enforces the same number when allocating sessions,
-	// so this is the publisher-side backstop. 0/absent => historical 3.
-	p2pMaxSessions = resp.max_sessions > 0 ? resp.max_sessions : 3;
+	if (p2pEnabled) {
+		p2pToken = resp.signal_token;
+		p2pSignalUrl = resp.signal_url;
+		p2pStreamPath = request.app_id + "/" + request.stream_name;
+		p2pStunServers = std::move(resp.stun_servers);
+		if (p2pStunServers.empty())
+			p2pStunServers.emplace_back("stun:stun.l.google.com:19302");
+		// Platform play setting: how many simultaneous P2P peers this publisher
+		// may carry. ppcenter enforces the same number when allocating sessions,
+		// so this is the publisher-side backstop. 0/absent => historical 3.
+		// The local Settings > Advanced > P2P limit can only tighten it.
+		p2pMaxSessions = resp.max_sessions > 0 ? resp.max_sessions : 3;
+		if (p2pLocalMaxSessions < p2pMaxSessions)
+			p2pMaxSessions = p2pLocalMaxSessions;
+	} else {
+		p2pToken.clear();
+		p2pSignalUrl.clear();
+		p2pStreamPath.clear();
+		p2pStunServers.clear();
+	}
+
+	if (p2p_only && !p2pEnabled) {
+		do_log(LOG_INFO, "P2P disabled in Settings > Advanced: P2P-only output will not start");
+		return false;
+	}
 
 	// Resolved before the p2p_only early return below: a P2P-only output
 	// never reaches the WHIP layer setup, but its Data() still has to know
@@ -1097,13 +1104,25 @@ void WHIPOutput::StartThread(uint64_t generation)
 	running = true;
 
 #ifdef WHIP_DEGRADE_ACTIVE
-	// Registered for both the normal WHIP output and the P2P-only
-	// companion that backs an SRT (or any non-WHIP) publish. One control
-	// channel per codec published (HEVC/H264 multitrack => two), each
-	// derived from the WHIP endpoint Setup() resolved from ppcenter for
-	// that codec.
-	WsDegradeClient::Instance().RegisterOutput(output, degrade_url_h264, degrade_token_h264,
-						   degrade_url_hevc, degrade_token_hevc);
+	// Not for a P2P-only companion backing an SRT (or RTMP) publish: that
+	// case used to be this registration's only reason to resolve
+	// degrade_url_h264/token_h264 at all (see the comment above this
+	// method's p2p_only branch), back when ppcenter never minted a
+	// whipTracks entry for a non-WHIP protocol, so it was silently a no-op
+	// (ConfigureChannelLocked requires a non-empty URL+token). Now that
+	// ppcenter does mint one for SRT (see docs/design/
+	// publish-degrade-protocol.zh-CN.md and plugins/obs-ffmpeg/
+	// srt-degrade-client.h, which registers the *real* SRT output's full
+	// ladder directly), this registration would just fight that one for
+	// the same per-path WS slot - this client's codecEncoders() only ever
+	// sees this companion's single shared base-layer encoder, so it can't
+	// represent the actual ladder anyway. Still skipped for an RTMP
+	// companion (no RTMP-side degrade client exists yet) rather than
+	// re-enabling the old single-encoder behavior just for that case.
+	if (!p2p_only) {
+		WsDegradeClient::Instance().RegisterOutput(output, degrade_url_h264, degrade_token_h264,
+							   degrade_url_hevc, degrade_token_hevc);
+	}
 #endif
 }
 
@@ -1130,6 +1149,8 @@ void WHIPOutput::StopThread(bool signal, uint64_t generation)
 
 bool WHIPOutput::StartP2PSignal()
 {
+	if (!p2pEnabled)
+		return false;
 	if (p2pToken.empty() || p2pSignalUrl.empty() || p2pStreamPath.empty())
 		return false;
 	// P2P always advertises H264 - see this class's header comment: it
@@ -1300,6 +1321,7 @@ std::string WHIPOutput::AcquireP2PToken(bool force)
 	request.stream_name = natProbeStreamName;
 	request.device_id = natProbeClientId;
 	request.nat_probe_id = natProbeId;
+	request.max_p2p_sessions = p2pLocalMaxSessions;
 	PPCenterPublishResponse response;
 	std::string error;
 	if (!ppcenter_refresh_p2p_token(request, response, error) || response.signal_token.empty()) {

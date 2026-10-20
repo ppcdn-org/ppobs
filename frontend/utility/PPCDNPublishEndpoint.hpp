@@ -27,6 +27,21 @@
 #define PPCDN_ERTMP_DEFAULT_PUBLISH_URL \
 	"rtmp://" PPCDN_PUBLISH_ENDPOINT_PLACEHOLDER "/{ppcenter_appid}/B01-frontView"
 
+// Default ERTSP (Enhanced RTSP) Server URL used when the field is left
+// empty. Unlike SRT/ERTMP, PPCenter's ERTSP publish-node response is
+// already a *complete* rtsp://user:token@host:port/path URL (the publish
+// token has to ride as RTSP Basic Auth userinfo, which a mid-template
+// placeholder substitution can't produce - see ResolvePPCDNPublishEndpoint's
+// "rtsp" branch), so the template here carries nothing but the placeholder
+// itself: resolution overwrites the whole Server field with PPCenter's
+// answer rather than substituting a fragment into it. The "rtsp://" prefix
+// still has to be literally present so rtmp_custom_get_protocol's prefix
+// sniff (and LoadStream1Settings') recognize this as ERTSP before it has
+// ever been resolved. The stream name has nowhere to live in this template
+// (there's no path to parse), so it comes from the Stream Key field instead
+// - see OBSBasicSettings_Stream.cpp's IsERTSP handling.
+#define PPCDN_ERTSP_DEFAULT_PUBLISH_URL "rtsp://" PPCDN_PUBLISH_ENDPOINT_PLACEHOLDER
+
 // ResolvePPCDNPublishEndpoint is a no-op returning true for anything that
 // isn't a custom SRT/ERTMP service still carrying the placeholder. For an
 // SRT or ERTMP template it requests the Origin's ingest address from

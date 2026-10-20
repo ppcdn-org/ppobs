@@ -350,9 +350,25 @@ void BasicOutputHandler::SetupCompanionStream(const char *outputType)
 	     obs_service_get_connect_info(hevcStreamService, OBS_SERVICE_CONNECT_INFO_SERVER_URL));
 }
 
+bool BasicOutputHandler::P2PStreamingEnabled() const
+{
+	config_t *config = main->Config();
+	return !config_has_user_value(config, "P2P", "Enabled") ||
+	       config_get_bool(config, "P2P", "Enabled");
+}
+
+int BasicOutputHandler::P2PStreamingMaxSessions() const
+{
+	config_t *config = main->Config();
+	if (!config_has_user_value(config, "P2P", "MaxSessions"))
+		return 3;
+	int value = (int)config_get_int(config, "P2P", "MaxSessions");
+	return value > 0 ? value : 3;
+}
+
 bool BasicOutputHandler::EnforceNoBFrames(obs_encoder_t *videoEncoder)
 {
-	if (!videoEncoder)
+	if (!videoEncoder || !P2PStreamingEnabled())
 		return true;
 
 	// WebRTC (the P2P leg) cannot consume B-frames. whip_custom forces this
@@ -402,6 +418,24 @@ void BasicOutputHandler::StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_
 	if (serviceId && strcmp(serviceId, "whip_custom") == 0)
 		return;
 
+	// ERTSP never attempts P2P (see the ERTSP cross-repo plan's confirmed
+	// scope - no NAT probe, no capability toggle, same as pplayer's read
+	// side). Without this check the companion blindly inherited the
+	// primary service's resolved "server" setting - for ERTSP a complete
+	// rtsp://user:pass@host:port/path URL - and tried to open it as a WHIP
+	// endpoint, failing immediately with a nonsensical "Protocol not
+	// found"/connect error logged under the companion's own name (found in
+	// the field: this fired for every ERTSP publish attempt until this
+	// check existed).
+	const char *protocol = obs_service_get_protocol(primary);
+	if (protocol && astrcmpi(protocol, "RTSP") == 0)
+		return;
+
+	if (!P2PStreamingEnabled()) {
+		blog(LOG_INFO, "[PPCDN] P2P companion disabled in Settings > Advanced");
+		return;
+	}
+
 	// Only a PPCDN publish (ppcenter configured) has anywhere to signal to.
 	OBSDataAutoRelease serviceSettings = obs_service_get_settings(primary);
 	if (!serviceSettings || !*obs_data_get_string(serviceSettings, "ppcenter_url"))
@@ -417,11 +451,20 @@ void BasicOutputHandler::StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_
 		return;
 	}
 
-	p2pOutput = obs_output_create("ppcenter_p2p_output", "ppcenter_p2p", nullptr, nullptr);
+	OBSDataAutoRelease p2pSettings = obs_data_create();
+	obs_data_set_int(p2pSettings, "ppcdn_p2p_max_sessions", P2PStreamingMaxSessions());
+	p2pOutput = obs_output_create("ppcenter_p2p_output", "ppcenter_p2p", p2pSettings, nullptr);
 	if (!p2pOutput) {
 		blog(LOG_WARNING, "[PPCDN] P2P companion: failed to create ppcenter_p2p_output");
 		return;
 	}
+	// Same absolute-timestamp SEI the primary output gets. Packet callbacks are
+	// per-output (libobs send_interleaved runs them on that output's own packet
+	// copy), so without this the SRT/ERTMP P2P companion would carry no SEI and
+	// pplayer could only show the estimated P2P delay ("est."). WHIP needs no
+	// equivalent because its P2P feed runs inside the output that already has
+	// this callback.
+	obs_output_add_packet_callback(p2pOutput, abs_ts_sei_inject, nullptr);
 	// Its own service instance, not the primary's: see p2pService's declaration
 	// in the header. A copy of the primary's settings carries the same ppcenter
 	// creds; obs_service_create() does not expand anything the primary's own

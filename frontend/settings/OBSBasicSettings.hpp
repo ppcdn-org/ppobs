@@ -220,6 +220,7 @@ private:
 	inline bool IsWHIP() const;
 	inline bool IsSRT() const;
 	inline bool IsERTMP() const;
+	inline bool IsERTSP() const;
 	bool IsRTMPCustomFamily() const;
 	bool IsWHIPSimulcast() const;
 	void UpdateWHIPSimulcastControls();
@@ -232,23 +233,30 @@ private:
 	int prevLangIndex;
 	bool prevBrowserAccel;
 
-	// Custom, SRT, ERTMP and WHIP share the same endpoint and key/token
-	// widgets, but each service type must retain its own values when
-	// switching between them - a Custom/SRT/ERTMP stream key and a WHIP
-	// bearer token are different secrets with different meanings, not the
-	// same field. SRT and ERTMP are both "rtmp_custom" under the hood and
-	// are told apart only by their URL convention/marker (see IsSRT/
-	// IsERTMP), so each needs its own slot too - previously all three of
-	// the RTMP-custom family shared one slot and clobbered each other.
-	enum class StreamDestinationField { Common, Custom, SRT, ERTMP, WHIP };
+	// Custom, SRT, ERTMP, ERTSP and WHIP share the same endpoint and
+	// key/token widgets, but each service type must retain its own values
+	// when switching between them - a Custom/SRT/ERTMP/ERTSP stream key
+	// and a WHIP bearer token are different secrets with different
+	// meanings, not the same field. SRT, ERTMP and ERTSP are all
+	// "rtmp_custom" under the hood and are told apart only by their URL
+	// convention/marker (see IsSRT/IsERTMP/IsERTSP), so each needs its own
+	// slot too - previously all three of the RTMP-custom family shared
+	// one slot and clobbered each other. ERTSP's "key" slot holds the
+	// stream name (not a secret - the publish token lives in the resolved
+	// Server URL, see PPCDNPublishEndpoint.cpp), reusing the widget rather
+	// than adding a dedicated one, same as every other family member
+	// reusing it for a differently-meaning value.
+	enum class StreamDestinationField { Common, Custom, SRT, ERTMP, ERTSP, WHIP };
 	StreamDestinationField lastStreamDestinationField = StreamDestinationField::Common;
 	QString customServiceEndpoint;
 	QString srtServiceEndpoint;
 	QString ertmpServiceEndpoint;
+	QString ertspServiceEndpoint;
 	QString whipServiceEndpoint;
 	QString customServiceKey;
 	QString srtServiceKey;
 	QString ertmpServiceKey;
+	QString ertspServiceKey;
 	QString whipServiceKey;
 	// Custom's auth sub-fields are exclusive to it (SRT/ERTMP/WHIP never
 	// show or use them), so they don't need swap-on-dropdown-change

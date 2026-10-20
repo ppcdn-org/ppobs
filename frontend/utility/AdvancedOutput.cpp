@@ -1019,6 +1019,8 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	obs_data_set_bool(settings, "low_latency_mode_enabled", enableLowLatencyMode);
 #endif
 	obs_data_set_bool(settings, "dyn_bitrate", enableDynBitrate);
+	obs_data_set_bool(settings, "ppcdn_p2p_enabled", P2PStreamingEnabled());
+	obs_data_set_int(settings, "ppcdn_p2p_max_sessions", P2PStreamingMaxSessions());
 	obs_data_set_int(settings, "whip_disconnect_grace_sec", whipDisconnectGraceSec);
 	obs_data_set_int(settings, "whip_reconnect_backoff_sec", whipReconnectBackoffSec);
 	// WHIPOutput::multitrackEnabled() reads this output-private setting

@@ -595,6 +595,9 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->hotkeyFocusType,      COMBO_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->autoRemux,            CHECK_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->dynBitrate,           CHECK_CHANGED,  ADV_CHANGED);
+	HookWidget(ui->ppcdnP2PEnabled,      CHECK_CHANGED,  ADV_CHANGED);
+	HookWidget(ui->ppcdnP2PMaxSessions,  SCROLL_CHANGED, ADV_CHANGED);
+	connect(ui->ppcdnP2PEnabled, &QCheckBox::toggled, ui->ppcdnP2PMaxSessions, &QWidget::setEnabled);
 	/* clang-format on */
 
 #define ADD_HOTKEY_FOCUS_TYPE(s) ui->hotkeyFocusType->addItem(QTStr("Basic.Settings.Advanced.Hotkeys." s), s)
@@ -2628,6 +2631,13 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	bool dynBitrate = config_get_bool(main->Config(), "Output", "DynamicBitrate");
 	const char *ipFamily = config_get_string(main->Config(), "Output", "IPFamily");
 	bool confirmOnExit = config_get_bool(App()->GetUserConfig(), "General", "ConfirmOnExit");
+	bool p2pEnabled = !config_has_user_value(main->Config(), "P2P", "Enabled") ||
+			  config_get_bool(main->Config(), "P2P", "Enabled");
+	int p2pMaxSessions = config_has_user_value(main->Config(), "P2P", "MaxSessions")
+				     ? (int)config_get_int(main->Config(), "P2P", "MaxSessions")
+				     : 3;
+	if (p2pMaxSessions <= 0)
+		p2pMaxSessions = 3;
 
 	config_t *appConfig = App()->GetAppConfig();
 	bool lossReconnectEnable = !config_has_user_value(appConfig, "General", "LossReconnectEnable") ||
@@ -2653,6 +2663,8 @@ void OBSBasicSettings::LoadAdvancedSettings()
 		SetInvalidValue(ui->monitoringDevice, monDevName, monDevId);
 
 	ui->confirmOnExit->setChecked(confirmOnExit);
+	ui->ppcdnP2PEnabled->setChecked(p2pEnabled);
+	ui->ppcdnP2PMaxSessions->setValue(p2pMaxSessions);
 
 	ui->filenameFormatting->setText(filename);
 	ui->overwriteIfExists->setChecked(overwriteIfExists);
@@ -3341,6 +3353,8 @@ void OBSBasicSettings::SaveAdvancedSettings()
 	SaveComboData(ui->ipFamily, "Output", "IPFamily");
 	SaveCheckBox(ui->autoRemux, "Video", "AutoRemux");
 	SaveCheckBox(ui->dynBitrate, "Output", "DynamicBitrate");
+	SaveCheckBox(ui->ppcdnP2PEnabled, "P2P", "Enabled");
+	SaveSpinBox(ui->ppcdnP2PMaxSessions, "P2P", "MaxSessions");
 
 	if (obs_audio_monitoring_available()) {
 		QString newDevice = ui->monitoringDevice->currentData().toString();
