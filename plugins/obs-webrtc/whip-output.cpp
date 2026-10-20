@@ -355,6 +355,10 @@ bool WHIPOutput::Init()
 	enable_pacing = obs_data_get_bool(output_settings, "whip_enable_pacing");
 	p2pEnabled = !obs_data_has_user_value(output_settings, "ppcdn_p2p_enabled") ||
 		     obs_data_get_bool(output_settings, "ppcdn_p2p_enabled");
+	p2pLocalMaxSessions = (int)obs_data_get_int(output_settings, "ppcdn_p2p_max_sessions");
+	if (!obs_data_has_user_value(output_settings, "ppcdn_p2p_max_sessions") ||
+	    p2pLocalMaxSessions <= 0)
+		p2pLocalMaxSessions = 3;
 	if (!p2pEnabled) {
 		// The output object is reused across starts. Clear everything the
 		// previous run may have left behind (including a direct-publish run,
@@ -704,6 +708,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 						 obs_data_get_string(service_settings, "ppcenter_secret"),
 						 obs_data_get_string(service_settings, "ppcenter_stream"),
 						 obs_data_get_string(service_settings, "ppcenter_region")};
+		request.max_p2p_sessions = p2pLocalMaxSessions;
 		// Register this device's hardware identity with ppcenter before
 		// publishing. The server enforces a per-user device binding limit and
 		// rejects publishes from unregistered devices (HTTP 403). Registration
@@ -772,7 +777,10 @@ bool WHIPOutput::Setup(uint64_t generation)
 		// Platform play setting: how many simultaneous P2P peers this publisher
 		// may carry. ppcenter enforces the same number when allocating sessions,
 		// so this is the publisher-side backstop. 0/absent => historical 3.
+		// The local Settings > Advanced > P2P limit can only tighten it.
 		p2pMaxSessions = resp.max_sessions > 0 ? resp.max_sessions : 3;
+		if (p2pLocalMaxSessions < p2pMaxSessions)
+			p2pMaxSessions = p2pLocalMaxSessions;
 	} else {
 		p2pToken.clear();
 		p2pSignalUrl.clear();
@@ -1313,6 +1321,7 @@ std::string WHIPOutput::AcquireP2PToken(bool force)
 	request.stream_name = natProbeStreamName;
 	request.device_id = natProbeClientId;
 	request.nat_probe_id = natProbeId;
+	request.max_p2p_sessions = p2pLocalMaxSessions;
 	PPCenterPublishResponse response;
 	std::string error;
 	if (!ppcenter_refresh_p2p_token(request, response, error) || response.signal_token.empty()) {

@@ -13,6 +13,10 @@ struct PPCenterPublishRequest {
 	std::string region;
 	std::string device_id;
 	std::string nat_probe_id;
+	// Local Settings > Advanced > P2P slot limit. ppcenter uses this per-
+	// publisher capacity for P2P allocations; 0 means "not reported" and
+	// lets ppcenter fall back to its own default.
+	int max_p2p_sessions = 0;
 };
 
 // One codec's WHIP endpoint inside PPCenterPublishResponse::whip_tracks -

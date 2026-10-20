@@ -118,6 +118,8 @@ struct BasicOutputHandler {
 	// Off means no NAT probe, no P2P signaling, no companion output and no
 	// direct P2P feed - viewers use the edge path only.
 	bool P2PStreamingEnabled() const;
+	// Local P2P slot limit (default 3). The platform's lower cap still wins.
+	int P2PStreamingMaxSessions() const;
 
 	// Starts/stops the P2P companion output (ppcenter_p2p_output) for a
 	// non-WHIP primary publish, sharing videoEnc (must be H264) and audioEnc.

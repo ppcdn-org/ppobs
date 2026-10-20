@@ -111,6 +111,8 @@ std::string ppcenter_build_publish_json(const PPCenterPublishRequest &request)
 		body["deviceId"] = request.device_id;
 	if (!request.nat_probe_id.empty())
 		body["natProbeId"] = request.nat_probe_id;
+	if (request.max_p2p_sessions > 0)
+		body["maxP2PSessions"] = request.max_p2p_sessions;
 	return body.dump();
 }
 

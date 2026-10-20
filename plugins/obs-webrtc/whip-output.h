@@ -132,6 +132,10 @@ private:
 	// Platform-set cap on simultaneous P2P peers (from the publish response);
 	// forwarded to P2PSignalClient. Defaults to the historical 3.
 	int p2pMaxSessions = 3;
+	// Local cap from Settings > Advanced > P2P, forwarded by the frontend as
+	// "ppcdn_p2p_max_sessions". The effective p2pMaxSessions is the lower of
+	// this and the platform-provided cap. Defaults to 3 when absent.
+	int p2pLocalMaxSessions = 3;
 	// Settings > Advanced > P2P. Forwarded by the frontend as the output
 	// setting "ppcdn_p2p_enabled"; defaults to true when absent.
 	bool p2pEnabled = true;

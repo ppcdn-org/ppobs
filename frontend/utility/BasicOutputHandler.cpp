@@ -357,6 +357,15 @@ bool BasicOutputHandler::P2PStreamingEnabled() const
 	       config_get_bool(config, "P2P", "Enabled");
 }
 
+int BasicOutputHandler::P2PStreamingMaxSessions() const
+{
+	config_t *config = main->Config();
+	if (!config_has_user_value(config, "P2P", "MaxSessions"))
+		return 3;
+	int value = (int)config_get_int(config, "P2P", "MaxSessions");
+	return value > 0 ? value : 3;
+}
+
 bool BasicOutputHandler::EnforceNoBFrames(obs_encoder_t *videoEncoder)
 {
 	if (!videoEncoder || !P2PStreamingEnabled())
@@ -442,7 +451,9 @@ void BasicOutputHandler::StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_
 		return;
 	}
 
-	p2pOutput = obs_output_create("ppcenter_p2p_output", "ppcenter_p2p", nullptr, nullptr);
+	OBSDataAutoRelease p2pSettings = obs_data_create();
+	obs_data_set_int(p2pSettings, "ppcdn_p2p_max_sessions", P2PStreamingMaxSessions());
+	p2pOutput = obs_output_create("ppcenter_p2p_output", "ppcenter_p2p", p2pSettings, nullptr);
 	if (!p2pOutput) {
 		blog(LOG_WARNING, "[PPCDN] P2P companion: failed to create ppcenter_p2p_output");
 		return;
