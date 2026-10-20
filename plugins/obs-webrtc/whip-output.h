@@ -139,37 +139,13 @@ private:
 	// when no H264 layer is attached, in which case P2P carries no video at
 	// all rather than an undecodable mix of layers.
 	obs_encoder_t *p2pVideoEncoder = nullptr;
-	// NVENC's initial H264 keyframe contains SPS/PPS, but a later forced IDR
-	// (requested when a P2P viewer connects) usually does not. Cache the
-	// Annex-B parameter-set NALs from the opening keyframe and prepend them to
-	// a peer's forced IDR so a mid-stream browser can initialize its decoder.
+	// A forced IDR (requested when a P2P viewer connects) usually does not
+	// repeat SPS/PPS, and non-WHIP services leave repeat_headers off, so no
+	// packet may carry them at all: libobs strips the first packet's
+	// SPS/PPS into obs_encoder_get_extra_data(). Cache the Annex-B
+	// parameter-set NALs from either source and prepend them to a peer's
+	// keyframe so a mid-stream browser can initialize its decoder.
 	std::vector<uint8_t> p2pH264ParameterSets;
-
-	// TEMPORARY P2P feed diagnostics (2026-09-30): the P2P leg reaches
-	// ICE+DTLS+SRTP connected on both ends but the browser decodes no frame,
-	// and nothing in the log says whether Data() is actually feeding the
-	// peers. Rolled up once every 2s while P2P is enabled, so a repro shows
-	// whether p2pVideoEncoder still matches, whether the feed is stuck
-	// waiting for a keyframe, or whether send() is throwing (the catch that
-	// used to swallow it now counts + logs the first few). Logged at Debug
-	// only, so it is off at the default log level. Remove once the feed
-	// regression is understood.
-	struct P2PFeedCounters {
-		uint64_t videoPackets = 0;   // every OBS video packet seen by Data()
-		uint64_t encoderMatched = 0; // packet->encoder == p2pVideoEncoder
-		uint64_t sent = 0;           // videoTrack->send() calls that returned
-		uint64_t skippedNoTrack = 0; // peer.videoTrack null or !isOpen()
-		uint64_t skippedNoKey = 0;   // !videoStarted && !packet->keyframe
-		uint64_t sendErrors = 0;     // videoTrack->send() threw
-		// Last RTP state actually pushed for a sent frame - reveals a stuck
-		// timestamp (one never-ending AU the browser can't decode) or a
-		// sequence-number jump.
-		uint32_t lastRtpTimestamp = 0;
-		uint16_t lastSequenceNumber = 0;
-		int64_t lastDtsUsec = 0;
-	};
-	P2PFeedCounters p2pFeedCounters;
-	int64_t lastP2PFeedLogMs = 0;
 
 	// The resolved per-codec WHIP endpoints Setup() got from ppcenter,
 	// reused by StartThread() to derive each codec's degrade control

@@ -105,78 +105,6 @@ static uint32_t advanceRtpTimestamp(const std::shared_ptr<rtc::RtpPacketizationC
 	return lastTimestamp + rtp->secondsToTimestamp(static_cast<double>(durationUsec) / (1000.0 * 1000.0));
 }
 
-// TEMPORARY diagnostic (2026-09-25): the P2P leg still fails to decode in the
-// browser (framesReceived=0) even though the RTP header is well-formed on the
-// wire and the sender setup is correct. The remaining suspect is the NAL
-// bitstream format handed to libdatachannel's H264RtpPacketizer, which is built
-// with Separator::StartSequence and therefore expects Annex-B start codes
-// (00 00 00 01 / 00 00 01). If OBS hands us AVCC (4-byte big-endian length
-// prefixes) in this SRT/rtmp_custom-companion scenario, the packetizer
-// mis-parses and the browser can never assemble a frame. This dumps the first
-// few video AUs' structure so we can see the actual format + NAL types +
-// whether SPS/PPS ride with the keyframe. Logged at Debug only (off at the
-// default log level). Remove once P2P decode is fixed.
-static void logP2PVideoNALDiag(const struct encoder_packet *packet)
-{
-	static int logged = 0;
-	if (logged >= 6)
-		return;
-	const uint8_t *d = (const uint8_t *)packet->data;
-	size_t n = packet->size;
-	if (n < 5)
-		return;
-	logged++;
-
-	const bool annexb4 = (d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 1);
-	const bool annexb3 = (d[0] == 0 && d[1] == 0 && d[2] == 1);
-	const char *fmt = annexb4 ? "AnnexB(4)" : (annexb3 ? "AnnexB(3)" : "AVCC?");
-
-	char head[64];
-	snprintf(head, sizeof(head), "%02x %02x %02x %02x %02x %02x %02x %02x", d[0], d[1], d[2], d[3],
-		 d[4], d[5 < n ? 5 : 4], d[6 < n ? 6 : 4], d[7 < n ? 7 : 4]);
-
-	// Walk NAL units and collect their types.
-	char nals[256] = {0};
-	size_t np = 0;
-	if (annexb4 || annexb3) {
-		size_t i = 0;
-		while (i + 3 < n && np < sizeof(nals) - 8) {
-			size_t sc = 0;
-			if (i + 3 < n && d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 0 && d[i + 3] == 1)
-				sc = 4;
-			else if (i + 2 < n && d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1)
-				sc = 3;
-			if (sc == 0) {
-				i++;
-				continue;
-			}
-			size_t nalStart = i + sc;
-			if (nalStart >= n)
-				break;
-			int t = d[nalStart] & 0x1f;
-			np += snprintf(nals + np, sizeof(nals) - np, "%d ", t);
-			i = nalStart + 1;
-		}
-	} else {
-		// Interpret as AVCC: [4-byte len][NAL]...
-		size_t i = 0;
-		while (i + 4 < n && np < sizeof(nals) - 8) {
-			uint32_t len = (uint32_t(d[i]) << 24) | (uint32_t(d[i + 1]) << 16) |
-				       (uint32_t(d[i + 2]) << 8) | uint32_t(d[i + 3]);
-			if (len == 0 || i + 4 + len > n) {
-				np += snprintf(nals + np, sizeof(nals) - np, "(len=%u bad)", len);
-				break;
-			}
-			int t = d[i + 4] & 0x1f;
-			np += snprintf(nals + np, sizeof(nals) - np, "%d ", t);
-			i += 4 + len;
-		}
-	}
-	// NAL types: 7=SPS 8=PPS 5=IDR 1=nonIDR 6=SEI 9=AUD
-	blog(LOG_DEBUG, "[obs-webrtc] [p2p-naldiag] #%d key=%d size=%zu fmt=%s head=[%s] nalTypes=[%s]", logged,
-	     packet->keyframe ? 1 : 0, n, fmt, head, nals);
-}
-
 static size_t h264StartCodeLength(const uint8_t *data, size_t size, size_t at)
 {
 	if (at + 3 < size && data[at] == 0 && data[at + 1] == 0 && data[at + 2] == 0 && data[at + 3] == 1)
@@ -255,6 +183,20 @@ static H264ParameterSets extractH264ParameterSets(const uint8_t *data, size_t si
 	return out;
 }
 
+// Parameter sets may come from either a packet (already Annex-B by this
+// point) or the encoder's own extra data. The latter is Annex-B for OBS's
+// encoders, but tolerate AVCC just in case a future encoder differs.
+static std::vector<uint8_t> extractH264ParameterSetsAny(const uint8_t *data, size_t size)
+{
+	auto sets = extractH264ParameterSets(data, size);
+	if (!sets.annexB.empty())
+		return sets.annexB;
+	auto annexB = h264PacketToAnnexB(data, size);
+	if (annexB.empty())
+		return {};
+	return extractH264ParameterSets(annexB.data(), annexB.size()).annexB;
+}
+
 void WHIPOutput::Data(struct encoder_packet *packet)
 {
 	if (!packet) {
@@ -311,13 +253,6 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 		// resolutions' NAL units into one SSRC/sequence-number stream,
 		// which no decoder can make sense of.
 		if (p2pSignal) {
-			// TEMPORARY P2P feed diagnostics (2026-09-30) - logged at Debug
-			// only, so a normal run's log stays readable; remove once the feed
-			// regression is understood.
-			p2pFeedCounters.videoPackets++;
-			if (packet->encoder == p2pVideoEncoder)
-				p2pFeedCounters.encoderMatched++;
-
 			if (packet->encoder == p2pVideoEncoder) {
 				const auto annexB = h264PacketToAnnexB((const uint8_t *)packet->data, packet->size);
 				const uint8_t *videoData = annexB.empty() ? (const uint8_t *)packet->data : annexB.data();
@@ -325,17 +260,33 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 				const auto parameterSets = extractH264ParameterSets(videoData, videoSize);
 				if (!parameterSets.annexB.empty())
 					p2pH264ParameterSets = parameterSets.annexB;
-				logP2PVideoNALDiag(packet); // TEMPORARY (2026-09-25) - remove once P2P decode is fixed
+				// The RTMP/ERTMP primary encoder's first packet has its
+				// SPS/PPS stripped into obs_encoder_get_extra_data()
+				// (libobs' obs_extract_avc_headers), and repeat_headers is
+				// false for non-WHIP services, so no packet ever carries
+				// them. A P2P viewer joining mid-stream then gets RTP but
+				// no decodable frame. Pull them from the encoder's own
+				// extra data once it is available (after the first packet).
+				if (p2pH264ParameterSets.empty() && packet->keyframe) {
+					uint8_t *extraData = nullptr;
+					size_t extraSize = 0;
+					if (obs_encoder_get_extra_data(p2pVideoEncoder, &extraData, &extraSize) &&
+					    extraData && extraSize) {
+						auto fromExtra = extractH264ParameterSetsAny(extraData, extraSize);
+						if (!fromExtra.empty()) {
+							p2pH264ParameterSets = std::move(fromExtra);
+							blog(LOG_INFO,
+							     "[obs-webrtc] [p2p] cached SPS/PPS from encoder extra data (%zu bytes)",
+							     p2pH264ParameterSets.size());
+						}
+					}
+				}
 				p2pSignal->ForEachPeer([&](P2PPeer &peer) {
-					if (!peer.videoTrack || !peer.videoTrack->isOpen()) {
-						p2pFeedCounters.skippedNoTrack++;
+					if (!peer.videoTrack || !peer.videoTrack->isOpen())
 						return;
-					}
 					// Start this peer's feed on a keyframe - see P2PPeer::videoStarted.
-					if (!peer.videoStarted && !packet->keyframe) {
-						p2pFeedCounters.skippedNoKey++;
+					if (!peer.videoStarted && !packet->keyframe)
 						return;
-					}
 					int64_t dur = peer.videoStarted ? packet->dts_usec - peer.lastVideoTimestamp : 0;
 					peer.lastVideoTimestamp = packet->dts_usec;
 					peer.videoStarted = true;
@@ -366,43 +317,11 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 					rtp->timestamp = advanceRtpTimestamp(rtp, peer.videoRtpTimestamp, dur);
 					try {
 						peer.videoTrack->send(sample);
-						p2pFeedCounters.sent++;
-						p2pFeedCounters.lastRtpTimestamp = rtp->timestamp;
-						p2pFeedCounters.lastSequenceNumber = rtp->sequenceNumber;
-						p2pFeedCounters.lastDtsUsec = packet->dts_usec;
-					} catch (const std::exception &e) {
-						p2pFeedCounters.sendErrors++;
-						if (p2pFeedCounters.sendErrors <= 5)
-							blog(LOG_DEBUG, "[obs-webrtc] [p2p-feed] videoTrack->send() threw: %s",
-							     e.what());
 					} catch (...) {
-						p2pFeedCounters.sendErrors++;
 					}
 					peer.videoSequenceNumber = rtp->sequenceNumber;
 					peer.videoRtpTimestamp = rtp->timestamp;
 				});
-			}
-
-		// 2s rollup - fires while video keeps arriving (a live WHIP stream
-		// always does), so a repro shows the feed state at the moment a
-		// viewer is connected.
-		auto now_ms = (int64_t)(obs_get_video_frame_time() / 1000000);
-		if (now_ms - lastP2PFeedLogMs >= 2000) {
-			lastP2PFeedLogMs = now_ms;
-			size_t peers = p2pSignal->PeerCount();
-			blog(LOG_DEBUG,
-				     "[obs-webrtc] [p2p-feed] 2s: videoPkts=%llu encMatch=%llu peers=%zu sent=%llu skipNoTrack=%llu skipNoKey=%llu sendErr=%llu p2pEnc=%p pktEnc=%p key=%d lastTs=%u lastSeq=%u lastDts=%lld",
-				     (unsigned long long)p2pFeedCounters.videoPackets,
-				     (unsigned long long)p2pFeedCounters.encoderMatched, peers,
-				     (unsigned long long)p2pFeedCounters.sent,
-				     (unsigned long long)p2pFeedCounters.skippedNoTrack,
-				     (unsigned long long)p2pFeedCounters.skippedNoKey,
-				     (unsigned long long)p2pFeedCounters.sendErrors,
-				     (void *)p2pVideoEncoder, (void *)packet->encoder, packet->keyframe ? 1 : 0,
-				     (unsigned)p2pFeedCounters.lastRtpTimestamp,
-				     (unsigned)p2pFeedCounters.lastSequenceNumber,
-				     (long long)p2pFeedCounters.lastDtsUsec);
-				p2pFeedCounters = P2PFeedCounters{};
 			}
 		}
 	}
