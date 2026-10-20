@@ -86,6 +86,7 @@ static uint32_t rtcp_read_be32(const uint8_t *p)
 
 void RtcpLossTracker::incoming(rtc::message_vector &messages, const rtc::message_callback &)
 {
+	bool wants_key_frame = false;
 	for (const auto &msg : messages) {
 		if (!msg || msg->type != rtc::Message::Binary)
 			continue;
@@ -99,11 +100,21 @@ void RtcpLossTracker::incoming(rtc::message_vector &messages, const rtc::message
 			size_t pkt_len = ((size_t)len + 1) * 4;
 			if (version != 2 || offset + pkt_len > size)
 				break;
-			if (pt == 201) // receiver report
+			if (pt == 201) { // receiver report
 				ParseReceiverReport(data + offset, pkt_len);
+			} else if (pt == 206) { // payload-specific feedback (PLI/FIR)
+				const uint8_t fmt = data[offset] & 0x1f;
+				if (fmt == 1 || fmt == 4)
+					wants_key_frame = true;
+			}
 			offset += pkt_len;
 		}
 	}
+	// One request per compound: mmx sends one PLI per video layer, but all of
+	// this session's layers share the same encoders, so one keyframe pass is
+	// enough.
+	if (wants_key_frame && on_key_frame_request)
+		on_key_frame_request();
 }
 
 void RtcpLossTracker::ParseReceiverReport(const uint8_t *pkt, size_t len)
@@ -380,6 +391,16 @@ void WHIPCodecSession::ConfigureVideoTrack(const std::string &media_stream_id, c
 	packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>(video_nack_buffer_size));
 
 	auto loss_tracker = std::make_shared<RtcpLossTracker>();
+	// A downstream viewer's PLI/FIR must reach the encoders, not just the loss
+	// statistics: request a keyframe on every layer of this codec session so a
+	// new edge viewer can decode immediately instead of waiting out the GOP.
+	auto key_frame_layers = video_layers;
+	loss_tracker->on_key_frame_request = [key_frame_layers]() {
+		for (obs_encoder_t *layer : key_frame_layers) {
+			if (layer)
+				obs_encoder_request_keyframe(layer);
+		}
+	};
 	packetizer->addToChain(loss_tracker);
 
 	if (cfg.enable_pacing) {
