@@ -23,6 +23,11 @@ struct TargetState {
 	// Server-side receiver latency the mmx node is applying to this path.
 	// Informational only - the client does not act on it, mmx owns it.
 	int latency_ms = 0;
+	// One-shot restart request (mmx's TARGET_STATE.reconnect). The receiver
+	// tells us to restart so a newly raised SRT latency is negotiated by a
+	// fresh handshake; layers/bitrate are the current values, not a change.
+	bool reconnect = false;
+	std::string reason;
 };
 
 // OBS-side executor for the mmx degrade protocol (see

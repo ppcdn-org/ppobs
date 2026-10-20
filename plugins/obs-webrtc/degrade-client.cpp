@@ -418,6 +418,10 @@ bool WsDegradeClient::ParseTargetState(const std::string &json, TargetState &out
 			out.bitrate_percent = j["bitrate_percent"];
 		if (j.contains("latency_ms"))
 			out.latency_ms = j["latency_ms"];
+		if (j.contains("reconnect"))
+			out.reconnect = j["reconnect"].get<bool>();
+		if (j.contains("reason"))
+			out.reason = j["reason"].get<std::string>();
 	} catch (const std::exception &e) {
 		do_log(LOG_DEBUG, "JSON parse error: %s", e.what());
 		return false;
@@ -438,6 +442,7 @@ void WsDegradeClient::ApplyIfNeeded(Channel &ch, const TargetState &target)
 {
 	obs_output_t *out_copy = nullptr;
 	bool layer_changed = false;
+	const bool restart_requested = target.reconnect;
 	TargetState prev;
 	bool prev_set = false;
 	int prev_pct = 100;
@@ -470,10 +475,14 @@ void WsDegradeClient::ApplyIfNeeded(Channel &ch, const TargetState &target)
 		do_log(LOG_INFO,
 		       "TARGET_STATE codec=%s layers=%d (was %d) bitrate=%d%% latency=%dms",
 		       ch.codec.c_str(), new_layers, current, target.bitrate_percent, target.latency_ms);
+		if (restart_requested)
+			do_log(LOG_INFO, "Reconnect requested for codec=%s (%s)", ch.codec.c_str(),
+			       target.reason.c_str());
 
-		if (!layer_changed && ch.target_set && ch.last_pct == target.bitrate_percent) {
+		if (!layer_changed && !restart_requested && ch.target_set && ch.last_pct == target.bitrate_percent) {
 			ch.target = target;
 			ch.target.layers = new_layers;
+			ch.target.reconnect = false;
 			return;
 		}
 
@@ -483,6 +492,7 @@ void WsDegradeClient::ApplyIfNeeded(Channel &ch, const TargetState &target)
 
 		ch.target = target;
 		ch.target.layers = new_layers;
+		ch.target.reconnect = false;
 		ch.target_set = true;
 		ch.last_pct = target.bitrate_percent;
 
@@ -491,7 +501,7 @@ void WsDegradeClient::ApplyIfNeeded(Channel &ch, const TargetState &target)
 		// settings; when it doesn't, the call below makes it live.
 		ApplyBitrateLocked(ch, output, target.bitrate_percent, !layer_changed);
 
-		if (!layer_changed) {
+		if (!layer_changed && !restart_requested) {
 			do_log(LOG_INFO, "Applied codec=%s bitrate=%d%% (live, no restart)", ch.codec.c_str(),
 			       target.bitrate_percent);
 			return;
