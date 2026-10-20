@@ -114,6 +114,11 @@ struct BasicOutputHandler {
 	// them off. See docs/design/ppobs-p2p-srt-publish-support.zh-CN.md.
 	bool EnforceNoBFrames(obs_encoder_t *videoEncoder);
 
+	// Settings > Advanced > P2P. Defaults to on when the config key is absent.
+	// Off means no NAT probe, no P2P signaling, no companion output and no
+	// direct P2P feed - viewers use the edge path only.
+	bool P2PStreamingEnabled() const;
+
 	// Starts/stops the P2P companion output (ppcenter_p2p_output) for a
 	// non-WHIP primary publish, sharing videoEnc (must be H264) and audioEnc.
 	// Best-effort: a P2P failure never affects the main publish. See p2pOutput

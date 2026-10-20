@@ -353,6 +353,24 @@ bool WHIPOutput::Init()
 		watchdog_stall_sec = watchdog_interval_sec;
 
 	enable_pacing = obs_data_get_bool(output_settings, "whip_enable_pacing");
+	p2pEnabled = !obs_data_has_user_value(output_settings, "ppcdn_p2p_enabled") ||
+		     obs_data_get_bool(output_settings, "ppcdn_p2p_enabled");
+	if (!p2pEnabled) {
+		// The output object is reused across starts. Clear everything the
+		// previous run may have left behind (including a direct-publish run,
+		// which never populates the ppcenter request below).
+		p2pToken.clear();
+		p2pSignalUrl.clear();
+		p2pStreamPath.clear();
+		p2pStunServers.clear();
+		natProbeUrl.clear();
+		natProbeAppId.clear();
+		natProbeAppSecret.clear();
+		natProbeStreamName.clear();
+		natProbeClientId.clear();
+		natProbeId.clear();
+		lastNatProbeRefreshMs = 0;
+	}
 
 	// Finite reconnect budget only in multitrack mode - see the design
 	// doc's "双轨重连超过配置上限时，停止整组输出". A single-session (no
@@ -702,24 +720,39 @@ bool WHIPOutput::Setup(uint64_t generation)
 			do_log(LOG_INFO, "device registered: deviceId=%s", deviceId.c_str());
 		}
 		request.device_id = deviceId;
-		natProbeUrl = request.url;
-		natProbeAppId = request.app_id;
-		natProbeAppSecret = request.app_secret;
-		natProbeStreamName = request.stream_name;
-		natProbeClientId = deviceId;
-		// /1,000,000 to match CheckNatProbeRefresh()'s own conversion (ns -> ms) -
-		// this baseline and that function's now_ms must be in the same unit or
-		// the first comparison is meaningless.
-		lastNatProbeRefreshMs = (int64_t)(obs_get_video_frame_time() / 1000000);
-		const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret, request.stream_name, natProbeClientId);
-		if (probe.succeeded) {
-			request.nat_probe_id = probe.probe_id;
-			natProbeId = probe.probe_id;
-			do_log(LOG_INFO, "P2P publisher NAT probe registered");
+		if (p2pEnabled) {
+			natProbeUrl = request.url;
+			natProbeAppId = request.app_id;
+			natProbeAppSecret = request.app_secret;
+			natProbeStreamName = request.stream_name;
+			natProbeClientId = deviceId;
+			// /1,000,000 to match CheckNatProbeRefresh()'s own conversion (ns -> ms) -
+			// this baseline and that function's now_ms must be in the same unit or
+			// the first comparison is meaningless.
+			lastNatProbeRefreshMs = (int64_t)(obs_get_video_frame_time() / 1000000);
+			const auto probe = ProbePublisherNAT(request.url, request.app_id, request.app_secret,
+							     request.stream_name, natProbeClientId);
+			if (probe.succeeded) {
+				request.nat_probe_id = probe.probe_id;
+				natProbeId = probe.probe_id;
+				do_log(LOG_INFO, "P2P publisher NAT probe registered");
+			} else {
+				// NAT probing is an optional P2P optimization. Publishing must
+				// continue normally; ppcenter will naturally choose edge-only.
+				do_log(LOG_WARNING,
+				       "P2P publisher NAT probe failed; continuing with edge-only fallback");
+			}
 		} else {
-			// NAT probing is an optional P2P optimization. Publishing must
-			// continue normally; ppcenter will naturally choose edge-only.
-			do_log(LOG_WARNING, "P2P publisher NAT probe failed; continuing with edge-only fallback");
+			// The output object is reused across starts, so drop any probe
+			// state left by a previous run with P2P enabled.
+			natProbeUrl.clear();
+			natProbeAppId.clear();
+			natProbeAppSecret.clear();
+			natProbeStreamName.clear();
+			natProbeClientId.clear();
+			natProbeId.clear();
+			lastNatProbeRefreshMs = 0;
+			do_log(LOG_INFO, "P2P disabled in Settings > Advanced: skipping NAT probe and signaling");
 		}
 		std::string error;
 		if (!ppcenter_resolve_publish(request, resp, error)) {
@@ -729,16 +762,28 @@ bool WHIPOutput::Setup(uint64_t generation)
 			return false;
 		}
 	}
-	p2pToken = resp.signal_token;
-	p2pSignalUrl = resp.signal_url;
-	p2pStreamPath = request.app_id + "/" + request.stream_name;
-	p2pStunServers = std::move(resp.stun_servers);
-	if (p2pStunServers.empty())
-		p2pStunServers.emplace_back("stun:stun.l.google.com:19302");
-	// Platform play setting: how many simultaneous P2P peers this publisher
-	// may carry. ppcenter enforces the same number when allocating sessions,
-	// so this is the publisher-side backstop. 0/absent => historical 3.
-	p2pMaxSessions = resp.max_sessions > 0 ? resp.max_sessions : 3;
+	if (p2pEnabled) {
+		p2pToken = resp.signal_token;
+		p2pSignalUrl = resp.signal_url;
+		p2pStreamPath = request.app_id + "/" + request.stream_name;
+		p2pStunServers = std::move(resp.stun_servers);
+		if (p2pStunServers.empty())
+			p2pStunServers.emplace_back("stun:stun.l.google.com:19302");
+		// Platform play setting: how many simultaneous P2P peers this publisher
+		// may carry. ppcenter enforces the same number when allocating sessions,
+		// so this is the publisher-side backstop. 0/absent => historical 3.
+		p2pMaxSessions = resp.max_sessions > 0 ? resp.max_sessions : 3;
+	} else {
+		p2pToken.clear();
+		p2pSignalUrl.clear();
+		p2pStreamPath.clear();
+		p2pStunServers.clear();
+	}
+
+	if (p2p_only && !p2pEnabled) {
+		do_log(LOG_INFO, "P2P disabled in Settings > Advanced: P2P-only output will not start");
+		return false;
+	}
 
 	// Resolved before the p2p_only early return below: a P2P-only output
 	// never reaches the WHIP layer setup, but its Data() still has to know
@@ -1096,6 +1141,8 @@ void WHIPOutput::StopThread(bool signal, uint64_t generation)
 
 bool WHIPOutput::StartP2PSignal()
 {
+	if (!p2pEnabled)
+		return false;
 	if (p2pToken.empty() || p2pSignalUrl.empty() || p2pStreamPath.empty())
 		return false;
 	// P2P always advertises H264 - see this class's header comment: it

@@ -132,6 +132,9 @@ private:
 	// Platform-set cap on simultaneous P2P peers (from the publish response);
 	// forwarded to P2PSignalClient. Defaults to the historical 3.
 	int p2pMaxSessions = 3;
+	// Settings > Advanced > P2P. Forwarded by the frontend as the output
+	// setting "ppcdn_p2p_enabled"; defaults to true when absent.
+	bool p2pEnabled = true;
 	// The single video encoder whose packets feed the P2P peers. P2P
 	// announces one H264 m-line per peer (P2PSignalClient::CreatePeerVideo),
 	// so Data() must forward exactly one layer: layers[0], i.e. rid "0" /

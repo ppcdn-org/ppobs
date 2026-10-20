@@ -350,9 +350,16 @@ void BasicOutputHandler::SetupCompanionStream(const char *outputType)
 	     obs_service_get_connect_info(hevcStreamService, OBS_SERVICE_CONNECT_INFO_SERVER_URL));
 }
 
+bool BasicOutputHandler::P2PStreamingEnabled() const
+{
+	config_t *config = main->Config();
+	return !config_has_user_value(config, "P2P", "Enabled") ||
+	       config_get_bool(config, "P2P", "Enabled");
+}
+
 bool BasicOutputHandler::EnforceNoBFrames(obs_encoder_t *videoEncoder)
 {
-	if (!videoEncoder)
+	if (!videoEncoder || !P2PStreamingEnabled())
 		return true;
 
 	// WebRTC (the P2P leg) cannot consume B-frames. whip_custom forces this
@@ -415,6 +422,11 @@ void BasicOutputHandler::StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_
 	if (protocol && astrcmpi(protocol, "RTSP") == 0)
 		return;
 
+	if (!P2PStreamingEnabled()) {
+		blog(LOG_INFO, "[PPCDN] P2P companion disabled in Settings > Advanced");
+		return;
+	}
+
 	// Only a PPCDN publish (ppcenter configured) has anywhere to signal to.
 	OBSDataAutoRelease serviceSettings = obs_service_get_settings(primary);
 	if (!serviceSettings || !*obs_data_get_string(serviceSettings, "ppcenter_url"))
@@ -435,6 +447,13 @@ void BasicOutputHandler::StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_
 		blog(LOG_WARNING, "[PPCDN] P2P companion: failed to create ppcenter_p2p_output");
 		return;
 	}
+	// Same absolute-timestamp SEI the primary output gets. Packet callbacks are
+	// per-output (libobs send_interleaved runs them on that output's own packet
+	// copy), so without this the SRT/ERTMP P2P companion would carry no SEI and
+	// pplayer could only show the estimated P2P delay ("est."). WHIP needs no
+	// equivalent because its P2P feed runs inside the output that already has
+	// this callback.
+	obs_output_add_packet_callback(p2pOutput, abs_ts_sei_inject, nullptr);
 	// Its own service instance, not the primary's: see p2pService's declaration
 	// in the header. A copy of the primary's settings carries the same ppcenter
 	// creds; obs_service_create() does not expand anything the primary's own
