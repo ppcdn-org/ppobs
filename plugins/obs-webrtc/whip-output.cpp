@@ -201,6 +201,37 @@ struct H264ParameterSets {
 	std::vector<uint8_t> annexB;
 };
 
+// libdatachannel's H264RtpPacketizer is built with Separator::StartSequence, so
+// the P2P feed must hand it Annex-B (00 00 00 01) NAL units. The WHIP/SRT
+// encoders already emit that, but the RTMP/ERTMP primary encoder hands OBS
+// AVCC (4-byte big-endian length prefixes) - the same packets the FLV mux
+// consumes. Feeding those straight to the packetizer makes Chrome receive RTP
+// but never assemble a decodable frame. Normalize here; an empty result means
+// the packet was neither recognized Annex-B nor a valid AVCC chain, so the
+// caller falls back to the original bytes.
+static std::vector<uint8_t> h264PacketToAnnexB(const uint8_t *data, size_t size)
+{
+	if (size >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
+		return std::vector<uint8_t>(data, data + size);
+	if (size >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1)
+		return std::vector<uint8_t>(data, data + size);
+
+	std::vector<uint8_t> out;
+	size_t i = 0;
+	while (i + 4 <= size) {
+		uint32_t len = (uint32_t(data[i]) << 24) | (uint32_t(data[i + 1]) << 16) |
+			       (uint32_t(data[i + 2]) << 8) | uint32_t(data[i + 3]);
+		if (len == 0 || i + 4 + len > size) {
+			out.clear();
+			return out;
+		}
+		out.insert(out.end(), {0, 0, 0, 1});
+		out.insert(out.end(), data + i + 4, data + i + 4 + len);
+		i += 4 + len;
+	}
+	return out;
+}
+
 static H264ParameterSets extractH264ParameterSets(const uint8_t *data, size_t size)
 {
 	H264ParameterSets out;
@@ -288,8 +319,10 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 				p2pFeedCounters.encoderMatched++;
 
 			if (packet->encoder == p2pVideoEncoder) {
-				const auto parameterSets = extractH264ParameterSets(
-					(const uint8_t *)packet->data, packet->size);
+				const auto annexB = h264PacketToAnnexB((const uint8_t *)packet->data, packet->size);
+				const uint8_t *videoData = annexB.empty() ? (const uint8_t *)packet->data : annexB.data();
+				const size_t videoSize = annexB.empty() ? packet->size : annexB.size();
+				const auto parameterSets = extractH264ParameterSets(videoData, videoSize);
 				if (!parameterSets.annexB.empty())
 					p2pH264ParameterSets = parameterSets.annexB;
 				logP2PVideoNALDiag(packet); // TEMPORARY (2026-09-25) - remove once P2P decode is fixed
@@ -313,12 +346,12 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 					// (codec=null, framesDecoded=0).
 					if (packet->keyframe && parameterSets.annexB.empty() &&
 					    !p2pH264ParameterSets.empty()) {
-						sample.reserve(p2pH264ParameterSets.size() + packet->size);
+						sample.reserve(p2pH264ParameterSets.size() + videoSize);
 						const auto *begin = reinterpret_cast<const rtc::byte *>(p2pH264ParameterSets.data());
 						sample.insert(sample.end(), begin, begin + p2pH264ParameterSets.size());
 					}
-					sample.insert(sample.end(), (rtc::byte *)packet->data,
-						      (rtc::byte *)packet->data + packet->size);
+					sample.insert(sample.end(), (rtc::byte *)videoData,
+						      (rtc::byte *)videoData + videoSize);
 					auto rtp = peer.videoSrReporter->rtpConfig;
 					rtp->sequenceNumber = peer.videoSequenceNumber;
 					rtp->ssrc = peer.videoSsrc;
