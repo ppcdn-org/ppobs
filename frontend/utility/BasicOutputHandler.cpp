@@ -5,6 +5,7 @@
 #include <abs-ts.h>
 #include <utility/ForceNoBFrames.hpp>
 #include <utility/MultitrackVideoError.hpp>
+#include <utility/PPCDNPublishEndpoint.hpp>
 #include <utility/PublishCodecCheck.hpp>
 #include <utility/StartMultiTrackVideoStreamingGuard.hpp>
 #include <utility/VCamConfig.hpp>
@@ -288,8 +289,19 @@ static OBSDataAutoRelease BuildCodecServiceSettings(obs_service_t *primary, cons
 	return settings;
 }
 
-void BasicOutputHandler::SetupCompanionStream(const char *outputType)
+obs_service_t *BasicOutputHandler::PrimaryPublishService(obs_service_t *service)
 {
+	if (h264StreamService)
+		return h264StreamService.Get();
+	if (singleCodecStreamService)
+		return singleCodecStreamService.Get();
+	return service;
+}
+
+void BasicOutputHandler::SetupCompanionStream(const char *outputType, const char *streamCodec)
+{
+	singleCodecStreamService = nullptr;
+
 	const bool wanted = whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder() &&
 			    StreamTransportIsSingleCodec(main->GetService());
 
@@ -301,6 +313,32 @@ void BasicOutputHandler::SetupCompanionStream(const char *outputType)
 		hevcStreamOutput = nullptr;
 		hevcStreamService = nullptr;
 		h264StreamService = nullptr;
+
+		// Multitrack off: publish on the path for the codec actually being
+		// encoded (".../h264" or ".../hevc") instead of the bare stream path.
+		// pplayer and the degrade channel both address a stream by codec
+		// path, so a bare-path publish is unplayable there. Only for a
+		// PPCenter-managed URL (the placeholder is what makes ppcenter mint
+		// the per-codec token) that doesn't already pin a codec itself.
+		obs_service_t *service = main->GetService();
+		const char *codec = streamCodec;
+		if (!service || whipHevcEncoders || !codec || (strcmp(codec, "h264") != 0 && strcmp(codec, "hevc") != 0) ||
+		    !StreamTransportIsSingleCodec(service) || strcmp(obs_service_get_id(service), "rtmp_custom") != 0)
+			return;
+
+		OBSDataAutoRelease original = obs_service_get_settings(service);
+		const char *server = obs_data_get_string(original, "server");
+		if (!server || !strstr(server, PPCDN_PUBLISH_ENDPOINT_PLACEHOLDER) ||
+		    !PublishCodecFromURL(server).empty())
+			return;
+
+		OBSDataAutoRelease settings = BuildCodecServiceSettings(service, codec);
+		if (!settings)
+			return;
+		singleCodecStreamService = obs_service_create(obs_service_get_id(service), "single_codec_stream_service",
+							      settings, nullptr);
+		if (singleCodecStreamService)
+			blog(LOG_INFO, "Publishing on the /%s path (multitrack off)", codec);
 		return;
 	}
 
@@ -605,14 +643,15 @@ BasicOutputHandler::BasicOutputHandler(OBSBasic *main_) : main(main_)
 	if (hevc_multitrack)
 		whipHevcEncoders = make_unique<WHIPHevcEncoders>();
 
-	// With multitrack off, a custom SRT publish's codec comes from the
-	// Server URL: /hevc selects HEVC, /h264 or no segment selects H264.
-	// Derived here (rather than per publish) so every output handler picks
-	// the same encoder at construction. See urlPublishCodec's declaration.
+	// With multitrack off, a custom SRT publish whose Server URL pins a codec
+	// (/hevc or /h264) uses that codec. A URL with no segment follows the
+	// configured stream encoder instead, and SetupCompanionStream appends the
+	// matching /h264 or /hevc to the publish path. Derived here (rather than
+	// per publish) so every output handler picks the same encoder at
+	// construction. See urlPublishCodec's declaration.
 	if (is_srt_custom && !hevc_multitrack) {
 		const char *server = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
-		const std::string codec = PublishCodecFromURL(server ? server : "");
-		urlPublishCodec = codec.empty() ? "h264" : codec;
+		urlPublishCodec = PublishCodecFromURL(server ? server : "");
 	}
 }
 

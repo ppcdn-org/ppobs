@@ -863,7 +863,7 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 		// connection needs a second publish for the HEVC ladder - see
 		// BasicOutputHandler::hevcStreamOutput. WHIP negotiates both
 		// codecs within one session and needs none of this.
-		SetupCompanionStream(type.c_str());
+		SetupCompanionStream(type.c_str(), obs_encoder_get_codec(videoStreaming));
 
 		// Single-codec transport (SRT/RTMP) with HEVC/H264 multitrack
 		// publishes the HEVC half on a separate output (hevcStreamOutput).
@@ -977,7 +977,7 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	// With multitrack on a single-codec transport this publish carries the
 	// H264 half, and publishes to its own /h264 path rather than the
 	// configured one (see SetupCompanionStream).
-	obs_output_set_service(streamOutput, h264StreamService ? h264StreamService.Get() : service);
+	obs_output_set_service(streamOutput, PrimaryPublishService(service));
 
 	bool reconnect = config_get_bool(main->Config(), "Output", "Reconnect");
 	int retryDelay = config_get_int(main->Config(), "Output", "RetryDelay");

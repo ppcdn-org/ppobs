@@ -69,6 +69,11 @@ struct BasicOutputHandler {
 	// service with /h264 appended, so both halves publish to their own
 	// codec path without the user having to spell either one out.
 	OBSServiceAutoRelease h264StreamService;
+	// Multitrack off on a PPCDN-managed publish URL: the configured service
+	// with /h264 or /hevc appended to match the stream encoder's codec, so a
+	// single-codec publish lands on the same codec path pplayer requests.
+	// Null when the URL already pins a codec or is not PPCDN-managed.
+	OBSServiceAutoRelease singleCodecStreamService;
 	OBSSignal hevcStopStreaming;
 
 	// P2P companion output (ppcenter_p2p_output): started alongside a non-WHIP
@@ -96,7 +101,11 @@ struct BasicOutputHandler {
 	// Creates (or tears down) the companion publish to match the current
 	// configuration. Safe to call repeatedly; outputType is the output id
 	// the primary publish uses, which the companion shares.
-	void SetupCompanionStream(const char *outputType);
+	void SetupCompanionStream(const char *outputType, const char *streamCodec);
+
+	// The service the primary stream output should publish through: the
+	// codec-pathed one when SetupCompanionStream derived one, else `service`.
+	obs_service_t *PrimaryPublishService(obs_service_t *service);
 
 	// Starts the companion publish, if one is configured. Returns false
 	// only when a companion was wanted but couldn't be started - the caller
@@ -145,12 +154,12 @@ struct BasicOutputHandler {
 	std::string outputType;
 	std::string lastError;
 
-	// For a custom SRT publish with HEVC/H264 multitrack off, the Server
-	// URL's codec segment decides the published codec: "/hevc" -> HEVC,
-	// "/h264" or no segment -> H264 (PPCENTER treats a bare stream name as
-	// the H264 stream). "h264"/"hevc", or empty when the URL doesn't apply
-	// (WHIP, or multitrack is on and builds both ladders itself). See
-	// EffectiveStreamEncoderId().
+	// For a custom SRT publish with HEVC/H264 multitrack off, a codec segment
+	// pinned in the Server URL decides the published codec: "/hevc" -> HEVC,
+	// "/h264" -> H264. "h264"/"hevc", or empty when the URL pins nothing (the
+	// configured stream encoder is used and its codec path is appended - see
+	// singleCodecStreamService), or doesn't apply (WHIP, or multitrack is on
+	// and builds both ladders itself). See EffectiveStreamEncoderId().
 	std::string urlPublishCodec;
 
 	// Returns the encoder id to publish with: the configured one when the

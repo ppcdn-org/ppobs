@@ -719,7 +719,7 @@ std::shared_future<void> SimpleOutput::SetupStreaming(obs_service_t *service, Se
 
 			// Multitrack over a transport that carries one video codec per
 			// connection needs a second publish for the HEVC ladder.
-			SetupCompanionStream(type.c_str());
+			SetupCompanionStream(type.c_str(), obs_encoder_get_codec(videoStreaming));
 
 			const char *streamCodec = obs_encoder_get_codec(videoStreaming);
 			const bool hevcOnSeparateOutput = hevcStreamOutput != nullptr && streamCodec &&
@@ -763,7 +763,7 @@ std::shared_future<void> SimpleOutput::SetupStreaming(obs_service_t *service, Se
 					blog(LOG_ERROR, "WHIP: no encoder slot left for the H264 base track");
 			}
 			obs_output_set_audio_encoder(streamOutput, audioStreaming, 0);
-			obs_output_set_service(streamOutput, service);
+			obs_output_set_service(streamOutput, PrimaryPublishService(service));
 			return true;
 		};
 
