@@ -16,6 +16,8 @@
 ******************************************************************************/
 #pragma once
 
+#include <utility/ForceNoBFrames.hpp>
+
 #include <string>
 #include <algorithm>
 
@@ -210,6 +212,11 @@ public:
 				obs_encoder_set_video(whip_simulcast_encoder, obs_get_video());
 				obs_encoder_set_scaled_size(whip_simulcast_encoder, width, height);
 				obs_encoder_set_gpu_scale_type(whip_simulcast_encoder, (obs_scale_type)rescaleFilter);
+				// Simulcast layers are often created with layerSettings
+				// null (simplified output) or cloned from a config that
+				// never went through the service, so their encoder
+				// defaults can still include B-frames.
+				ForceEncoderNoBFrames(whip_simulcast_encoder);
 				whipSimulcastEncoders.push_back(whip_simulcast_encoder);
 				obs_encoder_release(whip_simulcast_encoder);
 			} else {
@@ -256,6 +263,7 @@ public:
 			}
 
 			obs_encoder_update(whipSimulcastEncoders[idx], layerSettings);
+			ForceEncoderNoBFrames(whipSimulcastEncoders[idx]);
 		}
 	}
 

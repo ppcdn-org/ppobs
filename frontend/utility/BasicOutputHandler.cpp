@@ -3,6 +3,7 @@
 #include "SimpleOutput.hpp"
 
 #include <abs-ts.h>
+#include <utility/ForceNoBFrames.hpp>
 #include <utility/MultitrackVideoError.hpp>
 #include <utility/PublishCodecCheck.hpp>
 #include <utility/StartMultiTrackVideoStreamingGuard.hpp>
@@ -368,35 +369,37 @@ int BasicOutputHandler::P2PStreamingMaxSessions() const
 
 bool BasicOutputHandler::EnforceNoBFrames(obs_encoder_t *videoEncoder)
 {
-	if (!videoEncoder || !P2PStreamingEnabled())
+	if (!videoEncoder)
 		return true;
 
-	// WebRTC (the P2P leg) cannot consume B-frames. whip_custom forces this
-	// via apply_encoder_settings, but the SRT rtmp_custom publish path does
-	// not, and Advanced mode can skip service settings entirely - so force
-	// bf=0 here for every PPCDN publish regardless of transport. Merged into
-	// the encoder's existing settings (obs_encoder_update applies on top).
-	OBSDataAutoRelease force = obs_data_create();
-	obs_data_set_int(force, "bf", 0);
-	obs_encoder_update(videoEncoder, force);
+	// Every PPCDN publish must carry no B-frames, regardless of transport or
+	// whether P2P is enabled: the WebRTC leg cannot consume them, and the
+	// SRT/RTMP receive side should not have to cope with reordered DTS. The
+	// WHIP service only sets "bf" on its own settings object, which never
+	// reaches encoders created from a saved profile (and misses QSV's
+	// "bframes" key), so enforce it on the encoder itself here.
+	ForceEncoderNoBFrames(videoEncoder);
 
 	OBSDataAutoRelease applied = obs_encoder_get_settings(videoEncoder);
-	if (obs_data_get_int(applied, "bf") == 0)
+	const bool bfOff = obs_data_get_int(applied, "bf") == 0;
+	const bool bframesOff = obs_data_get_int(applied, "bframes") == 0 ||
+				!obs_data_has_user_value(applied, "bframes");
+	if (bfOff && bframesOff)
 		return true;
 
-	// The encoder clamped or rejected bf=0 (e.g. a preset that mandates
-	// B-frames, or a custom option overriding it). The main SRT/WHIP publish
-	// still works; only P2P will not - tell the user to disable B-frames.
-	blog(LOG_WARNING, "[PPCDN] streaming video encoder did not accept bf=0; P2P needs H.264 without B-frames");
+	// The encoder clamped or rejected the setting (e.g. a preset that
+	// mandates B-frames, or a custom option overriding it). Warn instead of
+	// aborting the publish.
+	blog(LOG_WARNING, "[PPCDN] streaming video encoder did not accept B-frames=0");
 	OBSBasic *m = main;
 	QMetaObject::invokeMethod(
 		m,
 		[m]() {
 			OBSMessageBox::warning(
-				m, QStringLiteral("P2P 未启用：编码器存在 B 帧"),
-				QStringLiteral(
-					"当前视频编码器无法设置为 0 个 B 帧（bf=0）。P2P 需要无 B 帧的 H.264 编码。\n\n"
-					"请到 设置 → 输出 把该编码器的 “B 帧 / bf” 数量改为 0，否则本次推流不会启用 P2P（仅走 edge）。"));
+				m, QStringLiteral("PPCDN encoder did not accept B-frames=0"),
+				QStringLiteral("The streaming video encoder could not be forced to 0 B-frames. "
+					       "Set B-frames / bframes to 0 in Settings > Output for this encoder; "
+					       "otherwise the stream carries B-frames and P2P/low-latency playback may misbehave."));
 		},
 		Qt::QueuedConnection);
 	return false;

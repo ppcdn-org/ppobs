@@ -65,9 +65,14 @@ void WHIPService::Defaults(obs_data_t *defaults)
 
 void WHIPService::ApplyEncoderSettings(obs_data_t *video_settings, obs_data_t *)
 {
-	// For now, ensure maximum compatibility with webrtc peers
+	// For now, ensure maximum compatibility with webrtc peers. OBS encoders
+	// spell B-frames differently: NVENC/x264/VAAPI/AMF read "bf", QSV and
+	// VideoToolbox read "bframes". The frontend enforces this on the actual
+	// encoders too (frontend/utility/ForceNoBFrames.hpp), but setting both
+	// here keeps settings cloned into the simulcast ladders consistent.
 	if (video_settings) {
 		obs_data_set_int(video_settings, "bf", 0);
+		obs_data_set_int(video_settings, "bframes", 0);
 		obs_data_set_bool(video_settings, "repeat_headers", true);
 	}
 }

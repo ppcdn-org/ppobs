@@ -130,6 +130,7 @@ void SimpleOutput::LoadStreamingPreset_Lossy(const char *encoderId)
 								nullptr, nullptr);
 			if (whipH264Base) {
 				obs_encoder_release(whipH264Base);
+				EnforceNoBFrames(whipH264Base);
 				blog(LOG_INFO, "WHIP: added '%s' as the H264 base track for a '%s' stream encoder",
 				     h264EncoderId.c_str(), encoderId);
 			} else {

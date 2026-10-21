@@ -1,5 +1,6 @@
 #pragma once
 
+#include <utility/ForceNoBFrames.hpp>
 #include <utility/WHIPSimulcastEncoders.hpp>
 
 #include <algorithm>
@@ -157,6 +158,11 @@ public:
 			ownsMainEncoder = true;
 		}
 
+		// Covers both branches above: the separately-created HEVC main and
+		// the existingMain owned by the caller (already enforced there, so
+		// this is idempotent).
+		ForceEncoderNoBFrames(mainEncoder);
+
 		if (totalLayers <= 1)
 			return;
 
@@ -220,6 +226,7 @@ public:
 				obs_encoder_set_video(layerEncoder, obs_get_video());
 				obs_encoder_set_scaled_size(layerEncoder, width, height);
 				obs_encoder_set_gpu_scale_type(layerEncoder, (obs_scale_type)rescaleFilter);
+				ForceEncoderNoBFrames(layerEncoder);
 				hevcLayerEncoders.push_back(layerEncoder);
 				obs_encoder_release(layerEncoder);
 			} else {
@@ -233,6 +240,7 @@ public:
 		if (!mainEncoder)
 			return;
 		obs_encoder_update(mainEncoder, videoSettings);
+		ForceEncoderNoBFrames(mainEncoder);
 
 		uint32_t outputWidth = video_output_get_width(obs_get_video());
 		uint32_t outputHeight = video_output_get_height(obs_get_video());
@@ -253,6 +261,7 @@ public:
 			}
 
 			obs_encoder_update(hevcLayerEncoders[idx], layerSettings);
+			ForceEncoderNoBFrames(hevcLayerEncoders[idx]);
 		}
 	}
 
