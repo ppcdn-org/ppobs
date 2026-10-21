@@ -124,8 +124,34 @@ WsDegradeClient::WsDegradeClient()
 
 		c.set_open_handler([this, chp](Channel::handle_t) {
 			do_log(LOG_INFO, "WS connected [%s] to %s", chp->codec.c_str(), chp->ws_url.c_str());
-			std::lock_guard<std::mutex> lk(mtx);
-			chp->reconnect_backoff_ms = kReconnectBackoffMinMs;
+
+			Channel::conn_ptr conn;
+			{
+				std::lock_guard<std::mutex> lk(mtx);
+				chp->reconnect_backoff_ms = kReconnectBackoffMinMs;
+				conn = chp->conn;
+			}
+			if (!conn)
+				return;
+
+			// Identify this executor to mmx. The degrade channel is the one
+			// control path shared by every publish transport (WHIP and SRT),
+			// so it is the only place that can report the ppobs build for
+			// both - the WHIP User-Agent only exists on the WHIP leg.
+			nlohmann::json info = {
+				{"type", "CLIENT_INFO"},
+				{"client", "ppobs"},
+				{"version", obs_get_version_string()},
+			};
+			websocketpp::lib::error_code ec =
+				conn->send(info.dump(), websocketpp::frame::opcode::text);
+			if (ec) {
+				do_log(LOG_WARNING, "CLIENT_INFO send failed [%s]: %s", chp->codec.c_str(),
+				       ec.message().c_str());
+			} else {
+				do_log(LOG_INFO, "CLIENT_INFO sent [%s]: client=ppobs version=%s",
+				       chp->codec.c_str(), obs_get_version_string());
+			}
 		});
 
 		c.set_close_handler([this, chp](Channel::handle_t) {
