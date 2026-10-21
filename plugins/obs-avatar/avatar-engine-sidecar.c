@@ -12,9 +12,12 @@
  * WaitForMultipleObjects over {io event, stop event}, so stopping is just
  * SetEvent.
  *
- * This is the stage C skeleton: it connects, negotiates, streams audio out and
- * frames in. Starting the worker process is deliberately not done yet - see
- * the note on worker_command below.
+ * It connects, negotiates, streams audio out and frames in. When the config
+ * names a worker script it also owns the worker's life: it starts the
+ * interpreter, keeps it inside a job object so a crashed OBS cannot orphan a
+ * process holding gigabytes of VRAM, and relaunches it with a growing delay
+ * when it dies. Without one it only waits, which is how a developer runs the
+ * worker in a terminal to watch its output.
  */
 
 #include "avatar-engine-sidecar.h"
@@ -35,7 +38,25 @@
 
 /* Generous enough that the kernel buffers a whole frame, so a worker's write
  * does not block waiting for our reader to drain. */
-#define SIDECAR_PIPE_BUFFER (2u * 1024u * 1024u)
+#define SIDECAR_PIPE_IN_BUFFER (2u * 1024u * 1024u)
+
+/* The other direction is kept small on purpose: it is the audio on its way to
+ * the worker, and whatever sits in the kernel's buffer is audio the worker has
+ * not seen yet. With the 2 MiB the frames need, a worker that cannot keep up
+ * is fed half a minute of backlog, the mouth moves to speech from half a
+ * minute ago, and once the buffer fills every write blocks. About a second
+ * is as much as is worth having in flight. */
+#define SIDECAR_PIPE_OUT_BUFFER (64u * 1024u)
+
+/* Audio not yet handed to the pipe, in seconds. The writer thread drains it,
+ * so a worker that has stopped reading costs this much memory and no more:
+ * when it is full the oldest audio is dropped, because a mouth that is a
+ * second late is wrong, and one that is ten seconds late is just broken. */
+#define SIDECAR_TX_RING_SECONDS 1
+
+/* Reported at most this often, since a worker that is too slow is too slow on
+ * every tick and one line per tick would bury everything else in the log. */
+#define SIDECAR_DROP_LOG_NS 5000000000ULL
 
 /* How long to wait before accepting another connection after a worker drops.
  * A crashed worker that is being restarted should not spin this thread. */
@@ -45,6 +66,25 @@
  * frozen mouth left on stream is worse than a still avatar, because it
  * still looks like it is talking. */
 #define SIDECAR_FRAME_STALE_NS 500000000ULL
+
+/* Relaunch delay for a worker the plugin started: doubling from the minimum
+ * to the maximum, so a worker that dies on import (a wrong interpreter, a
+ * missing package) is retried a few times a minute instead of spinning, while
+ * one that crashed once comes back almost at once. A session that lasted
+ * SIDECAR_STABLE_NS counts as healthy and resets the delay. */
+#define SIDECAR_BACKOFF_MIN_MS 1000
+#define SIDECAR_BACKOFF_MAX_MS 30000
+#define SIDECAR_STABLE_NS 10000000000ULL
+
+/* A launched worker that has neither connected nor exited by now is hung.
+ * The worker connects before it loads any model, so this is not a model
+ * loading budget - only how long an interpreter may take to start. */
+#define SIDECAR_CONNECT_TIMEOUT_MS 60000
+
+/* How long a worker gets to leave on its own once its session is over (it
+ * sees the pipe close), and after a BYE at shutdown. Past this it is killed. */
+#define SIDECAR_EXIT_GRACE_MS 1000
+#define SIDECAR_BYE_GRACE_MS 2000
 
 struct sidecar {
 	obs_source_t *owner;
@@ -56,18 +96,49 @@ struct sidecar {
 	char *pipe_name;
 	HANDLE pipe;
 
+	/* The worker process, when the plugin starts it. Owned by the pipe
+	 * thread; destroy only touches these after joining it. */
+	bool managed;
+	char *worker_python;
+	char *worker_script;
+	char *worker_engine;
+	char *musetalk_dir;
+	char *worker_log;
+	bool worker_log_started;
+	HANDLE worker;
+	HANDLE job;
+	volatile bool bye_sent;
+
 	HANDLE stop_event;
 	HANDLE read_event;
 	HANDLE write_event;
 	pthread_t thread;
 	bool thread_valid;
 
-	/* Writes come from the source's tick thread, reads from our own, so the
+	/* Writes come from a thread of their own, reads from the reader's, so the
 	 * two directions get separate OVERLAPPEDs and the write side is
-	 * serialised. */
+	 * serialised. The source's tick thread never writes to the pipe: it only
+	 * puts audio in the ring below, because a pipe write can wait as long as
+	 * the worker takes to read, and the tick runs under the engine lock that
+	 * the renderer and the properties dialog also want. */
 	pthread_mutex_t write_mutex;
 	uint8_t *tx;
 	size_t tx_cap;
+
+	pthread_mutex_t tx_mutex;
+	float *ring;
+	size_t ring_cap;
+	size_t ring_len;
+	int64_t ring_pts;
+	uint64_t ring_dropped;
+	uint64_t drop_logged;
+	uint64_t drop_reported;
+	float mouth_gain;
+	bool gain_dirty;
+	HANDLE tx_event;
+	pthread_t writer;
+	bool writer_valid;
+	bool bye_pending;
 
 	/* The latest frame, handed to the renderer under this lock. */
 	pthread_mutex_t frame_mutex;
@@ -302,6 +373,13 @@ static bool sidecar_handle_ready(struct sidecar *sc, const uint8_t *payload, uin
 
 	do_log(LOG_INFO, "worker ready: %s, %ux%u, %s", sc->stats.engine[0] ? sc->stats.engine : "(unnamed)", width,
 	       height, real ? "real model" : "STUB - no model loaded, frames are a placeholder");
+
+	/* A worker that has just (re)started knows nothing of the setting. */
+	pthread_mutex_lock(&sc->tx_mutex);
+	sc->gain_dirty = true;
+	pthread_mutex_unlock(&sc->tx_mutex);
+	SetEvent(sc->tx_event);
+
 	return true;
 }
 
@@ -455,29 +533,242 @@ static void sidecar_handle_error(struct sidecar *sc, const uint8_t *payload, uin
  * Session
  * ------------------------------------------------------------------------- */
 
-static bool sidecar_connect(struct sidecar *sc)
+static bool sidecar_wait_stop(struct sidecar *sc, DWORD ms)
+{
+	return WaitForSingleObject(sc->stop_event, ms) == WAIT_OBJECT_0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Worker process
+ * ------------------------------------------------------------------------- */
+
+static unsigned sidecar_next_backoff(unsigned ms)
+{
+	return (ms >= SIDECAR_BACKOFF_MAX_MS / 2) ? SIDECAR_BACKOFF_MAX_MS : ms * 2;
+}
+
+/* Everything the worker writes before the handshake - an interpreter that is
+ * not there, an import that fails, a traceback - goes to its stdout/stderr, and
+ * nobody is attached to those in a GUI process. A file is the one place that
+ * output survives to be read. */
+static HANDLE sidecar_open_worker_log(struct sidecar *sc, SECURITY_ATTRIBUTES *sa)
+{
+	if (!sc->worker_log[0])
+		return INVALID_HANDLE_VALUE;
+
+	wchar_t *wide = NULL;
+	if (os_utf8_to_wcs_ptr(sc->worker_log, 0, &wide) == 0)
+		return INVALID_HANDLE_VALUE;
+
+	/* The first launch of this engine starts a fresh file; relaunches append,
+	 * because the crash that caused the relaunch is what the file is for. */
+	if (!sc->worker_log_started) {
+		HANDLE truncate = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+					      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (truncate != INVALID_HANDLE_VALUE)
+			CloseHandle(truncate);
+		sc->worker_log_started = true;
+	}
+
+	HANDLE file = CreateFileW(wide, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, sa,
+				  OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	bfree(wide);
+	return file;
+}
+
+static bool sidecar_spawn_worker(struct sidecar *sc)
+{
+	const char *python = sc->worker_python[0] ? sc->worker_python : "python";
+
+	/* -X utf8 so the log is UTF-8 whatever the console code page is, -u so a
+	 * crash does not take its last lines down with it in a buffer. */
+	struct dstr cmd = {0};
+	dstr_printf(&cmd, "\"%s\" -X utf8 -u \"%s\" --pipe \"%s\" --engine %s", python, sc->worker_script,
+		    sc->pipe_name, sc->worker_engine);
+	if (sc->musetalk_dir[0])
+		dstr_catf(&cmd, " --musetalk-dir \"%s\"", sc->musetalk_dir);
+
+	SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+
+	HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+				 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	HANDLE log = sidecar_open_worker_log(sc, &sa);
+	HANDLE out = (log != INVALID_HANDLE_VALUE) ? log : nul;
+
+	/* A job that kills its members when the last handle closes. OBS dying
+	 * without running its shutdown path would otherwise leave the worker
+	 * running with the model resident in VRAM. */
+	HANDLE job = CreateJobObjectW(NULL, NULL);
+	if (job) {
+		JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+		limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+		SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+	}
+
+	if (log != INVALID_HANDLE_VALUE) {
+		struct dstr header = {0};
+		dstr_printf(&header, "---- launching worker ----\r\n%s\r\n", cmd.array);
+		DWORD written = 0;
+		WriteFile(log, header.array, (DWORD)header.len, &written, NULL);
+		dstr_free(&header);
+	}
+
+	/* Only the handles the child needs are inherited. Without the list,
+	 * CreateProcess with inheritance on hands over every inheritable handle
+	 * OBS happens to hold. */
+	HANDLE inherit[2] = {nul, out};
+	const DWORD inherit_count = (nul == out) ? 1 : 2;
+
+	STARTUPINFOEXW si = {0};
+	si.StartupInfo.cb = sizeof(si);
+	si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+	si.StartupInfo.hStdInput = nul;
+	si.StartupInfo.hStdOutput = out;
+	si.StartupInfo.hStdError = out;
+
+	SIZE_T attr_size = 0;
+	InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+	LPPROC_THREAD_ATTRIBUTE_LIST attrs = bmalloc(attr_size);
+	bool attrs_ready = InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) != 0;
+	if (attrs_ready &&
+	    !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit,
+				       inherit_count * sizeof(HANDLE), NULL, NULL)) {
+		DeleteProcThreadAttributeList(attrs);
+		attrs_ready = false;
+	}
+	si.lpAttributeList = attrs;
+
+	wchar_t *wide_cmd = NULL;
+	os_utf8_to_wcs_ptr(cmd.array, 0, &wide_cmd);
+
+	PROCESS_INFORMATION pi = {0};
+	bool ok = attrs_ready && wide_cmd &&
+		  CreateProcessW(NULL, wide_cmd, NULL, NULL, TRUE,
+				 CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+				 &si.StartupInfo, &pi);
+	const DWORD err = ok ? 0 : GetLastError();
+
+	if (attrs_ready)
+		DeleteProcThreadAttributeList(attrs);
+	bfree(attrs);
+	bfree(wide_cmd);
+
+	if (log != INVALID_HANDLE_VALUE)
+		CloseHandle(log);
+	if (nul != INVALID_HANDLE_VALUE)
+		CloseHandle(nul);
+
+	if (!ok) {
+		do_log(LOG_ERROR, "could not start the worker (error %lu): %s", err, cmd.array);
+		if (job)
+			CloseHandle(job);
+		dstr_free(&cmd);
+		return false;
+	}
+
+	/* Suspended until it is in the job, so it cannot start a child of its own
+	 * outside it. */
+	if (job && !AssignProcessToJobObject(job, pi.hProcess))
+		do_log(LOG_WARNING, "could not put the worker in a job object (%lu); it will outlive OBS if OBS crashes",
+		       GetLastError());
+
+	ResumeThread(pi.hThread);
+	CloseHandle(pi.hThread);
+
+	sc->worker = pi.hProcess;
+	sc->job = job;
+
+	do_log(LOG_INFO, "started the worker (pid %lu): %s", pi.dwProcessId, cmd.array);
+	if (sc->worker_log[0])
+		do_log(LOG_INFO, "worker output goes to %s", sc->worker_log);
+
+	dstr_free(&cmd);
+	return true;
+}
+
+/* Waits `grace_ms` for the worker to leave by itself, then removes whatever is
+ * left. Closing the job is what makes the removal complete: a virtualenv's
+ * python.exe is a launcher that runs the real interpreter as a child, and
+ * terminating the launcher alone would leave that child holding the GPU. */
+static void sidecar_reap_worker(struct sidecar *sc, DWORD grace_ms)
+{
+	if (!sc->worker)
+		return;
+
+	if (WaitForSingleObject(sc->worker, grace_ms) == WAIT_OBJECT_0) {
+		DWORD code = 0;
+		GetExitCodeProcess(sc->worker, &code);
+		do_log(code == 0 ? LOG_INFO : LOG_WARNING, "worker exited with code %lu (0x%lX)", code, code);
+	} else {
+		do_log(LOG_INFO, "stopping the worker");
+	}
+
+	CloseHandle(sc->worker);
+	sc->worker = NULL;
+
+	if (sc->job) {
+		CloseHandle(sc->job);
+		sc->job = NULL;
+	}
+}
+
+enum sidecar_connect_result {
+	SIDECAR_CONNECT_OK,
+	SIDECAR_CONNECT_STOP,
+	SIDECAR_CONNECT_FAILED,
+	SIDECAR_CONNECT_WORKER_EXITED,
+	SIDECAR_CONNECT_TIMEOUT,
+};
+
+static enum sidecar_connect_result sidecar_connect(struct sidecar *sc)
 {
 	OVERLAPPED ov = {0};
 	ov.hEvent = sc->read_event;
 	ResetEvent(sc->read_event);
 
 	if (ConnectNamedPipe(sc->pipe, &ov))
-		return true;
+		return SIDECAR_CONNECT_OK;
 
 	const DWORD err = GetLastError();
 
 	/* A worker that connected between CreateNamedPipe and here is already
 	 * attached, which is success rather than an error to recover from. */
 	if (err == ERROR_PIPE_CONNECTED)
-		return true;
+		return SIDECAR_CONNECT_OK;
 
 	if (err != ERROR_IO_PENDING) {
 		do_log(LOG_ERROR, "ConnectNamedPipe failed (%lu)", err);
-		return false;
+		return SIDECAR_CONNECT_FAILED;
 	}
 
+	/* A worker the plugin started is watched while waiting: if it dies on
+	 * import, nothing will ever connect, and an unwatched wait would sit
+	 * here forever with the avatar silently not moving. */
+	HANDLE waits[3] = {sc->read_event, sc->stop_event, sc->worker};
+	const DWORD count = sc->worker ? 3 : 2;
+	const DWORD timeout = sc->worker ? SIDECAR_CONNECT_TIMEOUT_MS : INFINITE;
+
+	const DWORD result = WaitForMultipleObjects(count, waits, FALSE, timeout);
+
 	DWORD transferred = 0;
-	return sidecar_wait_io(sc, &ov, sc->read_event, &transferred);
+	if (result == WAIT_OBJECT_0)
+		return GetOverlappedResult(sc->pipe, &ov, &transferred, FALSE) ? SIDECAR_CONNECT_OK
+									       : SIDECAR_CONNECT_FAILED;
+
+	CancelIoEx(sc->pipe, &ov);
+	/* A connection can complete in the instant before the cancel lands, in
+	 * which case it is a connection and not a cancellation. */
+	const bool connected = GetOverlappedResult(sc->pipe, &ov, &transferred, TRUE) != 0;
+
+	if (result == WAIT_OBJECT_0 + 1)
+		return SIDECAR_CONNECT_STOP;
+	if (connected)
+		return SIDECAR_CONNECT_OK;
+	if (result == WAIT_OBJECT_0 + 2)
+		return SIDECAR_CONNECT_WORKER_EXITED;
+	if (result == WAIT_TIMEOUT)
+		return SIDECAR_CONNECT_TIMEOUT;
+	return SIDECAR_CONNECT_FAILED;
 }
 
 static void sidecar_session(struct sidecar *sc)
@@ -567,16 +858,44 @@ static void *sidecar_thread(void *param)
 
 	do_log(LOG_INFO, "waiting for a worker on %s", sc->pipe_name);
 
-	while (WaitForSingleObject(sc->stop_event, 0) != WAIT_OBJECT_0) {
-		if (!sidecar_connect(sc))
+	unsigned backoff_ms = SIDECAR_BACKOFF_MIN_MS;
+
+	while (!sidecar_wait_stop(sc, 0)) {
+		if (sc->managed && !sc->worker && !sidecar_spawn_worker(sc)) {
+			do_log(LOG_WARNING, "trying again in %u ms", backoff_ms);
+			if (sidecar_wait_stop(sc, backoff_ms))
+				break;
+			backoff_ms = sidecar_next_backoff(backoff_ms);
+			continue;
+		}
+
+		const enum sidecar_connect_result connect = sidecar_connect(sc);
+		if (connect == SIDECAR_CONNECT_STOP || connect == SIDECAR_CONNECT_FAILED)
 			break;
 
-		sidecar_session(sc);
+		bool stable = false;
+
+		if (connect == SIDECAR_CONNECT_OK) {
+			const uint64_t started = os_gettime_ns();
+			sidecar_session(sc);
+			stable = os_gettime_ns() - started >= SIDECAR_STABLE_NS;
+		} else if (connect == SIDECAR_CONNECT_WORKER_EXITED) {
+			do_log(LOG_ERROR, "the worker exited before connecting; see %s",
+			       sc->worker_log[0] ? sc->worker_log : "its console output");
+		} else {
+			do_log(LOG_ERROR, "the worker did not connect within %d seconds", SIDECAR_CONNECT_TIMEOUT_MS / 1000);
+		}
 
 		pthread_mutex_lock(&sc->state_mutex);
 		const bool was_connected = sc->stats.connected;
 		sc->stats.connected = false;
 		pthread_mutex_unlock(&sc->state_mutex);
+
+		/* Audio queued for a worker that is gone must not be delivered to its
+		 * replacement as if it were current. */
+		pthread_mutex_lock(&sc->tx_mutex);
+		sc->ring_len = 0;
+		pthread_mutex_unlock(&sc->tx_mutex);
 
 		/* The last frame is kept on purpose rather than cleared: the
 		 * source should hold the final expression while the worker is
@@ -588,13 +907,39 @@ static void *sidecar_thread(void *param)
 		/* Only an unplanned disconnect is worth a warning. Saying "waiting
 		 * for it to come back" while shutting down is a false alarm, and
 		 * a false alarm in a log costs someone real time later. */
-		const bool stopping = WaitForSingleObject(sc->stop_event, 0) == WAIT_OBJECT_0;
-		if (was_connected && !stopping)
-			do_log(LOG_WARNING, "worker disconnected; waiting for it to come back");
-
-		if (stopping || WaitForSingleObject(sc->stop_event, SIDECAR_RECONNECT_MS) == WAIT_OBJECT_0)
+		if (sidecar_wait_stop(sc, 0))
 			break;
+
+		if (!sc->managed) {
+			if (was_connected)
+				do_log(LOG_WARNING, "worker disconnected; waiting for it to come back");
+			if (sidecar_wait_stop(sc, SIDECAR_RECONNECT_MS))
+				break;
+			continue;
+		}
+
+		if (was_connected)
+			do_log(LOG_WARNING, "worker disconnected");
+
+		/* Never leave the old process running beside its replacement: two
+		 * workers would each load the model, and the second to connect
+		 * would find the pipe taken. */
+		sidecar_reap_worker(sc, SIDECAR_EXIT_GRACE_MS);
+
+		if (stable)
+			backoff_ms = SIDECAR_BACKOFF_MIN_MS;
+
+		do_log(LOG_INFO, "relaunching the worker in %u ms", backoff_ms);
+		if (sidecar_wait_stop(sc, backoff_ms))
+			break;
+		backoff_ms = sidecar_next_backoff(backoff_ms);
 	}
+
+	/* After a BYE the worker is leaving on its own and only needs a moment.
+	 * Without one it may be in the middle of loading a model and will not
+	 * look at the pipe for a long while, which is not worth stalling a
+	 * property edit over. */
+	sidecar_reap_worker(sc, sc->bye_sent ? SIDECAR_BYE_GRACE_MS : 0);
 
 	return NULL;
 }
@@ -605,6 +950,94 @@ static void *sidecar_thread(void *param)
 
 static void sidecar_destroy(void *data);
 static bool sidecar_ready(void *data);
+
+/* Everything bound for the worker leaves from here. The thread sleeps until
+ * there is something to send and then writes it, however long the pipe takes
+ * to accept it: it is the only thread that can be stuck behind a slow worker,
+ * and nothing else waits on it. */
+static void *sidecar_writer_thread(void *param)
+{
+	struct sidecar *sc = param;
+
+	os_set_thread_name("avatar-sidecar-tx");
+
+	HANDLE waits[2] = {sc->tx_event, sc->stop_event};
+
+	while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) {
+		for (;;) {
+			uint8_t gain_payload[AVATAR_MOUTH_GAIN_PAYLOAD_SIZE];
+			bool send_gain = false;
+			bool send_bye = false;
+			uint32_t audio_len = 0;
+
+			pthread_mutex_lock(&sc->tx_mutex);
+
+			if (sc->gain_dirty) {
+				avatar_put_f32(gain_payload, sc->mouth_gain);
+				sc->gain_dirty = false;
+				send_gain = true;
+			}
+
+			size_t count = sc->ring_len;
+			if (count > avatar_audio_max_samples())
+				count = avatar_audio_max_samples();
+
+			if (count) {
+				audio_len = avatar_audio_payload_size((uint32_t)count);
+				if (sc->tx_cap < audio_len) {
+					sc->tx = brealloc(sc->tx, audio_len);
+					sc->tx_cap = audio_len;
+				}
+
+				avatar_put_i64(sc->tx, sc->ring_pts);
+				avatar_put_u32(sc->tx + 8, (uint32_t)count);
+				for (size_t i = 0; i < count; i++)
+					avatar_put_f32(sc->tx + AVATAR_AUDIO_HEADER_SIZE + i * 4, sc->ring[i]);
+
+				memmove(sc->ring, sc->ring + count, (sc->ring_len - count) * sizeof(float));
+				sc->ring_len -= count;
+				sc->ring_pts += (int64_t)count * 1000000000LL / (sc->sample_rate ? sc->sample_rate : 16000);
+			}
+
+			/* Last, so everything queued before it still reaches the worker. */
+			if (sc->bye_pending && !count) {
+				send_bye = true;
+				sc->bye_pending = false;
+			}
+
+			pthread_mutex_unlock(&sc->tx_mutex);
+
+			if (!send_gain && !audio_len && !send_bye)
+				break;
+
+			/* Nothing is sent to a worker that is not there; whatever was
+			 * queued for it is simply dropped. */
+			if (!sidecar_ready(sc))
+				continue;
+
+			bool ok = true;
+			if (send_gain)
+				ok = sidecar_send(sc, AVATAR_MSG_MOUTH_GAIN, gain_payload, sizeof(gain_payload));
+			if (ok && audio_len)
+				ok = sidecar_send(sc, AVATAR_MSG_AUDIO, sc->tx, audio_len);
+			if (ok && send_bye)
+				sc->bye_sent = sidecar_send(sc, AVATAR_MSG_BYE, NULL, 0);
+
+			if (!ok) {
+				/* The reader thread notices the same breakage and handles
+				 * the reconnect; nothing to do here but stop writing. */
+				pthread_mutex_lock(&sc->state_mutex);
+				sc->stats.connected = false;
+				pthread_mutex_unlock(&sc->state_mutex);
+			}
+
+			if (sidecar_wait_stop(sc, 0))
+				return NULL;
+		}
+	}
+
+	return NULL;
+}
 
 static void *sidecar_create(const struct avatar_engine_config *cfg, obs_source_t *owner)
 {
@@ -640,6 +1073,19 @@ static void *sidecar_create(const struct avatar_engine_config *cfg, obs_source_t
 		return NULL;
 	}
 
+	if (pthread_mutex_init(&sc->tx_mutex, NULL) != 0) {
+		pthread_mutex_destroy(&sc->state_mutex);
+		pthread_mutex_destroy(&sc->frame_mutex);
+		pthread_mutex_destroy(&sc->write_mutex);
+		bfree(sc->asset_path);
+		bfree(sc);
+		return NULL;
+	}
+
+	sc->ring_cap = (size_t)(sc->sample_rate ? sc->sample_rate : 16000) * SIDECAR_TX_RING_SECONDS;
+	sc->ring = bmalloc(sc->ring_cap * sizeof(float));
+	sc->mouth_gain = cfg->mouth_gain > 0.0f ? cfg->mouth_gain : 1.0f;
+
 	/* The pipe name has to be unique per source: two avatar sources in one
 	 * scene would otherwise fight over one pipe, and the second
 	 * CreateNamedPipe would hand its worker the first source's audio. */
@@ -650,8 +1096,9 @@ static void *sidecar_create(const struct avatar_engine_config *cfg, obs_source_t
 	sc->stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
 	sc->read_event = CreateEvent(NULL, TRUE, FALSE, NULL);
 	sc->write_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+	sc->tx_event = CreateEvent(NULL, FALSE, FALSE, NULL);
 
-	if (!sc->stop_event || !sc->read_event || !sc->write_event) {
+	if (!sc->stop_event || !sc->read_event || !sc->write_event || !sc->tx_event) {
 		blog(LOG_ERROR, "[obs-avatar sidecar] could not create the I/O events");
 		sidecar_destroy(sc);
 		return NULL;
@@ -659,7 +1106,7 @@ static void *sidecar_create(const struct avatar_engine_config *cfg, obs_source_t
 
 	sc->pipe = CreateNamedPipeA(sc->pipe_name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
 				    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, SIDECAR_PIPE_INSTANCES,
-				    SIDECAR_PIPE_BUFFER, SIDECAR_PIPE_BUFFER, 0, NULL);
+				    SIDECAR_PIPE_OUT_BUFFER, SIDECAR_PIPE_IN_BUFFER, 0, NULL);
 
 	if (sc->pipe == INVALID_HANDLE_VALUE) {
 		blog(LOG_ERROR, "[obs-avatar sidecar] CreateNamedPipe('%s') failed (%lu)", sc->pipe_name,
@@ -668,13 +1115,38 @@ static void *sidecar_create(const struct avatar_engine_config *cfg, obs_source_t
 		return NULL;
 	}
 
-	if (cfg->worker_command && *cfg->worker_command) {
-		/* Spawning, with the backoff relaunch the design calls for, is
-		 * the next piece of work. Until then this is reported rather
-		 * than silently ignored, so a configured command that does
-		 * nothing is not mistaken for a broken worker. */
-		blog(LOG_WARNING, "[obs-avatar sidecar] worker_command is set but launching is not implemented yet; "
-				  "start the worker by hand against the pipe named in the log");
+	sc->worker_python = bstrdup(cfg->worker_python ? cfg->worker_python : "");
+	sc->worker_script = bstrdup(cfg->worker_script ? cfg->worker_script : "");
+	sc->worker_engine = bstrdup(cfg->worker_engine && *cfg->worker_engine ? cfg->worker_engine : "musetalk");
+	sc->worker_log = bstrdup(cfg->worker_log ? cfg->worker_log : "");
+
+	/* A trailing backslash would turn the closing quote of the command line
+	 * into an escaped one and swallow the arguments after it. */
+	sc->musetalk_dir = bstrdup(cfg->musetalk_dir ? cfg->musetalk_dir : "");
+	for (size_t len = strlen(sc->musetalk_dir);
+	     len && (sc->musetalk_dir[len - 1] == '\\' || sc->musetalk_dir[len - 1] == '/'); len--)
+		sc->musetalk_dir[len - 1] = 0;
+
+	if (sc->worker_script[0]) {
+		/* Checked once, here, rather than on every relaunch: a path that
+		 * is wrong now is wrong until the settings change, and editing the
+		 * settings recreates the engine. Falling back to waiting for a
+		 * hand-started worker keeps the source usable meanwhile. */
+		const bool python_is_path = strpbrk(sc->worker_python, "\\/:") != NULL;
+
+		if (!os_file_exists(sc->worker_script)) {
+			blog(LOG_ERROR,
+			     "[obs-avatar sidecar] worker script '%s' does not exist; not starting a worker. "
+			     "Start one by hand against %s",
+			     sc->worker_script, sc->pipe_name);
+		} else if (python_is_path && !os_file_exists(sc->worker_python)) {
+			blog(LOG_ERROR,
+			     "[obs-avatar sidecar] Python interpreter '%s' does not exist; not starting a worker. "
+			     "Start one by hand against %s",
+			     sc->worker_python, sc->pipe_name);
+		} else {
+			sc->managed = true;
+		}
 	}
 
 	if (pthread_create(&sc->thread, NULL, sidecar_thread, sc) != 0) {
@@ -683,6 +1155,13 @@ static void *sidecar_create(const struct avatar_engine_config *cfg, obs_source_t
 		return NULL;
 	}
 	sc->thread_valid = true;
+
+	if (pthread_create(&sc->writer, NULL, sidecar_writer_thread, sc) != 0) {
+		blog(LOG_ERROR, "[obs-avatar sidecar] could not start the pipe writer thread");
+		sidecar_destroy(sc);
+		return NULL;
+	}
+	sc->writer_valid = true;
 
 	return sc;
 }
@@ -697,14 +1176,29 @@ static void sidecar_destroy(void *data)
 	 * exits on a BYE it understands instead of on a read error. Best effort
 	 * and before the stop event, because every write waits on that event and
 	 * would be cancelled the moment it is set. */
-	if (sidecar_ready(sc))
-		sidecar_send(sc, AVATAR_MSG_BYE, NULL, 0);
+	if (sidecar_ready(sc)) {
+		/* Through the writer like everything else, and waited for only
+		 * briefly: a writer stuck behind a worker that has stopped reading
+		 * would hold this up for as long as the stall lasts, and a worker
+		 * that is not reading would not have heard the BYE anyway. */
+		pthread_mutex_lock(&sc->tx_mutex);
+		sc->bye_pending = true;
+		pthread_mutex_unlock(&sc->tx_mutex);
+		SetEvent(sc->tx_event);
+
+		for (int waited = 0; waited < 30 && !sc->bye_sent; waited++)
+			Sleep(10);
+	}
 
 	if (sc->stop_event)
 		SetEvent(sc->stop_event);
 
 	if (sc->thread_valid)
 		pthread_join(sc->thread, NULL);
+	if (sc->writer_valid)
+		pthread_join(sc->writer, NULL);
+
+	sidecar_reap_worker(sc, 0);
 
 	if (sc->texture) {
 		obs_enter_graphics();
@@ -724,16 +1218,25 @@ static void sidecar_destroy(void *data)
 		CloseHandle(sc->read_event);
 	if (sc->write_event)
 		CloseHandle(sc->write_event);
+	if (sc->tx_event)
+		CloseHandle(sc->tx_event);
 
 	pthread_mutex_destroy(&sc->write_mutex);
 	pthread_mutex_destroy(&sc->frame_mutex);
 	pthread_mutex_destroy(&sc->state_mutex);
+	pthread_mutex_destroy(&sc->tx_mutex);
 
+	bfree(sc->ring);
 	bfree(sc->frame);
 	bfree(sc->rx);
 	bfree(sc->tx);
 	bfree(sc->pipe_name);
 	bfree(sc->asset_path);
+	bfree(sc->worker_python);
+	bfree(sc->worker_script);
+	bfree(sc->worker_engine);
+	bfree(sc->musetalk_dir);
+	bfree(sc->worker_log);
 	bfree(sc);
 }
 
@@ -754,28 +1257,74 @@ static void sidecar_push_audio(void *data, const float *samples, size_t count, i
 	if (!count || !sidecar_ready(sc))
 		return;
 
-	if (count > avatar_audio_max_samples())
-		count = avatar_audio_max_samples();
+	const uint32_t rate = sc->sample_rate ? sc->sample_rate : 16000;
+	uint64_t dropped_now = 0;
 
-	const uint32_t payload_len = avatar_audio_payload_size((uint32_t)count);
+	pthread_mutex_lock(&sc->tx_mutex);
 
-	if (sc->tx_cap < payload_len) {
-		sc->tx = brealloc(sc->tx, payload_len);
-		sc->tx_cap = payload_len;
+	/* A block larger than the whole ring keeps its tail, which is the newest. */
+	if (count > sc->ring_cap) {
+		const size_t skip = count - sc->ring_cap;
+		samples += skip;
+		pts_ns += (int64_t)skip * 1000000000LL / rate;
+		count = sc->ring_cap;
+		sc->ring_dropped += skip;
+		dropped_now += skip;
 	}
 
-	avatar_put_i64(sc->tx, pts_ns);
-	avatar_put_u32(sc->tx + 8, (uint32_t)count);
-	for (size_t i = 0; i < count; i++)
-		avatar_put_f32(sc->tx + AVATAR_AUDIO_HEADER_SIZE + i * 4, samples[i]);
-
-	if (!sidecar_send(sc, AVATAR_MSG_AUDIO, sc->tx, payload_len)) {
-		/* The reader thread notices the same breakage and handles the
-		 * reconnect; nothing to do here but stop writing. */
-		pthread_mutex_lock(&sc->state_mutex);
-		sc->stats.connected = false;
-		pthread_mutex_unlock(&sc->state_mutex);
+	if (sc->ring_len + count > sc->ring_cap) {
+		const size_t over = sc->ring_len + count - sc->ring_cap;
+		memmove(sc->ring, sc->ring + over, (sc->ring_len - over) * sizeof(float));
+		sc->ring_len -= over;
+		sc->ring_pts += (int64_t)over * 1000000000LL / rate;
+		sc->ring_dropped += over;
+		dropped_now += over;
 	}
+
+	if (sc->ring_len == 0)
+		sc->ring_pts = pts_ns;
+
+	memcpy(sc->ring + sc->ring_len, samples, count * sizeof(float));
+	sc->ring_len += count;
+
+	const uint64_t total_dropped = sc->ring_dropped;
+	pthread_mutex_unlock(&sc->tx_mutex);
+
+	SetEvent(sc->tx_event);
+
+	if (!dropped_now)
+		return;
+
+	/* The one place this is knowable: audio is being produced faster than the
+	 * worker takes it. Said once in a while, with the remedy, because the
+	 * symptom on stream is a mouth that lags and skips and nothing says why. */
+	const uint64_t now = os_gettime_ns();
+	if (!sc->drop_logged || now - sc->drop_logged >= SIDECAR_DROP_LOG_NS) {
+		const uint64_t since = total_dropped - sc->drop_reported;
+		do_log(LOG_WARNING,
+		       "the worker is not keeping up with real time: dropped %.1f s of audio since the last report. "
+		       "Lower the generated frame rate",
+		       (double)since / rate);
+		sc->drop_logged = now;
+		sc->drop_reported = total_dropped;
+	}
+}
+
+void avatar_engine_sidecar_set_mouth_gain(void *data, float gain)
+{
+	struct sidecar *sc = data;
+	if (!sc)
+		return;
+
+	pthread_mutex_lock(&sc->tx_mutex);
+	const bool changed = sc->mouth_gain != gain;
+	sc->mouth_gain = gain;
+	if (changed)
+		sc->gain_dirty = true;
+	pthread_mutex_unlock(&sc->tx_mutex);
+
+	if (changed)
+		SetEvent(sc->tx_event);
 }
 
 static bool sidecar_lock_frame(void *data, struct avatar_engine_frame *out)

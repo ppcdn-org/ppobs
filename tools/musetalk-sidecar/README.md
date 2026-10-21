@@ -18,7 +18,43 @@
 
 ## 跑起来
 
-插件在源启用时创建管道，并把管道名打进 OBS 日志：
+**默认由插件自己拉起。** 把口型驱动选成「真人（MuseTalk worker）」，插件就会创建管道、
+启动 worker、等它连上；worker 退出或崩溃后按 1s、2s、4s……（上限 30s）的间隔重新拉起，
+连续稳定运行 10 秒以上才把间隔重置。worker 在一个 Windows job object 里，OBS 即使崩溃，
+worker 也会被一并收掉，不会留一个占着显存的孤儿进程。
+
+属性里有五项（只在 MuseTalk worker 模式下显示）：
+
+| 属性 | 留空时 |
+|---|---|
+| 自动启动 worker | 默认勾选；取消则回到手动模式（见下） |
+| 口型幅度 | 默认 200%，运行时生效（经 `MOUTH_GAIN` 消息发给 worker，不用重启） |
+| MuseTalk 目录 | 默认 `D:\github\MuseTalk`，环境变量 `MUSETALK_DIR` 可改默认值 |
+| Python 解释器 | 用 `<MuseTalk 目录>\venv\Scripts\python.exe`；没有 venv 才退到 PATH 里的 `python` |
+| worker 脚本 | 用编译时记下的源码树里的 `ppobs_avatar_worker.py` |
+
+**口型幅度**：MuseTalk v1.5 在不少脸上嘴只张一点点，模型里没有对应的旋钮，把音频放大也没用（Whisper
+特征做了归一化）。worker 启动时先算一遍静音下 UNet 的输出作为"嘴的静止形状"，之后每一帧输出
+`静止 + 幅度 × (输出 - 静止)`，在隐空间里放大偏移。实测（`greg02.jpg`）100%、150% 几乎看不出张嘴，
+200% 清楚，300% 开口更大但嘴角出现发白的伪影，所以默认 200%、范围 50%–300%。
+
+**生成帧率**：本机 RTX 4060 上 MuseTalk 约 40 ms 一帧（GPU 空闲时），所以 30 fps 比实时还慢，
+25 fps 刚好没有余量，OBS 自己的编码器还要分走一部分 GPU。默认 20 fps。worker 追不上时，
+插件只保留最近 1 秒的音频、更早的丢掉，并在日志里报
+`the worker is not keeping up with real time` —— 嘴会滞后、掉帧，但 OBS 不会被拖住。
+
+MuseTalk 必须用它自己 venv 里的解释器 —— torch、CUDA 都装在那里，系统 Python 没有。
+
+worker 的 stdout/stderr 写到 OBS 日志旁边的 `logs/avatar-worker.log`（便携模式下是
+`config/obs-studio/logs/`）。解释器找不到、import 失败这类问题发生在握手之前，只有这个文件
+能看到。每次启动前会写一行 `---- launching worker ----` 和完整命令行；OBS 本身的日志里也会
+记 `started the worker (pid …)`、`worker exited with code …` 和下一次重拉的间隔。
+
+配置的路径不存在时，插件在日志里报错并退回手动模式，而不是反复重拉一个注定起不来的命令。
+
+### 手动启动
+
+取消「自动启动 worker」后，插件只创建管道并等待，管道名打在 OBS 日志里（也显示在属性页）：
 
 ```
 [obs-avatar sidecar: '头像直播'] waiting for a worker on \\.\pipe\ppobs-avatar-1234-000001ab...
@@ -30,9 +66,7 @@
 python ppobs_avatar_worker.py --pipe "\\.\pipe\ppobs-avatar-1234-000001ab"
 ```
 
-当前阶段**由你手动启动**。插件侧的 `worker_command` 设置已经留好，但拉起进程和退避重拉
-还没实现（属于阶段 D 的生命周期管理）—— 手动启动的好处是 worker 的输出直接在终端里看得见，
-排查协议问题比翻日志快得多。
+好处是 worker 的输出直接在终端里看得见，排查协议问题比翻日志快得多。
 
 检查线格式，不需要管道也不需要 OBS：
 

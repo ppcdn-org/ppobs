@@ -47,14 +47,30 @@ struct avatar_engine_config {
 	 * before choosing an asset. */
 	const char *asset_path;
 
-	/* Command the plugin uses to start the worker, if it is to start one at
-	 * all. Empty means "a worker is being started by hand", which is how
-	 * the skeleton is driven: the pipe waits, the developer runs the worker
-	 * in a terminal and sees its output directly. */
-	const char *worker_command;
+	/* How the plugin starts the worker, if it is to start one at all. An empty
+	 * or NULL worker_script means "a worker is being started by hand": the
+	 * pipe waits and the developer runs the worker in a terminal, which is
+	 * also how the loopback test drives the engine.
+	 *
+	 * With a script, the engine runs `worker_python worker_script` itself,
+	 * hands it the pipe and the MuseTalk checkout, and relaunches it with a
+	 * growing delay when it dies. worker_python may be empty (then "python"
+	 * from PATH). worker_log, when set, is where the worker's stdout and
+	 * stderr go: the interpreter's import errors and tracebacks happen
+	 * before the handshake, so nothing else would ever show them. */
+	const char *worker_script;
+	const char *worker_engine; /* the worker's --engine; NULL means "musetalk" */
+	const char *worker_python;
+	const char *musetalk_dir;
+	const char *worker_log;
 
 	uint32_t fps;
 	uint32_t sample_rate;
+
+	/* Mode A: how far the mouth may travel, as a multiple of what the model
+	 * produces. 0 means "not set" and is treated as 1.0. Changed at run time
+	 * through avatar_engine_sidecar_set_mouth_gain. */
+	float mouth_gain;
 };
 
 struct avatar_engine_frame {

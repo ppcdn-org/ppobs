@@ -72,6 +72,13 @@ enum avatar_msg_type {
 	 * a couple of hundred kilobytes. The mask is the alpha channel, so the
 	 * feathered edge survives the move. */
 	AVATAR_MSG_CROP = 9,
+
+	/* plugin -> worker: a float32 multiple of how far the mouth is allowed
+	 * to travel from its resting shape (1.0 = as the model produced it).
+	 * Sent after READY and again whenever the user moves the slider, so
+	 * tuning it does not cost the minute a worker restart takes. A worker
+	 * that predates it ignores it, like any unknown type. */
+	AVATAR_MSG_MOUTH_GAIN = 10,
 };
 
 /* READY flags */
@@ -85,6 +92,9 @@ enum avatar_msg_type {
  * alpha is the blend mask. x/y are in the reference frame's pixel coordinates,
  * which READY reports as its width/height. */
 #define AVATAR_CROP_HEADER_SIZE 24
+
+/* MOUTH_GAIN: a single float32. */
+#define AVATAR_MOUTH_GAIN_PAYLOAD_SIZE 4
 
 /* STAT: whisper_us, unet_us, vae_us, queue_depth, dropped. */
 #define AVATAR_STAT_PAYLOAD_SIZE 20

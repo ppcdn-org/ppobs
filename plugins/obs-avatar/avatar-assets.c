@@ -26,7 +26,7 @@
  *
  * Both are searched, matching the virtual background: either is a reasonable
  * place for someone to have put the folder. */
-static char *avatar_asset_root_variant(bool below_obs_studio)
+static char *avatar_config_leaf(bool below_obs_studio, const char *leaf)
 {
 	/* Asking for "" gives the module's own config directory, which sits
 	 * under "<root>/obs-studio/plugin_config". */
@@ -51,7 +51,30 @@ static char *avatar_asset_root_variant(bool below_obs_studio)
 		keep += strlen(AVATAR_CONFIG_MARKER) - 1;
 	dstr_resize(&path, keep);
 
-	dstr_cat(&path, "/" AVATAR_ASSET_DIR);
+	dstr_cat(&path, "/");
+	dstr_cat(&path, leaf);
+	return path.array;
+}
+
+static char *avatar_asset_root_variant(bool below_obs_studio)
+{
+	return avatar_config_leaf(below_obs_studio, AVATAR_ASSET_DIR);
+}
+
+char *avatar_worker_log_path(void)
+{
+	/* OBS keeps its own logs in <config>/obs-studio/logs, and the worker's
+	 * belongs beside them. The directory exists whenever OBS is running, but
+	 * is created anyway: a missing one would silently cost the log. */
+	char *dir = avatar_config_leaf(true, "logs");
+	if (!dir)
+		return NULL;
+
+	os_mkdirs(dir);
+
+	struct dstr path = {0};
+	dstr_printf(&path, "%s/avatar-worker.log", dir);
+	bfree(dir);
 	return path.array;
 }
 

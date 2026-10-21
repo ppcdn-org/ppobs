@@ -66,6 +66,7 @@ MSG_LOG = 6
 MSG_ERROR = 7
 MSG_BYE = 8
 MSG_CROP = 9
+MSG_MOUTH_GAIN = 10
 
 READY_REAL_MODEL = 1 << 0
 
@@ -306,6 +307,20 @@ class Session:
 
             self.emit_frame(window, window_pts)
 
+    def on_mouth_gain(self, payload: bytes) -> None:
+        if len(payload) != 4:
+            raise ProtocolError(f"MOUTH_GAIN carries {len(payload)} bytes, expected 4")
+
+        (gain,) = struct.unpack("<f", payload)
+
+        # Bounded here as well as in the plugin's slider: this is the process
+        # that would turn a stray value into a face made of artefacts.
+        gain = min(max(gain, 0.0), 4.0)
+
+        if hasattr(self.engine, "mouth_gain"):
+            self.engine.mouth_gain = gain
+            send_log(self.stream, LOG_INFO, f"mouth gain set to {gain:.2f}")
+
     def send_region(self, pixels: bytes, pts_ns: int, rect) -> None:
         """A region goes as CROP for the plugin to composite; rect None means
         the engine produced a whole picture and it goes as FRAME."""
@@ -362,6 +377,8 @@ class Session:
 
             if msg_type == MSG_AUDIO:
                 self.on_audio(payload)
+            elif msg_type == MSG_MOUTH_GAIN:
+                self.on_mouth_gain(payload)
             elif msg_type == MSG_BYE:
                 return
             else:
@@ -449,6 +466,10 @@ def selftest() -> int:
     )
     built = AUDIO_HEADER.pack(1000000000, 2) + struct.pack("<2f", 0.5, -0.25)
     assert built == expected_audio, built.hex()
+
+    # MOUTH_GAIN (type 10): a header for a 4-byte payload, and 2.0f.
+    assert HEADER.pack(4, MSG_MOUTH_GAIN, 0) == bytes.fromhex("04000000" "0A00" "0000")
+    assert struct.pack("<f", 2.0) == bytes.fromhex("00000040")
 
     pts, count = AUDIO_HEADER.unpack_from(expected_audio, 0)
     assert pts == 1000000000 and count == 2

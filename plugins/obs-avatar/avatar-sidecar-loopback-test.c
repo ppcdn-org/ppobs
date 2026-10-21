@@ -210,9 +210,8 @@ int main(void)
 
 	const struct avatar_engine_config cfg = {
 		.asset_path = asset,
-		/* Empty: the test starts the worker itself, which is also how a
-		 * developer drives the skeleton by hand. */
-		.worker_command = "",
+		/* No worker_script: the test starts the worker itself, which is
+		 * also how a developer drives the skeleton by hand. */
 		.fps = TEST_FPS,
 		.sample_rate = TEST_SAMPLE_RATE,
 	};

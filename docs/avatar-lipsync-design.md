@@ -632,7 +632,11 @@ UNet + VAE 的 36 ms 与源图尺寸无关，尺寸只能影响区域合成那�
 - 环回测试 `avatar-sidecar-loopback-test`：编入真客户端、拉起真 worker，跑完整握手、音频
   外发、帧回传、BYE 退出 ✅（实测握手成功、2 秒音频产出 50 帧、0 丢弃、worker 退出码 0）
 - 引擎接到源上 ✅：动态纹理上传、口型驱动模式属性、陈旧帧回退（见 7.4.1）
-- 待做：worker 进程的拉起与退避重拉（`worker_command` 已留好，目前手动启动）
+- worker 进程的拉起与退避重拉 ✅：插件按配置（MuseTalk 目录、Python 解释器、worker 脚本，
+  均可在属性里改）启动 worker，放进 job object（OBS 崩溃时一并收掉），退出后按 1s→30s 的
+  间隔重拉，稳定 10 秒以上重置间隔；worker 输出写到 `logs/avatar-worker.log`。
+  `avatar-sidecar-launch-test` 覆盖：拉起并连上、被外部杀掉后重拉、立即退出时的退避、
+  脚本不存在时不启动、销毁后无残留进程（含 venv 的启动器子进程）
 - 待做：`MuseTalkEngine` 真实推理与头像准备流程
 - 验收：真人头像口型与语音对应，持续 30 分钟不崩
 

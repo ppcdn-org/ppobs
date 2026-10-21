@@ -20,6 +20,12 @@ extern const struct avatar_engine_ops avatar_engine_sidecar_ops;
  * loopback test, which starts a real worker against it. */
 const char *avatar_engine_sidecar_pipe_name(void *data);
 
+/* How far the worker lets the mouth travel, as a multiple of what the model
+ * produces. Safe to call from any thread and never blocks: the value is kept
+ * and handed to the worker by the engine's own writer, now if one is connected
+ * and again after any reconnect. */
+void avatar_engine_sidecar_set_mouth_gain(void *data, float gain);
+
 #ifdef __cplusplus
 }
 #endif

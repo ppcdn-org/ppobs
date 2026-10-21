@@ -32,6 +32,10 @@ extern "C" {
 /* The asset root, whether or not it exists yet.  Caller owns the result. */
 char *avatar_asset_root(void);
 
+/* Where the plugin-started worker's stdout and stderr go, next to OBS's own
+ * logs. The directory is created if needed. Caller owns the result. */
+char *avatar_worker_log_path(void);
+
 /* A subdirectory of the root ("musetalk", say), existing or not.  Caller owns
  * the result. */
 char *avatar_asset_subdir(const char *leaf);

@@ -11,6 +11,7 @@
 #include <util/threading.h>
 
 #include <sys/stat.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define S_IMAGE "avatar_image"
@@ -18,6 +19,17 @@
 #define S_LOG_LEVEL "log_audio_level"
 #define S_MODE "lipsync_mode"
 #define S_FPS "generate_fps"
+
+#define S_AUTO_WORKER "auto_worker"
+#define S_MOUTH_GAIN "mouth_gain"
+#define S_WORKER_PYTHON "worker_python"
+#define S_MUSETALK_DIR "musetalk_dir"
+#define S_WORKER_SCRIPT "worker_script"
+
+/* Where the MuseTalk checkout (code and weights) lives when nothing else says
+ * so; the worker's own --musetalk-dir default is the same place. MUSETALK_DIR
+ * in the environment wins, as it does for the worker. */
+#define AVATAR_DEFAULT_MUSETALK_DIR "D:\\github\\MuseTalk"
 
 #define S_MODE_OFF "off"
 #define S_MODE_SIDECAR "sidecar"
@@ -68,6 +80,11 @@
 #define TEXT_SHOW_MOUTH MT_("Avatar.Mouth.Show")
 #define TEXT_TEETH MT_("Avatar.Mouth.Teeth")
 #define TEXT_TONGUE MT_("Avatar.Mouth.Tongue")
+#define TEXT_AUTO_WORKER MT_("Avatar.Worker.Auto")
+#define TEXT_MOUTH_GAIN MT_("Avatar.Worker.MouthGain")
+#define TEXT_WORKER_PYTHON MT_("Avatar.Worker.Python")
+#define TEXT_MUSETALK_DIR MT_("Avatar.Worker.MuseTalkDir")
+#define TEXT_WORKER_SCRIPT MT_("Avatar.Worker.Script")
 #define TEXT_PIPE MT_("Avatar.Pipe")
 #define TEXT_PIPE_IDLE MT_("Avatar.Pipe.Idle")
 
@@ -135,6 +152,10 @@ struct avatar_source {
 	char *mode;
 	uint32_t fps;
 	int64_t audio_pts;
+
+	/* The worker launch settings joined into one string, so a change to any
+	 * of them is a single comparison rather than four. */
+	char *worker_key;
 
 	/* The generated frame.  The texture and its dimensions belong to the
 	 * graphics thread (video_render); the two flags and the arrival time are
@@ -269,6 +290,18 @@ static void avatar_apply_mouth(struct avatar_source *ctx, obs_data_t *settings)
 	avatar_engine_viseme_set_mouth(engine, &mouth);
 }
 
+/* How far the real-person worker lets the mouth travel.  Pushed to the running
+ * engine, not carried in its config: the worker takes it as a message, so
+ * dragging the slider is not a minute-long restart per notch. */
+static void avatar_apply_gain(struct avatar_source *ctx, obs_data_t *settings)
+{
+	pthread_mutex_lock(&ctx->engine_mutex);
+	if (ctx->ops == &avatar_engine_sidecar_ops && ctx->engine)
+		avatar_engine_sidecar_set_mouth_gain(ctx->engine,
+						     (float)obs_data_get_double(settings, S_MOUTH_GAIN) / 100.0f);
+	pthread_mutex_unlock(&ctx->engine_mutex);
+}
+
 /* ---------------------------------------------------------------------------
  * Placing the mouth with the mouse
  *
@@ -400,23 +433,86 @@ static void *avatar_swap_engine(struct avatar_source *ctx, const struct avatar_e
 	return old;
 }
 
-static void avatar_apply_engine(struct avatar_source *ctx)
+static const char *avatar_default_musetalk_dir(void)
+{
+	const char *env = getenv("MUSETALK_DIR");
+	return (env && *env) ? env : AVATAR_DEFAULT_MUSETALK_DIR;
+}
+
+/* The worker's launch settings as they will be used, with the blanks filled
+ * in: an empty interpreter means the virtualenv MuseTalk was installed into
+ * (it needs that environment's torch and CUDA, which a system Python will not
+ * have), and an empty script means the one in the source tree this build came
+ * from. Empty results stay empty, and the engine then says what is missing. */
+struct avatar_worker_launch {
+	struct dstr python;
+	struct dstr musetalk_dir;
+	struct dstr script;
+	bool enabled;
+};
+
+static void avatar_resolve_worker(obs_data_t *settings, struct avatar_worker_launch *out)
+{
+	memset(out, 0, sizeof(*out));
+
+	out->enabled = obs_data_get_bool(settings, S_AUTO_WORKER);
+
+	dstr_copy(&out->musetalk_dir, obs_data_get_string(settings, S_MUSETALK_DIR));
+	dstr_replace(&out->musetalk_dir, "/", "\\");
+
+	dstr_copy(&out->python, obs_data_get_string(settings, S_WORKER_PYTHON));
+	if (dstr_is_empty(&out->python) && !dstr_is_empty(&out->musetalk_dir)) {
+		struct dstr venv = {0};
+		dstr_printf(&venv, "%s\\venv\\Scripts\\python.exe", out->musetalk_dir.array);
+		if (os_file_exists(venv.array))
+			dstr_copy_dstr(&out->python, &venv);
+		dstr_free(&venv);
+	}
+
+	dstr_copy(&out->script, obs_data_get_string(settings, S_WORKER_SCRIPT));
+#ifdef AVATAR_DEFAULT_WORKER_SCRIPT
+	if (dstr_is_empty(&out->script))
+		dstr_copy(&out->script, AVATAR_DEFAULT_WORKER_SCRIPT);
+#endif
+	dstr_replace(&out->script, "/", "\\");
+}
+
+static void avatar_free_worker(struct avatar_worker_launch *launch)
+{
+	dstr_free(&launch->python);
+	dstr_free(&launch->musetalk_dir);
+	dstr_free(&launch->script);
+}
+
+static void avatar_apply_engine(struct avatar_source *ctx, obs_data_t *settings)
 {
 	const struct avatar_engine_ops *ops = avatar_ops_for_mode(ctx->mode);
 	void *engine = NULL;
 
 	if (ops) {
+		struct avatar_worker_launch worker;
+		avatar_resolve_worker(settings, &worker);
+
+		/* Only the worker engine has a process to start; the sprite engine
+		 * would ignore these, but handing them over would suggest it
+		 * might. */
+		const bool launch = ops == &avatar_engine_sidecar_ops && worker.enabled;
+		char *log_path = launch ? avatar_worker_log_path() : NULL;
+
 		const struct avatar_engine_config cfg = {
 			.asset_path = ctx->image_path ? ctx->image_path : "",
-			/* Launching the worker is still to come; until then the
-			 * pipe waits for one started by hand, which is also the
-			 * most debuggable way to drive the skeleton. */
-			.worker_command = "",
+			.worker_script = launch ? worker.script.array : NULL,
+			.worker_python = launch ? worker.python.array : NULL,
+			.musetalk_dir = launch ? worker.musetalk_dir.array : NULL,
+			.worker_log = log_path,
 			.fps = ctx->fps,
 			.sample_rate = AVATAR_TAP_SAMPLE_RATE,
+			.mouth_gain = (float)obs_data_get_double(settings, S_MOUTH_GAIN) / 100.0f,
 		};
 
 		engine = ops->create(&cfg, ctx->source);
+		bfree(log_path);
+		avatar_free_worker(&worker);
 		if (!engine) {
 			blog(LOG_ERROR, "[obs-avatar: '%s'] could not start the '%s' engine",
 			     obs_source_get_name(ctx->source), ops->id);
@@ -451,6 +547,17 @@ static void avatar_source_update(void *data, obs_data_t *settings)
 	const bool mode_changed = !ctx->mode || strcmp(ctx->mode, mode) != 0;
 	const bool fps_changed = ctx->fps != fps;
 
+	struct dstr worker_key = {0};
+	dstr_printf(&worker_key, "%d|%s|%s|%s", (int)obs_data_get_bool(settings, S_AUTO_WORKER),
+		    obs_data_get_string(settings, S_WORKER_PYTHON), obs_data_get_string(settings, S_MUSETALK_DIR),
+		    obs_data_get_string(settings, S_WORKER_SCRIPT));
+	const bool worker_changed = !ctx->worker_key || strcmp(ctx->worker_key, worker_key.array) != 0;
+	if (worker_changed) {
+		bfree(ctx->worker_key);
+		ctx->worker_key = bstrdup(worker_key.array);
+	}
+	dstr_free(&worker_key);
+
 	if (image_changed) {
 		bfree(ctx->image_path);
 		ctx->image_path = bstrdup(path);
@@ -470,14 +577,16 @@ static void avatar_source_update(void *data, obs_data_t *settings)
 	/* The asset path and frame rate are negotiated in the handshake, so a
 	 * change to either has to be renegotiated.  That drops the worker and
 	 * waits for it to reconnect, which is the predictable behaviour even if
-	 * it is not the cheapest. */
-	if (mode_changed || fps_changed || image_changed)
-		avatar_apply_engine(ctx);
+	 * it is not the cheapest.  How the worker is launched is only read when
+	 * it is started, so changing that restarts it too. */
+	if (mode_changed || fps_changed || image_changed || worker_changed)
+		avatar_apply_engine(ctx, settings);
 
 	/* After the engine exists, and on every edit: the mouth sliders are
 	 * dragged live, so they are pushed onto the running engine rather than
 	 * carried in the config and costing a restart per pixel moved. */
 	avatar_apply_mouth(ctx, settings);
+	avatar_apply_gain(ctx, settings);
 }
 
 static void *avatar_source_create(obs_data_t *settings, obs_source_t *source)
@@ -527,6 +636,7 @@ static void avatar_source_destroy(void *data)
 
 	bfree(ctx->drain);
 	bfree(ctx->mode);
+	bfree(ctx->worker_key);
 	bfree(ctx->image_path);
 	bfree(ctx);
 }
@@ -906,7 +1016,16 @@ static void avatar_source_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, S_AUDIO_SOURCE, "none");
 	obs_data_set_default_string(settings, S_MODE, S_MODE_OFF);
-	obs_data_set_default_int(settings, S_FPS, 25);
+	/* MuseTalk costs about 40 ms a frame on an RTX 4060 with nothing else on
+	 * the GPU, so 25 fps is already no headroom and 30 is slower than real
+	 * time.  A worker that cannot keep up drops audio and the mouth lags and
+	 * skips; 20 leaves room for OBS's own encoders to share the card. */
+	obs_data_set_default_int(settings, S_FPS, 20);
+	/* Measured on this model: at 1.0 the mouth barely opens on most faces, 2.0
+	 * is clearly visible, and by 3.0 the lip edges start to show artefacts. */
+	obs_data_set_default_double(settings, S_MOUTH_GAIN, 200.0);
+	obs_data_set_default_bool(settings, S_AUTO_WORKER, true);
+	obs_data_set_default_string(settings, S_MUSETALK_DIR, avatar_default_musetalk_dir());
 
 	/* Lower-middle of the frame, which is where a mouth is on most
 	 * head-and-shoulders artwork.  It will not be right for any particular
@@ -955,6 +1074,11 @@ static bool avatar_mode_modified(obs_properties_t *props, obs_property_t *proper
 
 	obs_property_set_visible(obs_properties_get(props, S_FPS), sidecar);
 
+	static const char *const worker_props[] = {S_AUTO_WORKER,    S_MOUTH_GAIN,    S_MUSETALK_DIR,
+						   S_WORKER_PYTHON, S_WORKER_SCRIPT};
+	for (size_t i = 0; i < sizeof(worker_props) / sizeof(worker_props[0]); i++)
+		obs_property_set_visible(obs_properties_get(props, worker_props[i]), sidecar);
+
 	static const char *const mouth_props[] = {"mouth_hint", S_MOUTH_X,      S_MOUTH_Y,     S_MOUTH_W,
 						  S_MOUTH_H,    S_MOUTH_TRAVEL, S_SENSITIVITY, S_TEETH,
 						  S_TONGUE,     S_SHOW_MOUTH};
@@ -992,6 +1116,16 @@ static obs_properties_t *avatar_source_properties(void *data)
 	obs_property_list_add_int(fps, "20", 20);
 	obs_property_list_add_int(fps, "25", 25);
 	obs_property_list_add_int(fps, "30", 30);
+
+	/* Mode A's worker.  Off means "I start it myself", the way to watch its
+	 * console; the pipe to point it at is shown further down.  An empty
+	 * interpreter or script is not an error - each has a default, resolved
+	 * when the worker is launched. */
+	obs_properties_add_bool(props, S_AUTO_WORKER, TEXT_AUTO_WORKER);
+	obs_properties_add_float_slider(props, S_MOUTH_GAIN, TEXT_MOUTH_GAIN, 50.0, 300.0, 5.0);
+	obs_properties_add_path(props, S_MUSETALK_DIR, TEXT_MUSETALK_DIR, OBS_PATH_DIRECTORY, NULL, NULL);
+	obs_properties_add_path(props, S_WORKER_PYTHON, TEXT_WORKER_PYTHON, OBS_PATH_FILE, "python.exe (*.exe)", NULL);
+	obs_properties_add_path(props, S_WORKER_SCRIPT, TEXT_WORKER_SCRIPT, OBS_PATH_FILE, "Python (*.py)", NULL);
 
 	/* Mode B's mouth.  There is no detecting where an animal's mouth is -
 	 * that is exactly what MuseTalk's face parsing cannot do either - so

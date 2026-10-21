@@ -165,6 +165,11 @@ class MuseTalkEngine:
         self._cycle_pos = 0
         self.stage_us = {"whisper": 0, "unet": 0, "vae": 0, "blend": 0}
         self.decode_start = self.avatar["decode_start_latent"] if self.half_decode else 0
+
+        # How far the mouth is allowed to travel, as a multiple of what the
+        # model produces. See _amplify. Settable while running.
+        self.mouth_gain = 1.0
+        self._rest = self._silent_prediction()
         print(
             f"[musetalk] ready: {self.width}x{self.height}, cycle {self.cycle_length} frames, "
             f"decoding latent rows {self.decode_start}..{self.LATENT_ROWS}",
@@ -417,6 +422,73 @@ class MuseTalkEngine:
 
             buffer_pts += int(self.window_samples * 1_000_000_000 / self.sample_rate)
 
+    def _silent_prediction(self):
+        """What the UNet produces for each cycle position when nobody is
+        speaking: the mouth's resting look, in latent space.
+
+        MuseTalk v1.5 moves the mouth only a little on many faces, and there is
+        no knob in the model for more. Turning the audio up does nothing - the
+        Whisper features are normalised - so the amplitude has to be scaled
+        after the fact, and scaling is only meaningful relative to a rest
+        state. Averaged over the window's frames because silence still gives
+        slightly different features frame to frame.
+        """
+        torch = self._torch
+        from musetalk.utils.utils import datagen
+
+        silence = np.zeros(self.window_samples, dtype=np.float32)
+
+        with torch.no_grad():
+            with tempfile.TemporaryDirectory() as tmp:
+                wav_path = Path(tmp) / "silence.wav"
+                _write_wav(wav_path, silence, self.sample_rate)
+                features, librosa_length = self.audio_processor.get_audio_feature(str(wav_path))
+                chunks = self.audio_processor.get_whisper_chunk(
+                    features, self.device, self.weight_dtype, self.whisper, librosa_length, fps=self.fps
+                )
+
+            sums = [None] * self.cycle_length
+            counts = [0] * self.cycle_length
+            done = 0
+            for whisper_batch, latent_batch in datagen(
+                chunks, self.avatar["input_latent_list_cycle"], self.batch_size, device=self.device
+            ):
+                audio_features = self.pe(whisper_batch.to(self.device))
+                latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
+                pred = self.unet.model(latent_batch, self.timesteps, encoder_hidden_states=audio_features).sample
+
+                for j in range(pred.shape[0]):
+                    idx = (done + j) % self.cycle_length
+                    item = pred[j].float()
+                    sums[idx] = item if sums[idx] is None else sums[idx] + item
+                    counts[idx] += 1
+                done += pred.shape[0]
+
+            rest = [
+                (sums[i] / counts[i]).to(self.unet.model.dtype) if counts[i] else None for i in range(self.cycle_length)
+            ]
+            if any(r is None for r in rest):
+                return None
+            return torch.stack(rest)
+
+    def _amplify(self, pred, first_index: int):
+        """Scales how far the prediction strays from the silent one.
+
+        `rest + gain * (pred - rest)`: at 1.0 this is the model unchanged, above
+        1.0 the mouth opens wider than the model chose to, below it narrower.
+        Done on the latent rather than on pixels because the latent's offset
+        from rest is a change of mouth *shape*, so scaling it keeps the result
+        a plausible mouth, where scaling pixels would just fade two mouths into
+        each other.
+        """
+        gain = self.mouth_gain
+        if gain == 1.0 or self._rest is None:
+            return pred
+
+        indices = [(first_index + j) % self.cycle_length for j in range(pred.shape[0])]
+        rest = self._rest[indices]
+        return rest + gain * (pred - rest)
+
     def _run_window(self, window: np.ndarray):
         """Per-stage timings land in self.stage_us.
 
@@ -450,6 +522,7 @@ class MuseTalkEngine:
                 audio_features = self.pe(whisper_batch.to(self.device))
                 latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
                 pred = self.unet.model(latent_batch, self.timesteps, encoder_hidden_states=audio_features).sample
+                pred = self._amplify(pred, produced)
                 pred = pred.to(device=self.device, dtype=self.vae.vae.dtype)
                 torch.cuda.synchronize() if self.device.type == "cuda" else None
                 self.stage_us["unet"] += int((_time.perf_counter() - started) * 1e6)

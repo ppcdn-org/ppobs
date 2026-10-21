@@ -34,6 +34,15 @@ target_link_libraries(obs-avatar PRIVATE OBS::libobs $<$<PLATFORM_ID:Windows>:OB
 
 set_target_properties_obs(obs-avatar PROPERTIES FOLDER plugins PREFIX "")
 
+# The worker the source launches when its own "worker script" setting is empty.
+# It stays in the source tree rather than the installer - see
+# tools/musetalk-sidecar/README.md - so a build made elsewhere points at a path
+# that does not exist there, which the engine reports instead of guessing.
+target_compile_definitions(
+  obs-avatar
+  PRIVATE AVATAR_DEFAULT_WORKER_SCRIPT="${CMAKE_SOURCE_DIR}/tools/musetalk-sidecar/ppobs_avatar_worker.py"
+)
+
 if(ENABLE_TEST_INPUT)
   # The ring buffer and level maths are static inline in avatar-audio-tap.h
   # precisely so this test does not have to link avatar-audio-tap.c, which
@@ -73,4 +82,16 @@ if(ENABLE_TEST_INPUT)
   )
   add_test(NAME avatar-sidecar-loopback COMMAND avatar-sidecar-loopback-test)
   set_target_properties(avatar-sidecar-loopback-test PROPERTIES FOLDER tests)
+
+  # The engine starting, watching and relaunching the worker itself, which the
+  # loopback test sidesteps by starting the worker by hand. Same needs, same
+  # skip when there is no interpreter.
+  add_executable(avatar-sidecar-launch-test avatar-sidecar-launch-test.c avatar-engine-sidecar.c)
+  target_link_libraries(avatar-sidecar-launch-test PRIVATE OBS::libobs OBS::w32-pthreads)
+  target_compile_definitions(
+    avatar-sidecar-launch-test
+    PRIVATE AVATAR_WORKER_SCRIPT="${CMAKE_SOURCE_DIR}/tools/musetalk-sidecar/ppobs_avatar_worker.py"
+  )
+  add_test(NAME avatar-sidecar-launch COMMAND avatar-sidecar-launch-test)
+  set_target_properties(avatar-sidecar-launch-test PROPERTIES FOLDER tests)
 endif()

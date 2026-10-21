@@ -50,6 +50,22 @@ static void test_audio_payload_fixture(void)
 	CHECK(avatar_get_f32(expected + 16) == -0.25f);
 }
 
+static void test_mouth_gain_fixture(void)
+{
+	/* MOUTH_GAIN (type 10), a single float32: 2.0f. */
+	static const uint8_t expected_header[AVATAR_MSG_HEADER_SIZE] = {0x04, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00};
+	static const uint8_t expected_payload[AVATAR_MOUTH_GAIN_PAYLOAD_SIZE] = {0x00, 0x00, 0x00, 0x40};
+
+	uint8_t header[AVATAR_MSG_HEADER_SIZE];
+	avatar_msg_header_write(header, AVATAR_MSG_MOUTH_GAIN, AVATAR_MOUTH_GAIN_PAYLOAD_SIZE);
+	CHECK(memcmp(header, expected_header, sizeof(header)) == 0);
+
+	uint8_t payload[AVATAR_MOUTH_GAIN_PAYLOAD_SIZE];
+	avatar_put_f32(payload, 2.0f);
+	CHECK(memcmp(payload, expected_payload, sizeof(payload)) == 0);
+	CHECK(avatar_get_f32(expected_payload) == 2.0f);
+}
+
 static void test_scalar_round_trip(void)
 {
 	uint8_t buf[8];
@@ -210,6 +226,7 @@ int main(void)
 {
 	test_header_fixture();
 	test_audio_payload_fixture();
+	test_mouth_gain_fixture();
 	test_scalar_round_trip();
 	test_header_rejects_bad_input();
 	test_header_accepts_unknown_type();
