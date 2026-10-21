@@ -1,5 +1,6 @@
 #include "avatar-source.h"
 #include "avatar-assets.h"
+#include "avatar-blink.h"
 #include "avatar-audio-tap.h"
 #include "avatar-engine-sidecar.h"
 #include "avatar-engine-viseme.h"
@@ -11,6 +12,7 @@
 #include <util/threading.h>
 
 #include <sys/stat.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -21,6 +23,11 @@
 #define S_FPS "generate_fps"
 
 #define S_AUTO_WORKER "auto_worker"
+#define S_BLINK "blink"
+#define S_AUTO_SYNC "auto_sync"
+#define S_SYNC_RESTORE_SOURCE "_sync_restore_source"
+#define S_SYNC_RESTORE_MS "_sync_restore_ms"
+#define S_IDLE_MOTION "idle_motion"
 #define S_MOUTH_GAIN "mouth_gain"
 #define S_WORKER_PYTHON "worker_python"
 #define S_MUSETALK_DIR "musetalk_dir"
@@ -83,6 +90,9 @@
 #define TEXT_TEETH MT_("Avatar.Mouth.Teeth")
 #define TEXT_TONGUE MT_("Avatar.Mouth.Tongue")
 #define TEXT_AUTO_WORKER MT_("Avatar.Worker.Auto")
+#define TEXT_BLINK MT_("Avatar.Blink")
+#define TEXT_AUTO_SYNC MT_("Avatar.AutoSync")
+#define TEXT_IDLE_MOTION MT_("Avatar.IdleMotion")
 #define TEXT_MOUTH_GAIN MT_("Avatar.Worker.MouthGain")
 #define TEXT_WORKER_PYTHON MT_("Avatar.Worker.Python")
 #define TEXT_MUSETALK_DIR MT_("Avatar.Worker.MuseTalkDir")
@@ -159,6 +169,36 @@ struct avatar_source {
 	 * of them is a single comparison rather than four. */
 	char *worker_key;
 
+	/* How much the whole avatar breathes and sways while idle, as a multiple
+	 * of the default, and when the source was created: the motion is a
+	 * function of time since then, so it never needs to be stepped. */
+	float idle_motion;
+	uint64_t start_ns;
+
+	/* The eyes blink on their own timing, over whatever the engine drew. */
+	bool blink_enabled;
+	struct avatar_blink blink;
+
+	/* The picture of the mouth is a second or two behind the voice it was
+	 * made from, however well it is made. The voice that goes out is made to
+	 * wait by the same amount, through the sync offset of the audio source the
+	 * mouth is driven by: the capture that feeds the worker takes its audio as it
+	 * comes in, before that delay is applied, so delaying the mix does not delay
+	 * the mouth's input as well. The offset is the one thing here that belongs
+	 * to a source other than this one, so the original is remembered - in memory
+	 * and in this source's settings, to survive a restart - and put back whenever
+	 * this stops managing it. */
+	bool auto_sync;
+	char *audio_source_name;
+	char *sync_source;
+	int64_t sync_original_ns;
+	int64_t sync_applied_ns;
+	bool sync_active;
+	bool sync_user_took_over;
+	double lag_ema_ms;
+	int lag_samples;
+	uint64_t sync_check_ns;
+
 	/* The generated frame.  The texture and its dimensions belong to the
 	 * graphics thread (video_render); the two flags and the arrival time are
 	 * also read by the video thread's staleness check, so they are atomic
@@ -177,6 +217,7 @@ struct avatar_source {
  * turn source coordinates into fractions of the artwork. */
 static uint32_t avatar_source_get_width(void *data);
 static uint32_t avatar_source_get_height(void *data);
+static void avatar_sync_restore(struct avatar_source *ctx);
 
 /* Clears the accumulated summary back to "nothing heard". */
 static void avatar_reset_pending(struct avatar_source *ctx)
@@ -585,7 +626,23 @@ static void avatar_source_update(void *data, obs_data_t *settings)
 	ctx->fps = fps;
 	ctx->log_level = obs_data_get_bool(settings, S_LOG_LEVEL);
 
-	avatar_audio_tap_set_source(ctx->tap, obs_data_get_string(settings, S_AUDIO_SOURCE));
+	const char *audio_source = obs_data_get_string(settings, S_AUDIO_SOURCE);
+	const bool auto_sync = obs_data_get_bool(settings, S_AUTO_SYNC);
+
+	/* Another source, or none, or the feature off: the one that was being
+	 * managed is put back before anything else happens. */
+	if (ctx->sync_active && (!auto_sync || !ctx->audio_source_name || strcmp(ctx->audio_source_name, audio_source) != 0))
+		avatar_sync_restore(ctx);
+	if (!auto_sync || !ctx->audio_source_name || strcmp(ctx->audio_source_name, audio_source) != 0)
+		ctx->sync_user_took_over = false;
+
+	bfree(ctx->audio_source_name);
+	ctx->audio_source_name = bstrdup(audio_source);
+	ctx->auto_sync = auto_sync;
+
+	avatar_audio_tap_set_source(ctx->tap, audio_source);
+	ctx->idle_motion = (float)obs_data_get_double(settings, S_IDLE_MOTION) / 100.0f;
+	ctx->blink_enabled = obs_data_get_bool(settings, S_BLINK);
 
 	/* The asset path and frame rate are negotiated in the handshake, so a
 	 * change to either has to be renegotiated.  That drops the worker and
@@ -606,6 +663,8 @@ static void *avatar_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct avatar_source *ctx = bzalloc(sizeof(*ctx));
 	ctx->source = source;
+	ctx->start_ns = os_gettime_ns();
+	avatar_blink_init(&ctx->blink, ctx->start_ns);
 	ctx->drain = bmalloc(AVATAR_DRAIN_CHUNK * sizeof(float));
 	avatar_reset_pending(ctx);
 
@@ -633,6 +692,11 @@ static void avatar_source_destroy(void *data)
 {
 	struct avatar_source *ctx = data;
 
+	/* Put back whether this source is being deleted or OBS is exiting: at exit
+	 * the scene has already been saved with the managed offset and the original
+	 * in this source's settings, so the next start takes it up again. */
+	avatar_sync_restore(ctx);
+
 	const struct avatar_engine_ops *old_ops = NULL;
 	void *old = avatar_swap_engine(ctx, NULL, NULL, &old_ops);
 	if (old_ops && old)
@@ -643,6 +707,7 @@ static void avatar_source_destroy(void *data)
 
 	obs_enter_graphics();
 	gs_texture_destroy(ctx->texture);
+	avatar_blink_free(&ctx->blink);
 	obs_leave_graphics();
 
 	pthread_mutex_destroy(&ctx->engine_mutex);
@@ -650,6 +715,8 @@ static void avatar_source_destroy(void *data)
 	bfree(ctx->drain);
 	bfree(ctx->mode);
 	bfree(ctx->worker_key);
+	bfree(ctx->audio_source_name);
+	bfree(ctx->sync_source);
 	bfree(ctx->image_path);
 	bfree(ctx);
 }
@@ -811,12 +878,97 @@ static bool avatar_render_engine(struct avatar_source *ctx, gs_texture_t *base, 
 	return drawn;
 }
 
+/* A person is never perfectly still, and a photograph that is reads as a
+ * photograph however well the mouth moves. The pose is a slow breath plus two
+ * unrelated slow sways, so it never visibly repeats, small enough that it
+ * reads as a person sitting rather than as the picture being moved:
+ *
+ *   rotation  up to about 0.6 degrees
+ *   shift     up to 0.25% of the width, 0.2% of the height
+ *   scale     breathing, plus or minus 0.4%
+ *
+ * It is a transform of everything the source draws - artwork and the mouth
+ * painted onto it alike - so nothing can slip against anything else. The pivot
+ * is low in the frame, which is where the shoulders are: the head swings more
+ * than the body, the way it does on a person. */
+static void avatar_idle_pose(float amount, double t, float *rotation, float *shift_x, float *shift_y, float *scale)
+{
+	const double tau = 6.283185307179586;
+	const double breath = sin(tau * t / 4.2);
+	const double sway_a = sin(tau * t / 7.3 + 1.3);
+	const double sway_b = sin(tau * t / 11.9 + 0.4);
+
+	*rotation = amount * (float)(0.35 * sway_a + 0.25 * sway_b) * 0.0174532925f;
+	*shift_x = amount * (float)(0.0025 * (0.6 * sway_b + 0.4 * sway_a));
+	*shift_y = amount * (float)(0.0020 * breath);
+	*scale = 1.0f + amount * (float)(0.004 * breath);
+}
+
+static void avatar_source_render_content(struct avatar_source *ctx);
+
+/* The lids go over whatever the engine drew, in the same transform, so they stay
+ * on the eyes through the idle sway. Nothing is drawn between blinks, and
+ * nothing without eyes: an engine that has not found a face (the sprite mode, a
+ * worker not yet connected) simply does not blink. */
+static void avatar_source_draw_blink(struct avatar_source *ctx)
+{
+	if (!ctx->blink_enabled || !ctx->image_loaded)
+		return;
+
+	struct avatar_eyes eyes = {0};
+
+	pthread_mutex_lock(&ctx->engine_mutex);
+	const bool have = ctx->ops == &avatar_engine_sidecar_ops && ctx->engine &&
+			  avatar_engine_sidecar_get_eyes(ctx->engine, &eyes);
+	pthread_mutex_unlock(&ctx->engine_mutex);
+
+	if (!have)
+		return;
+
+	const float amount = avatar_blink_amount(&ctx->blink, os_gettime_ns());
+	if (amount <= 0.0f)
+		return;
+
+	struct gs_image_file *const image = &ctx->if4.image3.image2.image;
+	avatar_blink_draw(&ctx->blink, image->texture, image->cx, image->cy, &eyes, amount);
+}
+
 static void avatar_source_render(void *data, gs_effect_t *unused)
 {
 	struct avatar_source *ctx = data;
 
 	UNUSED_PARAMETER(unused);
 
+	if (ctx->idle_motion <= 0.0f) {
+		avatar_source_render_content(ctx);
+		avatar_source_draw_blink(ctx);
+		return;
+	}
+
+	const float cx = (float)avatar_source_get_width(ctx);
+	const float cy = (float)avatar_source_get_height(ctx);
+
+	float rotation, shift_x, shift_y, scale;
+	avatar_idle_pose(ctx->idle_motion, (double)(os_gettime_ns() - ctx->start_ns) / 1e9, &rotation, &shift_x,
+			 &shift_y, &scale);
+
+	const float pivot_x = cx * 0.5f;
+	const float pivot_y = cy * 0.95f;
+
+	gs_matrix_push();
+	gs_matrix_translate3f(pivot_x + shift_x * cx, pivot_y + shift_y * cy, 0.0f);
+	gs_matrix_rotaa4f(0.0f, 0.0f, 1.0f, rotation);
+	gs_matrix_scale3f(scale, scale, 1.0f);
+	gs_matrix_translate3f(-pivot_x, -pivot_y, 0.0f);
+
+	avatar_source_render_content(ctx);
+	avatar_source_draw_blink(ctx);
+
+	gs_matrix_pop();
+}
+
+static void avatar_source_render_content(struct avatar_source *ctx)
+{
 	const uint32_t cx = avatar_source_get_width(ctx);
 	const uint32_t cy = avatar_source_get_height(ctx);
 
@@ -992,9 +1144,13 @@ static void avatar_check_stale(struct avatar_source *ctx)
 {
 	pthread_mutex_lock(&ctx->engine_mutex);
 	const bool running = ctx->ops != NULL;
+	/* An engine that draws for itself says when it has gone stale; this count
+	 * of when the source last uploaded a frame would be reporting on a frame
+	 * it never sees. */
+	const bool engine_reports_itself = running && ctx->ops->render != NULL;
 	pthread_mutex_unlock(&ctx->engine_mutex);
 
-	if (!running || !os_atomic_load_bool(&ctx->have_frame) || os_atomic_load_bool(&ctx->stale_logged))
+	if (!running || engine_reports_itself || !os_atomic_load_bool(&ctx->have_frame) || os_atomic_load_bool(&ctx->stale_logged))
 		return;
 
 	if (avatar_frame_fresh(ctx))
@@ -1005,6 +1161,160 @@ static void avatar_check_stale(struct avatar_source *ctx)
 	     obs_source_get_name(ctx->source), (unsigned long long)(AVATAR_FRAME_STALE_NS / 1000000ULL));
 }
 
+/* Puts the audio source's sync offset back as it was before it was managed,
+ * unless someone has changed it since - their change is theirs. */
+static void avatar_sync_restore(struct avatar_source *ctx)
+{
+	if (ctx->sync_active && ctx->sync_source) {
+		obs_source_t *src = obs_get_source_by_name(ctx->sync_source);
+		if (src) {
+			if (obs_source_get_sync_offset(src) == ctx->sync_applied_ns) {
+				obs_source_set_sync_offset(src, ctx->sync_original_ns);
+				blog(LOG_INFO, "[obs-avatar: '%s'] put the sync offset of '%s' back to %lld ms",
+				     obs_source_get_name(ctx->source), ctx->sync_source,
+				     (long long)(ctx->sync_original_ns / 1000000));
+			}
+			obs_source_release(src);
+		}
+	}
+
+	if (ctx->sync_active) {
+		obs_data_t *settings = obs_source_get_settings(ctx->source);
+		obs_data_unset_user_value(settings, S_SYNC_RESTORE_SOURCE);
+		obs_data_unset_user_value(settings, S_SYNC_RESTORE_MS);
+		obs_data_release(settings);
+	}
+
+	ctx->sync_active = false;
+	bfree(ctx->sync_source);
+	ctx->sync_source = NULL;
+	ctx->lag_samples = 0;
+	ctx->lag_ema_ms = 0.0;
+}
+
+/* Measures how far behind the voice the mouth is on screen and makes the voice
+ * wait that long. Once a second at most, and only when it has settled: every
+ * change of an audio source's offset is a click, so it is made when the
+ * measurement has been steady for a while and has moved by more than 150 ms,
+ * not chased. */
+static void avatar_update_sync(struct avatar_source *ctx)
+{
+	const uint64_t now = os_gettime_ns();
+	if (now - ctx->sync_check_ns < 1000000000ULL)
+		return;
+	ctx->sync_check_ns = now;
+
+	const char *name = ctx->audio_source_name;
+	const bool have_source = name && *name && strcmp(name, "none") != 0;
+
+	pthread_mutex_lock(&ctx->engine_mutex);
+	const bool sidecar = ctx->ops == &avatar_engine_sidecar_ops && ctx->engine;
+	struct avatar_engine_stats stats = {0};
+	if (sidecar)
+		avatar_engine_sidecar_ops.get_stats(ctx->engine, &stats);
+	const int64_t audio_pts = ctx->audio_pts;
+	pthread_mutex_unlock(&ctx->engine_mutex);
+
+	if (!ctx->auto_sync || !sidecar || !have_source) {
+		avatar_sync_restore(ctx);
+		return;
+	}
+
+	/* The source this was managing is no longer the one being driven. */
+	if (ctx->sync_active && ctx->sync_source && strcmp(ctx->sync_source, name) != 0)
+		avatar_sync_restore(ctx);
+
+	if (ctx->sync_user_took_over)
+		return;
+
+	if (!stats.connected || !stats.shown || !avatar_audio_tap_attached(ctx->tap)) {
+		ctx->lag_samples = 0;
+		return;
+	}
+
+	const double lag_ms = (double)(audio_pts - stats.shown_pts_ns) / 1000000.0;
+	if (lag_ms < 0.0 || lag_ms > 8000.0)
+		return;
+
+	if (!ctx->lag_samples || fabs(lag_ms - ctx->lag_ema_ms) > 1000.0) {
+		ctx->lag_ema_ms = lag_ms;
+		ctx->lag_samples = 1;
+	} else {
+		ctx->lag_ema_ms = 0.8 * ctx->lag_ema_ms + 0.2 * lag_ms;
+		ctx->lag_samples++;
+	}
+
+	/* The first seconds after the worker connects are not representative: the
+	 * queue is filling and the rate may still be coming down. Half a minute of
+	 * samples is cheap next to setting the offset twice. */
+	if (ctx->lag_samples < 15)
+		return;
+
+	const int64_t target_ns = (int64_t)floor(ctx->lag_ema_ms / 50.0 + 0.5) * 50 * 1000000LL;
+
+	obs_source_t *src = obs_get_source_by_name(name);
+	if (!src)
+		return;
+
+	const int64_t current = obs_source_get_sync_offset(src);
+
+	if (!ctx->sync_active) {
+		/* A scene saved while this was managing the offset carries our value; the
+		 * original is in this source's own settings. */
+		obs_data_t *settings = obs_source_get_settings(ctx->source);
+		const char *saved_source = obs_data_get_string(settings, S_SYNC_RESTORE_SOURCE);
+
+		if (saved_source && strcmp(saved_source, name) == 0) {
+			ctx->sync_original_ns = obs_data_get_int(settings, S_SYNC_RESTORE_MS) * 1000000LL;
+			ctx->sync_source = bstrdup(name);
+			ctx->sync_applied_ns = current;
+			ctx->sync_active = true;
+		}
+		obs_data_release(settings);
+	}
+
+	if (ctx->sync_active && current != ctx->sync_applied_ns) {
+		/* Someone moved it by hand. That is a decision, not noise. */
+		blog(LOG_INFO, "[obs-avatar: '%s'] the sync offset of '%s' was changed by hand; leaving it alone",
+		     obs_source_get_name(ctx->source), name);
+		ctx->sync_active = false;
+		ctx->sync_user_took_over = true;
+		bfree(ctx->sync_source);
+		ctx->sync_source = NULL;
+		obs_source_release(src);
+		return;
+	}
+
+	const int64_t diff = target_ns > current ? target_ns - current : current - target_ns;
+	if (ctx->sync_active && diff < 150000000LL) {
+		obs_source_release(src);
+		return;
+	}
+
+	if (!ctx->sync_active) {
+		ctx->sync_original_ns = current;
+		ctx->sync_source = bstrdup(name);
+
+		obs_data_t *settings = obs_source_get_settings(ctx->source);
+		obs_data_set_string(settings, S_SYNC_RESTORE_SOURCE, name);
+		obs_data_set_int(settings, S_SYNC_RESTORE_MS, current / 1000000LL);
+		obs_data_release(settings);
+	}
+
+	obs_source_set_sync_offset(src, target_ns);
+	ctx->sync_applied_ns = target_ns;
+	const int64_t previous_ns = current;
+	ctx->sync_active = true;
+
+	blog(LOG_INFO,
+	     "[obs-avatar: '%s'] the mouth is %.0f ms behind the voice; set the sync offset of '%s' to %lld ms so the voice "
+	     "waits for it (was %lld ms, originally %lld ms)",
+	     obs_source_get_name(ctx->source), ctx->lag_ema_ms, name, (long long)(target_ns / 1000000),
+	     (long long)(previous_ns / 1000000), (long long)(ctx->sync_original_ns / 1000000));
+
+	obs_source_release(src);
+}
+
 static void avatar_source_tick(void *data, float seconds)
 {
 	struct avatar_source *ctx = data;
@@ -1012,6 +1322,7 @@ static void avatar_source_tick(void *data, float seconds)
 	avatar_audio_tap_tick(ctx->tap);
 	avatar_report_audio(ctx, avatar_drain_audio(ctx));
 	avatar_check_stale(ctx);
+	avatar_update_sync(ctx);
 
 	if (!obs_source_showing(ctx->source))
 		return;
@@ -1056,6 +1367,9 @@ static void avatar_source_defaults(obs_data_t *settings)
 	 * is clearly visible, and by 3.0 the lip edges start to show artefacts. */
 	obs_data_set_default_double(settings, S_MOUTH_GAIN, 200.0);
 	obs_data_set_default_bool(settings, S_AUTO_WORKER, true);
+	obs_data_set_default_bool(settings, S_BLINK, true);
+	obs_data_set_default_bool(settings, S_AUTO_SYNC, true);
+	obs_data_set_default_double(settings, S_IDLE_MOTION, 100.0);
 	obs_data_set_default_string(settings, S_MUSETALK_DIR, avatar_default_musetalk_dir());
 
 	/* Lower-middle of the frame, which is where a mouth is on most
@@ -1105,8 +1419,9 @@ static bool avatar_mode_modified(obs_properties_t *props, obs_property_t *proper
 
 	obs_property_set_visible(obs_properties_get(props, S_FPS), sidecar);
 
-	static const char *const worker_props[] = {S_AUTO_WORKER,    S_MOUTH_GAIN,    S_MUSETALK_DIR,
-						   S_WORKER_PYTHON, S_WORKER_SCRIPT};
+	static const char *const worker_props[] = {S_AUTO_WORKER,   S_AUTO_SYNC,     S_BLINK,
+						   S_MOUTH_GAIN,    S_MUSETALK_DIR,  S_WORKER_PYTHON,
+						   S_WORKER_SCRIPT};
 	for (size_t i = 0; i < sizeof(worker_props) / sizeof(worker_props[0]); i++)
 		obs_property_set_visible(obs_properties_get(props, worker_props[i]), sidecar);
 
@@ -1134,6 +1449,8 @@ static obs_properties_t *avatar_source_properties(void *data)
 	obs_property_list_add_string(sources, TEXT_AUDIO_SOURCE_NONE, "none");
 	obs_enum_sources(avatar_add_audio_source, sources);
 
+	obs_properties_add_float_slider(props, S_IDLE_MOTION, TEXT_IDLE_MOTION, 0.0, 300.0, 10.0);
+
 	obs_property_t *mode = obs_properties_add_list(props, S_MODE, TEXT_MODE, OBS_COMBO_TYPE_LIST,
 						       OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(mode, TEXT_MODE_OFF, S_MODE_OFF);
@@ -1152,6 +1469,8 @@ static obs_properties_t *avatar_source_properties(void *data)
 	 * interpreter or script is not an error - each has a default, resolved
 	 * when the worker is launched. */
 	obs_properties_add_bool(props, S_AUTO_WORKER, TEXT_AUTO_WORKER);
+	obs_properties_add_bool(props, S_AUTO_SYNC, TEXT_AUTO_SYNC);
+	obs_properties_add_bool(props, S_BLINK, TEXT_BLINK);
 	obs_properties_add_float_slider(props, S_MOUTH_GAIN, TEXT_MOUTH_GAIN, 50.0, 300.0, 5.0);
 	obs_properties_add_path(props, S_MUSETALK_DIR, TEXT_MUSETALK_DIR, OBS_PATH_DIRECTORY, NULL, NULL);
 	obs_properties_add_path(props, S_WORKER_PYTHON, TEXT_WORKER_PYTHON, OBS_PATH_FILE, "python.exe (*.exe)", NULL);

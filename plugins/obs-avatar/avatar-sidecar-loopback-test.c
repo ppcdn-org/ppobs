@@ -262,6 +262,34 @@ int main(void)
 		CHECK(strstr(stats.engine, "stub") != NULL);
 	printf("handshake ok: engine='%s', real_model=%d\n", stats.engine, (int)stats.real_model);
 
+	/* The real engine finds a face in the artwork and says where the eyes are, so
+	 * the plugin can blink them; the stub has no face to find. */
+	if (real) {
+		struct avatar_eyes eyes = {0};
+		const uint64_t eyes_started = os_gettime_ns();
+		while (!avatar_engine_sidecar_get_eyes(engine, &eyes) && elapsed_ms(eyes_started) < 5000)
+			os_sleep_ms(POLL_MS);
+
+		CHECK(eyes.valid);
+		CHECK(eyes.count == 2);
+		for (uint32_t i = 0; i < eyes.count; i++) {
+			const struct avatar_eye *eye = &eyes.eye[i];
+			CHECK(eye->left < eye->right);
+			CHECK(eye->right <= (float)eyes.ref_width);
+			CHECK(eye->eh >= 1.0f);
+			/* The lids' curves have to put the upper lid above the lower at the eye's middle. */
+			const float x = 0.0f;
+			const float up = eye->up[0] * x * x + eye->up[1] * x + eye->up[2];
+			const float lo = eye->lo[0] * x * x + eye->lo[1] * x + eye->lo[2];
+			CHECK(up < lo);
+		}
+		printf("eyes: %u, first %.0f-%.0f px wide at x %.0f, opens %.1f px\n", eyes.count, eyes.eye[0].left,
+		       eyes.eye[0].right, eyes.eye[0].cx, eyes.eye[0].eh);
+	} else {
+		struct avatar_eyes eyes = {0};
+		CHECK(!avatar_engine_sidecar_get_eyes(engine, &eyes));
+	}
+
 	/* --- audio out, frames back --- */
 	int64_t pts = 0;
 	/* One second, loud - or two for the real engine, which holds back a window

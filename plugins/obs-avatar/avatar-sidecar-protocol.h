@@ -86,6 +86,18 @@ enum avatar_msg_type {
 	 * the cure - fewer frames a second - must not cost the minute a restart
 	 * takes while the mouth lags further. */
 	AVATAR_MSG_SET_FPS = 11,
+
+	/* worker -> plugin: where the eyes are, as the lids' curves, so the plugin can
+	 * blink them. Sent once after READY for a worker that found a face; the
+	 * plugin draws the blink itself on the GPU, over the artwork it already has,
+	 * because a generated frame is only the lower face and a still photograph
+	 * that never blinks is the first thing that looks wrong about it.
+	 *
+	 * Payload: uint32 eye_count, uint32 ref_width, uint32 ref_height, then per
+	 * eye ten float32: cx, left, right, eh, then the upper lid's a, b, c and the
+	 * lower lid's a, b, c, where a lid is y = a*x'*x' + b*x' + c with x' = x - cx.
+	 * Everything is in the reference frame's pixels. */
+	AVATAR_MSG_EYES = 12,
 };
 
 /* READY flags */
@@ -99,6 +111,11 @@ enum avatar_msg_type {
  * alpha is the blend mask. x/y are in the reference frame's pixel coordinates,
  * which READY reports as its width/height. */
 #define AVATAR_CROP_HEADER_SIZE 24
+
+/* EYES: three uint32 then ten float32 per eye. */
+#define AVATAR_EYES_HEADER_SIZE 12
+#define AVATAR_EYE_FLOATS 10
+#define AVATAR_EYES_MAX 2
 
 /* SET_FPS: a single uint32. */
 #define AVATAR_SET_FPS_PAYLOAD_SIZE 4

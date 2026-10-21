@@ -66,6 +66,33 @@ static void test_mouth_gain_fixture(void)
 	CHECK(avatar_get_f32(expected_payload) == 2.0f);
 }
 
+static void test_eyes_fixture(void)
+{
+	/* EYES (type 12): one eye in a payload of 12 + 40 bytes. */
+	static const uint8_t expected_header[AVATAR_MSG_HEADER_SIZE] = {0x34, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00};
+	static const uint8_t expected_start[AVATAR_EYES_HEADER_SIZE + 8] = {
+		0x01, 0x00, 0x00, 0x00, /* one eye */
+		0x41, 0x01, 0x00, 0x00, /* ref width 321 */
+		0x8C, 0x01, 0x00, 0x00, /* ref height 396 */
+		0x00, 0x00, 0x80, 0x3F, /* cx 1.0f */
+		0x00, 0x00, 0x00, 0x40, /* left 2.0f */
+	};
+
+	CHECK(AVATAR_EYES_HEADER_SIZE + 1 * AVATAR_EYE_FLOATS * 4 == 52);
+
+	uint8_t header[AVATAR_MSG_HEADER_SIZE];
+	avatar_msg_header_write(header, AVATAR_MSG_EYES, 52);
+	CHECK(memcmp(header, expected_header, sizeof(header)) == 0);
+
+	uint8_t payload[sizeof(expected_start)];
+	avatar_put_u32(payload, 1);
+	avatar_put_u32(payload + 4, 321);
+	avatar_put_u32(payload + 8, 396);
+	avatar_put_f32(payload + 12, 1.0f);
+	avatar_put_f32(payload + 16, 2.0f);
+	CHECK(memcmp(payload, expected_start, sizeof(payload)) == 0);
+}
+
 static void test_set_fps_fixture(void)
 {
 	/* SET_FPS (type 11), a single uint32: 20. */
@@ -244,6 +271,7 @@ int main(void)
 	test_audio_payload_fixture();
 	test_mouth_gain_fixture();
 	test_set_fps_fixture();
+	test_eyes_fixture();
 	test_scalar_round_trip();
 	test_header_rejects_bad_input();
 	test_header_accepts_unknown_type();

@@ -29,6 +29,8 @@
 
 #include <windows.h>
 
+#include <math.h>
+
 #define do_log(level, format, ...) \
 	blog(level, "[obs-avatar sidecar: '%s'] " format, sidecar_owner_name(sc), ##__VA_ARGS__)
 
@@ -67,6 +69,31 @@
  * still looks like it is talking. */
 #define SIDECAR_FRAME_STALE_NS 500000000ULL
 
+/* Draws a texture with its alpha scaled, which the stock effect cannot: the
+ * mouth is faded from the previous generated frame to the next, so that the
+ * picture moves smoothly whatever rate the worker generates at and whatever
+ * rate the canvas runs at. Without it a 15 fps mouth on a 25 fps canvas
+ * is held for one canvas frame, then two, then one: judder that no
+ * choice of generated rate removes unless it happens to divide the canvas's. */
+static const char sidecar_fade_effect[] =
+	"uniform float4x4 ViewProj;\n"
+	"uniform texture2d image;\n"
+	"uniform float opacity;\n"
+	"sampler_state def_sampler { Filter = Linear; AddressU = Clamp; AddressV = Clamp; };\n"
+	"struct VertInOut { float4 pos : POSITION; float2 uv : TEXCOORD0; };\n"
+	"VertInOut VSDefault(VertInOut vert_in) {\n"
+	"	VertInOut vert_out;\n"
+	"	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);\n"
+	"	vert_out.uv = vert_in.uv;\n"
+	"	return vert_out;\n"
+	"}\n"
+	"float4 PSFade(VertInOut vert_in) : TARGET {\n"
+	"	float4 rgba = image.Sample(def_sampler, vert_in.uv);\n"
+	"	rgba.a *= opacity;\n"
+	"	return rgba;\n"
+	"}\n"
+	"technique Draw { pass { vertex_shader = VSDefault(vert_in); pixel_shader = PSFade(vert_in); } }\n";
+
 /* Frames the worker has produced but the picture has not shown yet. The worker
  * makes them in bursts - a batch of eight arrives together, then nothing for
  * most of a second - and showing only the newest of each burst turns the
@@ -81,14 +108,18 @@
 
 /* A worker that cannot keep up is asked for fewer frames a second. Judged over
  * a stretch rather than a moment, because OBS starting an encoder or a scene
- * change can cost a second of audio once without meaning anything: when more
- * than SIDECAR_FPS_DROP_RATIO of the audio had to be thrown away over
+ * change can cost a fraction of a second of audio once without meaning anything:
+ * when more than SIDECAR_FPS_DROP_RATIO of the audio had to be thrown away over
  * SIDECAR_FPS_WINDOW_NS, the rate goes down one step, never below the floor.
+ * The ratio is low because a worker that keeps up drops nothing at all; one that
+ * is only a few percent slower than real time sits with its queues full, and
+ * the picture then runs the full length of them - over two seconds - behind
+ * the voice for as long as it stays that way, without ever losing much audio.
  * Dropping audio is what the plugin does instead of letting the picture fall
  * ever further behind, but it leaves holes in the speech the model hears, so
  * the better answer to a worker that is too slow is less work for it. */
 #define SIDECAR_FPS_WINDOW_NS 10000000000ULL
-#define SIDECAR_FPS_DROP_RATIO 0.25
+#define SIDECAR_FPS_DROP_RATIO 0.03
 #define SIDECAR_FPS_FLOOR 15
 
 /* Relaunch delay for a worker the plugin started: doubling from the minimum
@@ -205,8 +236,18 @@ struct sidecar {
 	uint32_t ref_width;
 	uint32_t ref_height;
 
-	/* Owned by the graphics thread, inside render(). */
+	/* When the frame now being shown took over, for the fade from the one
+	 * before it (set under frame_mutex by the playout). */
+	uint64_t advanced_at;
+
+	/* Owned by the graphics thread, inside render(). `texture_prev` holds the
+	 * frame shown before `texture`, and `cur_since` when `texture` took over. */
 	gs_texture_t *texture;
+	gs_texture_t *texture_prev;
+	bool prev_valid;
+	uint64_t cur_since;
+	gs_effect_t *fade_effect;
+	bool fade_failed;
 	uint32_t tex_width;
 	uint32_t tex_height;
 	int64_t uploaded_pts;
@@ -215,6 +256,7 @@ struct sidecar {
 
 	pthread_mutex_t state_mutex;
 	struct avatar_engine_stats stats;
+	struct avatar_eyes eyes;
 
 	/* Payload scratch, owned by the reader thread alone. */
 	uint8_t *rx;
@@ -524,6 +566,7 @@ static void sidecar_playout_advance(struct sidecar *sc)
 	sc->region_x = slot->x;
 	sc->region_y = slot->y;
 	sc->frame_valid = true;
+	sc->advanced_at = now;
 
 	sidecar_queue_drop_oldest(sc, 1);
 
@@ -588,6 +631,72 @@ static bool sidecar_handle_crop(struct sidecar *sc, const uint8_t *payload, uint
 	sc->stats.frames++;
 	pthread_mutex_unlock(&sc->state_mutex);
 	return true;
+}
+
+/* Where the eyes are. Checked rather than trusted: these numbers go straight
+ * into a shader, and a lid curve that is not finite or an eye of no width would
+ * not fail loudly there, it would paint something strange on the avatar. */
+static void sidecar_handle_eyes(struct sidecar *sc, const uint8_t *payload, uint32_t len)
+{
+	if (len < AVATAR_EYES_HEADER_SIZE)
+		return;
+
+	const uint32_t count = avatar_get_u32(payload);
+	const uint32_t ref_width = avatar_get_u32(payload + 4);
+	const uint32_t ref_height = avatar_get_u32(payload + 8);
+
+	if (!count || count > AVATAR_EYES_CAPACITY || !ref_width || !ref_height || ref_width > 8192 || ref_height > 8192 ||
+	    len != AVATAR_EYES_HEADER_SIZE + count * AVATAR_EYE_FLOATS * 4u) {
+		do_log(LOG_WARNING, "ignoring an EYES message that does not make sense (%u eyes, %ux%u, %u bytes)", count,
+		       ref_width, ref_height, len);
+		return;
+	}
+
+	struct avatar_eyes eyes = {.valid = true, .count = count, .ref_width = ref_width, .ref_height = ref_height};
+
+	for (uint32_t i = 0; i < count; i++) {
+		float f[AVATAR_EYE_FLOATS];
+		for (int k = 0; k < AVATAR_EYE_FLOATS; k++) {
+			f[k] = avatar_get_f32(payload + AVATAR_EYES_HEADER_SIZE + (i * AVATAR_EYE_FLOATS + (uint32_t)k) * 4u);
+			if (!isfinite(f[k])) {
+				do_log(LOG_WARNING, "ignoring an EYES message with a value that is not a number");
+				return;
+			}
+		}
+
+		if (f[2] - f[1] < 4.0f || f[3] < 1.0f || f[1] < 0.0f || f[2] > (float)ref_width) {
+			do_log(LOG_WARNING, "ignoring an EYES message with an eye of no size");
+			return;
+		}
+
+		struct avatar_eye *eye = &eyes.eye[i];
+		eye->cx = f[0];
+		eye->left = f[1];
+		eye->right = f[2];
+		eye->eh = f[3];
+		for (int k = 0; k < 3; k++) {
+			eye->up[k] = f[4 + k];
+			eye->lo[k] = f[7 + k];
+		}
+	}
+
+	pthread_mutex_lock(&sc->state_mutex);
+	sc->eyes = eyes;
+	pthread_mutex_unlock(&sc->state_mutex);
+
+	do_log(LOG_INFO, "the worker found %u eye%s; the avatar will blink", count, count == 1 ? "" : "s");
+}
+
+bool avatar_engine_sidecar_get_eyes(void *data, struct avatar_eyes *out)
+{
+	struct sidecar *sc = data;
+	if (!sc)
+		return false;
+
+	pthread_mutex_lock(&sc->state_mutex);
+	*out = sc->eyes;
+	pthread_mutex_unlock(&sc->state_mutex);
+	return out->valid;
 }
 
 static void sidecar_handle_stat(struct sidecar *sc, const uint8_t *payload, uint32_t len)
@@ -949,6 +1058,10 @@ static void sidecar_session(struct sidecar *sc)
 			sidecar_handle_stat(sc, sc->rx, msg.payload_len);
 			break;
 
+		case AVATAR_MSG_EYES:
+			sidecar_handle_eyes(sc, sc->rx, msg.payload_len);
+			break;
+
 		case AVATAR_MSG_LOG:
 			sidecar_handle_log(sc, sc->rx, msg.payload_len);
 			break;
@@ -1007,6 +1120,7 @@ static void *sidecar_thread(void *param)
 		pthread_mutex_lock(&sc->state_mutex);
 		const bool was_connected = sc->stats.connected;
 		sc->stats.connected = false;
+		sc->eyes.valid = false;
 		pthread_mutex_unlock(&sc->state_mutex);
 
 		/* Audio queued for a worker that is gone must not be delivered to its
@@ -1330,9 +1444,11 @@ static void sidecar_destroy(void *data)
 
 	sidecar_reap_worker(sc, 0);
 
-	if (sc->texture) {
+	if (sc->texture || sc->texture_prev || sc->fade_effect) {
 		obs_enter_graphics();
 		gs_texture_destroy(sc->texture);
+		gs_texture_destroy(sc->texture_prev);
+		gs_effect_destroy(sc->fade_effect);
 		obs_leave_graphics();
 	}
 
@@ -1557,7 +1673,17 @@ static bool sidecar_render(void *data, gs_texture_t *base, uint32_t cx, uint32_t
 	sidecar_playout_advance(sc);
 
 	const bool have = sc->frame_valid;
-	const bool fresh = have && (os_gettime_ns() - sc->frame_arrived) < SIDECAR_FRAME_STALE_NS;
+
+	/* Stale means nothing left to show and nothing coming: the queue is empty
+	 * and neither a frame's arrival nor the playout's last step is recent. It
+	 * must not mean "nothing arrived lately". The worker works a window at a
+	 * time, and a window is most of a second of audio, so at a low frame rate
+	 * its frames come in batches with gaps between them longer than the
+	 * threshold while the queue still holds the frames to play through the gap.
+	 * Judged by arrival alone, the picture fell back to the still artwork
+	 * between every pair of batches and flipped back when the next came. */
+	const uint64_t last_activity = sc->frame_arrived > sc->advanced_at ? sc->frame_arrived : sc->advanced_at;
+	const bool fresh = have && (sc->queue_count > 0 || (os_gettime_ns() - last_activity) < SIDECAR_FRAME_STALE_NS);
 	if (fresh) {
 		sc->shown_pts = sc->frame_pts;
 		sc->shown_valid = true;
@@ -1569,20 +1695,41 @@ static bool sidecar_render(void *data, gs_texture_t *base, uint32_t cx, uint32_t
 	const uint32_t y = sc->region_y;
 	const uint32_t ref_width = sc->ref_width ? sc->ref_width : width;
 	const uint32_t ref_height = sc->ref_height ? sc->ref_height : height;
+	const uint64_t interval = 1000000000ULL / (sc->fps ? sc->fps : 25);
 
 	if (fresh && sc->frame_pts != sc->uploaded_pts) {
 		if (!sc->texture || sc->tex_width != width || sc->tex_height != height) {
 			gs_texture_destroy(sc->texture);
+			gs_texture_destroy(sc->texture_prev);
 			sc->texture = gs_texture_create(width, height, GS_BGRA, 1, NULL, GS_DYNAMIC);
+			sc->texture_prev = NULL;
+			sc->prev_valid = false;
 			sc->tex_width = width;
 			sc->tex_height = height;
+		} else if (is_region) {
+			/* What was showing becomes what the next frame fades in from. */
+			if (!sc->texture_prev)
+				sc->texture_prev = gs_texture_create(width, height, GS_BGRA, 1, NULL, GS_DYNAMIC);
+
+			if (sc->texture_prev) {
+				gs_texture_t *older = sc->texture_prev;
+				sc->texture_prev = sc->texture;
+				sc->texture = older;
+				sc->prev_valid = sc->uploaded;
+			}
+		} else {
+			sc->prev_valid = false;
 		}
+
 		if (sc->texture) {
 			gs_texture_set_image(sc->texture, sc->frame, width * 4, false);
 			sc->uploaded_pts = sc->frame_pts;
 			sc->uploaded = true;
+			sc->cur_since = sc->advanced_at;
 		}
 	}
+
+	const uint64_t cur_since = sc->cur_since;
 
 	pthread_mutex_unlock(&sc->frame_mutex);
 
@@ -1636,14 +1783,51 @@ static bool sidecar_render(void *data, gs_texture_t *base, uint32_t cx, uint32_t
 	const float sx = (float)cx / (float)ref_width;
 	const float sy = (float)cy / (float)ref_height;
 
+	/* How far the picture has moved from the previous generated frame to this
+	 * one: it reaches it one frame interval after taking over. A frame is shown
+	 * one interval late for that, which is the price of motion that is even. */
+	float fade = 1.0f;
+	if (sc->prev_valid && sc->texture_prev && interval) {
+		const uint64_t now = os_gettime_ns();
+		const double progress = (double)(now - cur_since) / (double)interval;
+		fade = progress < 0.0 ? 0.0f : (progress > 1.0 ? 1.0f : (float)progress);
+	}
+
+	if (fade < 1.0f && !sc->fade_effect && !sc->fade_failed) {
+		char *error = NULL;
+		sc->fade_effect = gs_effect_create(sidecar_fade_effect, "avatar-region-fade", &error);
+		if (!sc->fade_effect) {
+			sc->fade_failed = true;
+			do_log(LOG_WARNING, "could not build the frame blend effect (%s); frames will be shown as they are",
+			       error ? error : "no detail");
+		}
+		bfree(error);
+	}
+
+	const uint32_t draw_w = (uint32_t)((float)width * sx);
+	const uint32_t draw_h = (uint32_t)((float)height * sy);
+
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
 	gs_matrix_push();
 	gs_matrix_translate3f((float)x * sx, (float)y * sy, 0.0f);
 
-	gs_effect_set_texture_srgb(gs_effect_get_param_by_name(effect, "image"), sc->texture);
-	while (gs_effect_loop(effect, "Draw"))
-		gs_draw_sprite(sc->texture, 0, (uint32_t)((float)width * sx), (uint32_t)((float)height * sy));
+	if (fade < 1.0f && sc->fade_effect) {
+		/* The older frame whole, and the newer over it by the fraction of the
+		 * way there. At the ends this is exactly one frame or the other. */
+		gs_effect_set_texture_srgb(gs_effect_get_param_by_name(effect, "image"), sc->texture_prev);
+		while (gs_effect_loop(effect, "Draw"))
+			gs_draw_sprite(sc->texture_prev, 0, draw_w, draw_h);
+
+		gs_effect_set_texture_srgb(gs_effect_get_param_by_name(sc->fade_effect, "image"), sc->texture);
+		gs_effect_set_float(gs_effect_get_param_by_name(sc->fade_effect, "opacity"), fade);
+		while (gs_effect_loop(sc->fade_effect, "Draw"))
+			gs_draw_sprite(sc->texture, 0, draw_w, draw_h);
+	} else {
+		gs_effect_set_texture_srgb(gs_effect_get_param_by_name(effect, "image"), sc->texture);
+		while (gs_effect_loop(effect, "Draw"))
+			gs_draw_sprite(sc->texture, 0, draw_w, draw_h);
+	}
 
 	gs_matrix_pop();
 	gs_blend_state_pop();

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "avatar-engine.h"
+#include "avatar-eyes.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +26,11 @@ const char *avatar_engine_sidecar_pipe_name(void *data);
  * and handed to the worker by the engine's own writer, now if one is connected
  * and again after any reconnect. */
 void avatar_engine_sidecar_set_mouth_gain(void *data, float gain);
+
+/* Where the worker says the eyes are. False until a worker that found a face has
+ * connected and said so, and again whenever it goes away: the curves belong to
+ * one worker's picture of one avatar. */
+bool avatar_engine_sidecar_get_eyes(void *data, struct avatar_eyes *out);
 
 #ifdef __cplusplus
 }

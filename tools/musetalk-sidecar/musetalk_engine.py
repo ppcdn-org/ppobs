@@ -152,6 +152,7 @@ class MuseTalkEngine:
         print("[musetalk] preparing the avatar", flush=True)
         self.avatar = self._build_avatar(asset)
         self.cycle_length = len(self.avatar["frame_list_cycle"])
+        self.eyes = self._find_eyes(self.avatar["frame_list_cycle"][0])
 
         # What the plugin receives is the repainted *region*, not the whole
         # picture, so width/height here are the reference frame - the
@@ -178,6 +179,54 @@ class MuseTalkEngine:
             f"decoding latent rows {self.decode_start}..{self.LATENT_ROWS}",
             flush=True,
         )
+
+    # -- eyes ---------------------------------------------------------------
+
+    def _find_eyes(self, frame):
+        """The two eyes as lid curves in the reference frame's pixels, or None.
+
+        MuseTalk's own landmark model already runs on every avatar; its 68 face
+        points are the ones in dlib's order, six to an eye: the outer corner, two
+        along the upper lid, the inner corner, two along the lower lid. A lid is
+        fitted as a parabola in x because that is all a lid is at this size and it
+        is three numbers for the shader instead of a polyline.
+
+        Only for a still picture of one face looking at the camera: the plugin
+        draws a single set of curves over every frame.
+        """
+        try:
+            from musetalk.utils.preprocessing import model as pose_model
+            from mmpose.apis import inference_topdown
+            from mmpose.structures import merge_data_samples
+
+            result = merge_data_samples(inference_topdown(pose_model, frame))
+            points = result.pred_instances.keypoints[0][23:91].astype(np.float64)
+        except Exception as exc:  # a missing eye is a missing blink, not a failed avatar
+            print(f"[musetalk] no eye landmarks, the avatar will not blink: {exc}", flush=True)
+            return None
+
+        eyes = []
+        for first in (36, 42):
+            pts = points[first : first + 6]
+            cx = float(pts[:, 0].mean())
+            left, right = float(pts[:, 0].min()), float(pts[:, 0].max())
+            if right - left < 6.0:
+                return None
+
+            upper = pts[[0, 1, 2, 3]]
+            lower = pts[[3, 4, 5, 0]]
+            upper = upper[np.argsort(upper[:, 0])]
+            lower = lower[np.argsort(lower[:, 0])]
+            up = np.polyfit(upper[:, 0] - cx, upper[:, 1], 2)
+            lo = np.polyfit(lower[:, 0] - cx, lower[:, 1], 2)
+
+            xs = np.linspace(left, right, 24) - cx
+            gap = np.polyval(lo, xs) - np.polyval(up, xs)
+            eh = max(float(gap.max()), 4.0)
+            eyes.append((cx, left, right, eh, *map(float, up), *map(float, lo)))
+
+        print(f"[musetalk] found the eyes ({eyes[0][2] - eyes[0][1]:.0f} and {eyes[1][2] - eyes[1][1]:.0f} px wide)", flush=True)
+        return eyes
 
     # -- per-reference preprocessing ---------------------------------------
 
@@ -396,6 +445,20 @@ class MuseTalkEngine:
 
     # -- streaming inference -----------------------------------------------
 
+    # The mouth is moved by `mouth_gain` while someone is speaking and by
+    # PAUSE_GAIN times the model's own deviation while they are not. Measured on a
+    # real narration, the model leaves the mouth moving in pauses at close to half
+    # the amplitude it has in speech (breaths, room noise, the tail of the last
+    # word), and a gain that opens the mouth wider for speech opens it wider for
+    # that too, so the avatar looks as if it never stops talking. The gate is
+    # driven by the loudness of the audio itself, smoothed so a quiet consonant
+    # inside a word does not close the mouth: the level has to stay low for a
+    # moment before it counts as a pause.
+    PAUSE_GAIN = 0.4
+    GATE_LOW_DB = -52.0
+    GATE_HIGH_DB = -40.0
+    GATE_RELEASE_DB_PER_S = 60.0
+
     # How far apart two audio blocks may be, beyond what their length explains,
     # before they are taken to be separated by dropped audio.
     GAP_NS = 60_000_000
@@ -543,7 +606,26 @@ class MuseTalkEngine:
                 return None
             return torch.stack(rest)
 
-    def _amplify(self, pred, first_index: int):
+    def _frame_gains(self, window: np.ndarray, frames: int):
+        """The gain for each frame of a window: full while there is speech, down
+        to PAUSE_GAIN in a pause, from the window's own audio."""
+        per_frame = max(1, int(round(self.sample_rate / self.fps)))
+        gains = np.empty(frames, dtype=np.float32)
+        held = -120.0
+        release = self.GATE_RELEASE_DB_PER_S / self.fps
+
+        for i in range(frames):
+            chunk = window[i * per_frame : (i + 1) * per_frame]
+            level = 20.0 * np.log10(float(np.sqrt(np.mean(chunk * chunk))) + 1e-9) if len(chunk) else -120.0
+            held = max(level, held - release)
+            x = (held - self.GATE_LOW_DB) / (self.GATE_HIGH_DB - self.GATE_LOW_DB)
+            x = min(max(x, 0.0), 1.0)
+            speech = x * x * (3.0 - 2.0 * x)
+            gains[i] = self.PAUSE_GAIN + (1.0 - self.PAUSE_GAIN) * speech
+
+        return gains
+
+    def _amplify(self, pred, first_index: int, gate=None):
         """Scales how far the prediction strays from the silent one.
 
         `rest + gain * (pred - rest)`: at 1.0 this is the model unchanged, above
@@ -554,12 +636,19 @@ class MuseTalkEngine:
         each other.
         """
         gain = self.mouth_gain
-        if gain == 1.0 or self._rest is None:
+        if self._rest is None or (gain == 1.0 and gate is None):
             return pred
 
         indices = [(first_index + j) % self.cycle_length for j in range(pred.shape[0])]
         rest = self._rest[indices]
-        return rest + gain * (pred - rest)
+
+        if gate is None:
+            return rest + gain * (pred - rest)
+
+        # Between PAUSE_GAIN of the model's deviation and the full gain, by frame.
+        per_frame = self._torch.as_tensor(gate[first_index : first_index + pred.shape[0]], device=pred.device)
+        factor = (self.PAUSE_GAIN + (gain - self.PAUSE_GAIN) * (per_frame - self.PAUSE_GAIN) / (1.0 - self.PAUSE_GAIN))
+        return rest + factor.to(pred.dtype).view(-1, 1, 1, 1) * (pred - rest)
 
     def _blend_window(self, chunks, keep):
         """The features for the frames being kept, with the first few eased in
@@ -615,6 +704,8 @@ class MuseTalkEngine:
                 )
             # Whisper ran over the context as well; the UNet and the decoder,
             # which are where the time goes, only run over what is kept.
+            gate_all = self._frame_gains(window, int(len(window) * self.fps // self.sample_rate) + 1)
+            gate = gate_all[keep[0] : keep[1]]
             chunks = self._blend_window(chunks, keep)
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
@@ -628,7 +719,7 @@ class MuseTalkEngine:
                 audio_features = self.pe(whisper_batch.to(self.device))
                 latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
                 pred = self.unet.model(latent_batch, self.timesteps, encoder_hidden_states=audio_features).sample
-                pred = self._amplify(pred, produced)
+                pred = self._amplify(pred, produced, gate)
                 pred = pred.to(device=self.device, dtype=self.vae.vae.dtype)
                 torch.cuda.synchronize() if self.device.type == "cuda" else None
                 self.stage_us["unet"] += int((_time.perf_counter() - started) * 1e6)

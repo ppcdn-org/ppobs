@@ -22,6 +22,9 @@ target_sources(
     avatar-engine.h
     avatar-engine-sidecar.c
     avatar-engine-sidecar.h
+    avatar-blink.c
+    avatar-blink.h
+    avatar-eyes.h
     avatar-engine-viseme.c
     avatar-engine-viseme.h
     avatar-sidecar-protocol.h
@@ -94,4 +97,18 @@ if(ENABLE_TEST_INPUT)
   )
   add_test(NAME avatar-sidecar-launch COMMAND avatar-sidecar-launch-test)
   set_target_properties(avatar-sidecar-launch-test PROPERTIES FOLDER tests)
+
+  # The blink shader drawn on a real Direct3D 11 device, headless, to BMP files
+  # that can be compared with the picture it was designed against. Not an
+  # add_test: it needs a GPU and has to be run from the directory holding
+  # obs.dll and libobs-d3d11.dll (see the comment at the top of the file).
+  add_executable(avatar-blink-test avatar-blink-test.c avatar-blink.c)
+  target_link_libraries(avatar-blink-test PRIVATE OBS::libobs)
+  set_target_properties(avatar-blink-test PROPERTIES FOLDER tests)
+
+  # When it blinks and how long it takes, which needs no GPU.
+  add_executable(avatar-blink-timing-test avatar-blink-timing-test.c avatar-blink.c)
+  target_link_libraries(avatar-blink-timing-test PRIVATE OBS::libobs)
+  add_test(NAME avatar-blink-timing COMMAND avatar-blink-timing-test)
+  set_target_properties(avatar-blink-timing-test PROPERTIES FOLDER tests)
 endif()

@@ -68,6 +68,7 @@ MSG_BYE = 8
 MSG_CROP = 9
 MSG_MOUTH_GAIN = 10
 MSG_SET_FPS = 11
+MSG_EYES = 12
 
 READY_REAL_MODEL = 1 << 0
 
@@ -449,6 +450,14 @@ def handshake(stream, requested_engine: str, musetalk_dir: str):
         struct.pack("<IIIII", PROTOCOL_VERSION, engine.width, engine.height, flags, len(name)) + name,
     )
 
+    # Where the eyes are, for a worker that found a face: the plugin blinks them.
+    eyes = getattr(engine, "eyes", None)
+    if eyes:
+        body = struct.pack("<III", len(eyes), engine.width, engine.height)
+        for eye in eyes:
+            body += struct.pack("<10f", *eye)
+        send_message(stream, MSG_EYES, body)
+
     print(f"ready: engine={engine.name} {engine.width}x{engine.height} "
           f"{sample_rate} Hz {fps} fps asset={asset_path or '(none)'}", flush=True)
 
@@ -488,6 +497,14 @@ def selftest() -> int:
     )
     built = AUDIO_HEADER.pack(1000000000, 2) + struct.pack("<2f", 0.5, -0.25)
     assert built == expected_audio, built.hex()
+
+    # EYES (type 12): one eye, ten floats, in a 52-byte payload (12 + 40).
+    eye = (1.0, 2.0, 3.0, 4.0, 0.5, -0.25, 6.0, 0.125, 0.0, 7.0)
+    body = struct.pack("<III", 1, 321, 396) + struct.pack("<10f", *eye)
+    assert len(body) == 52
+    assert HEADER.pack(len(body), MSG_EYES, 0) == bytes.fromhex("34000000" "0C00" "0000")
+    assert body[:12] == bytes.fromhex("010000004101000" "08C010000")
+    assert body[12:16] == bytes.fromhex("0000803F") and body[16:20] == bytes.fromhex("00000040")
 
     # SET_FPS (type 11): a header for a 4-byte payload, and 20.
     assert HEADER.pack(4, MSG_SET_FPS, 0) == bytes.fromhex("04000000" "0B00" "0000")
