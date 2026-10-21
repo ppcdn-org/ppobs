@@ -60,7 +60,6 @@ void OBSBasic::StartStreaming()
 	ApplyTemporalDenoiseSetting();
 	ApplyBeautyFilterSetting();
 	ApplyClarityFilterSetting();
-	ApplyVoiceTemplateSetting();
 
 	if (auth && auth->broadcastFlow()) {
 		if (!broadcastActive && !broadcastReady) {

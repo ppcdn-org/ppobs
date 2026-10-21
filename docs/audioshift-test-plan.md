@@ -124,6 +124,8 @@ build_x64\rundir\RelWithDebInfo\bin\64bit\obs64.exe
 
 ## 8. 声音模板（P1，前端滤镜链）
 
+> **已移除**：设置页的声音模板下拉框已删除，本节（AS-28~AS-35）不再适用，无需执行。
+
 操作入口：**设置 → 流 → 高级选项**，找到 **Voice Template / 声音模板** 下拉框。
 
 > 关键实现说明：模板只会挂到 **麦克风输入源**（`wasapi_input_capture`），**不会**碰桌面/系统
