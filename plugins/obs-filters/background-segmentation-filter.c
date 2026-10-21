@@ -36,6 +36,8 @@
 #include <string.h>
 #include <wchar.h>
 
+#include "background-blur.h"
+#include "background-blur-render.h"
 #include "background-mask.h"
 #include "matting-models.h"
 #include "matting-ort.h"
@@ -51,6 +53,18 @@
 #define S_DESPILL "despill"
 #define S_REJECT "reject"
 #define S_SHOW_MASK "show_mask"
+#define S_BG_MODE "background_mode"
+#define S_BLUR_STRENGTH "blur_strength"
+
+/* What happens to the pixels the matte calls background.  Stored in settings,
+ * so the values must not be renumbered. */
+enum background_mode {
+	/* Make them transparent; whatever is below this source in the scene
+	 * shows through.  The original behaviour, hence the zero default. */
+	BACKGROUND_MODE_REMOVE = 0,
+	/* Keep them but blur them. */
+	BACKGROUND_MODE_BLUR = 1,
+};
 
 /* Models live in the OBS configuration directory:
  *
@@ -181,6 +195,9 @@ struct background_data {
 	/* Last computed fade level, reused when the lock is contended. */
 	float last_strength;
 
+	/* Blur mode, graphics thread only. */
+	struct background_blur_targets blur_targets;
+
 	char *model;
 	enum matting_model_family family;
 	int inference_fps;
@@ -192,6 +209,8 @@ struct background_data {
 	double despill;
 	double reject;
 	bool show_mask;
+	enum background_mode mode;
+	int blur_strength;
 };
 
 static const char *background_name(void *unused)
@@ -606,6 +625,9 @@ static void background_update(void *data, obs_data_t *settings)
 	filter->despill = obs_data_get_double(settings, S_DESPILL);
 	filter->reject = obs_data_get_double(settings, S_REJECT);
 	filter->show_mask = obs_data_get_bool(settings, S_SHOW_MASK);
+	filter->mode = obs_data_get_int(settings, S_BG_MODE) == BACKGROUND_MODE_BLUR ? BACKGROUND_MODE_BLUR
+										      : BACKGROUND_MODE_REMOVE;
+	filter->blur_strength = (int)obs_data_get_int(settings, S_BLUR_STRENGTH);
 	pthread_mutex_unlock(&filter->mutex);
 
 	os_event_signal(filter->wake_event);
@@ -679,6 +701,7 @@ static void background_destroy(void *data)
 		gs_texrender_destroy(filter->readback_render);
 	if (filter->readback_stage)
 		gs_stagesurface_destroy(filter->readback_stage);
+	background_blur_targets_destroy(&filter->blur_targets);
 	obs_leave_graphics();
 
 	background_mask_free(&filter->published_mask);
@@ -689,6 +712,34 @@ static void background_destroy(void *data)
 	bfree(filter->model);
 	pthread_mutex_destroy(&filter->mutex);
 	bfree(filter);
+}
+
+/* Clears the current render target and draws the filter's target into it,
+ * stretched to fill, however large the target is.  Must be called between
+ * gs_texrender_begin and gs_texrender_end.  Graphics thread only.
+ *
+ * This is the same dance obs_source_process_filter_begin does, minus keeping
+ * the result private: the callers here need the pixels at a size of their
+ * choosing. */
+static void background_draw_target(obs_source_t *target, obs_source_t *parent, uint32_t cx, uint32_t cy)
+{
+	const uint32_t parent_flags = obs_source_get_output_flags(parent);
+	const bool custom_draw = (parent_flags & OBS_SOURCE_CUSTOM_DRAW) != 0;
+	const bool async = (parent_flags & OBS_SOURCE_ASYNC) != 0;
+	struct vec4 clear_color;
+
+	vec4_zero(&clear_color);
+	gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+
+	if (!cx || !cy)
+		return;
+
+	gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
+
+	if (target == parent && !custom_draw && !async)
+		obs_source_default_render(target);
+	else
+		obs_source_video_render(target);
 }
 
 /* Renders the filter target into a small texture and copies it back to CPU
@@ -773,26 +824,12 @@ static void background_capture_input(struct background_data *filter, obs_source_
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 
 	if (gs_texrender_begin(filter->readback_render, size, size)) {
-		const uint32_t parent_flags = obs_source_get_output_flags(parent);
-		const bool custom_draw = (parent_flags & OBS_SOURCE_CUSTOM_DRAW) != 0;
-		const bool async = (parent_flags & OBS_SOURCE_ASYNC) != 0;
 		const uint32_t cx = obs_source_get_base_width(target);
 		const uint32_t cy = obs_source_get_base_height(target);
-		struct vec4 clear_color;
 
-		vec4_zero(&clear_color);
-		gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
-
-		if (cx && cy) {
-			/* Map the source's own coordinate space onto the square
-			 * render target, which performs the downscale. */
-			gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
-
-			if (target == parent && !custom_draw && !async)
-				obs_source_default_render(target);
-			else
-				obs_source_video_render(target);
-		}
+		/* Maps the source's own coordinate space onto the square render
+		 * target, which performs the downscale. */
+		background_draw_target(target, parent, cx, cy);
 
 		gs_texrender_end(filter->readback_render);
 
@@ -900,6 +937,29 @@ static float background_sync_mask_texture(struct background_data *filter)
 	return filter->mask_texture ? strength : 0.0f;
 }
 
+/* What the blur's draw callback needs to render the filter's target. */
+struct background_blur_source {
+	obs_source_t *target;
+	obs_source_t *parent;
+	uint32_t cx;
+	uint32_t cy;
+};
+
+static void background_blur_draw_source(void *data, uint32_t width, uint32_t height)
+{
+	UNUSED_PARAMETER(width);
+	UNUSED_PARAMETER(height);
+
+	const struct background_blur_source *source = data;
+
+	/* Blending as obs_source_process_filter_begin sets it, so a source with
+	 * transparency lands in the copy the way it would on screen. */
+	gs_blend_state_push();
+	gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+	background_draw_target(source->target, source->parent, source->cx, source->cy);
+	gs_blend_state_pop();
+}
+
 static void background_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
@@ -925,16 +985,17 @@ static void background_render(void *data, gs_effect_t *effect)
 		return;
 	}
 
-	if (!obs_source_process_filter_begin(filter->context, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING))
-		return;
-
 	bool show_mask;
 	float despill;
 	float reject;
+	enum background_mode mode;
+	int blur_strength;
 	pthread_mutex_lock(&filter->mutex);
 	show_mask = filter->show_mask;
 	despill = (float)filter->despill;
 	reject = (float)filter->reject;
+	mode = filter->mode;
+	blur_strength = filter->blur_strength;
 	pthread_mutex_unlock(&filter->mutex);
 
 	/* Both corrections are defined relative to the measured wall colour.
@@ -945,19 +1006,37 @@ static void background_render(void *data, gs_effect_t *effect)
 		reject = 0.0f;
 	}
 
-	struct vec2 mask_scale = {1.0f, 1.0f};
-	struct vec2 mask_offset = {0.0f, 0.0f};
+	const struct background_blur_matte matte = {
+		.texture = filter->mask_texture,
+		.scale = {1.0f, 1.0f},
+		.offset = {0.0f, 0.0f},
+	};
 
-	gs_eparam_t *param = gs_effect_get_param_by_name(filter->effect, "mask_tex");
-	gs_effect_set_texture(param, filter->mask_texture);
+	/* The blur renders targets of its own, so it has to finish before
+	 * process_filter_begin starts the filter's.  It also runs effect
+	 * techniques, and an effect forgets every parameter when a technique
+	 * ends, so nothing is set on the effect until it is done. */
+	gs_texture_t *blurred = NULL;
+	if (mode == BACKGROUND_MODE_BLUR) {
+		const uint32_t cx = obs_source_get_base_width(target);
+		const uint32_t cy = obs_source_get_base_height(target);
+		const struct background_blur_plan plan = background_blur_plan_for(cx, cy, blur_strength);
+		struct background_blur_source source = {target, parent, cx, cy};
 
-	param = gs_effect_get_param_by_name(filter->effect, "mask_scale");
-	gs_effect_set_vec2(param, &mask_scale);
+		blurred = background_blur_render(filter->effect, &filter->blur_targets, &plan, &matte,
+						 background_blur_draw_source, &source);
+		if (!blurred) {
+			obs_source_skip_video_filter(filter->context);
+			return;
+		}
+	}
 
-	param = gs_effect_get_param_by_name(filter->effect, "mask_offset");
-	gs_effect_set_vec2(param, &mask_offset);
+	if (!obs_source_process_filter_begin(filter->context, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING))
+		return;
 
-	param = gs_effect_get_param_by_name(filter->effect, "mask_strength");
+	background_blur_set_matte(filter->effect, &matte);
+
+	gs_eparam_t *param = gs_effect_get_param_by_name(filter->effect, "mask_strength");
 	gs_effect_set_float(param, strength);
 
 	param = gs_effect_get_param_by_name(filter->effect, "show_mask");
@@ -986,7 +1065,13 @@ static void background_render(void *data, gs_effect_t *effect)
 	param = gs_effect_get_param_by_name(filter->effect, "reject_softness");
 	gs_effect_set_float(param, BACKGROUND_REJECT_SOFTNESS);
 
-	obs_source_process_filter_end(filter->context, filter->effect, 0, 0);
+	if (blurred) {
+		param = gs_effect_get_param_by_name(filter->effect, "blurred_tex");
+		gs_effect_set_texture(param, blurred);
+		obs_source_process_filter_tech_end(filter->context, filter->effect, 0, 0, "DrawBlurred");
+	} else {
+		obs_source_process_filter_end(filter->context, filter->effect, 0, 0);
+	}
 }
 
 /* Lists every .onnx in the segmentation model directory. */
@@ -1021,8 +1106,25 @@ static void background_fill_model_list(obs_property_t *list)
 	}
 }
 
+/* Edge despill unmixes the measured wall colour, which only matters when the
+ * background is removed; blur strength only matters when it is blurred. */
+static void background_show_mode_controls(obs_properties_t *props, bool blur)
+{
+	obs_property_set_visible(obs_properties_get(props, S_BLUR_STRENGTH), blur);
+	obs_property_set_visible(obs_properties_get(props, S_DESPILL), !blur);
+}
+
+static bool background_mode_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+
+	background_show_mode_controls(props, obs_data_get_int(settings, S_BG_MODE) == BACKGROUND_MODE_BLUR);
+	return true;
+}
+
 static obs_properties_t *background_properties(void *data)
 {
+	struct background_data *filter = data;
 	obs_properties_t *props = obs_properties_create();
 
 	obs_properties_add_text(props, "model_info", obs_module_text("BackgroundSegmentation.ModelInfo"),
@@ -1055,6 +1157,15 @@ static obs_properties_t *background_properties(void *data)
 	obs_property_list_add_int(family, "MODNet", MATTING_MODEL_MODNET);
 	obs_property_list_add_int(family, "RobustVideoMatting", MATTING_MODEL_RVM);
 
+	obs_property_t *mode = obs_properties_add_list(props, S_BG_MODE, obs_module_text("BackgroundSegmentation.Mode"),
+						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(mode, obs_module_text("BackgroundSegmentation.Mode.Replace"), BACKGROUND_MODE_REMOVE);
+	obs_property_list_add_int(mode, obs_module_text("BackgroundSegmentation.Mode.Blur"), BACKGROUND_MODE_BLUR);
+	obs_property_set_modified_callback(mode, background_mode_modified);
+
+	obs_properties_add_int_slider(props, S_BLUR_STRENGTH, obs_module_text("BackgroundSegmentation.BlurStrength"),
+				      BACKGROUND_BLUR_MIN_STRENGTH, BACKGROUND_BLUR_MAX_STRENGTH, 1);
+
 	obs_property_t *fps = obs_properties_add_list(props, S_INFERENCE_FPS,
 						      obs_module_text("BackgroundSegmentation.InferenceFps"),
 						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -1078,7 +1189,17 @@ static obs_properties_t *background_properties(void *data)
 					1.0);
 	obs_properties_add_bool(props, S_SHOW_MASK, obs_module_text("BackgroundSegmentation.ShowMask"));
 
-	UNUSED_PARAMETER(data);
+	/* The modified callback only fires on edits, so the first display needs
+	 * the right controls shown without waiting for one.  `data` is NULL when
+	 * the properties are built without a live filter. */
+	bool blur = false;
+	if (filter) {
+		obs_data_t *settings = obs_source_get_settings(filter->context);
+		blur = obs_data_get_int(settings, S_BG_MODE) == BACKGROUND_MODE_BLUR;
+		obs_data_release(settings);
+	}
+	background_show_mode_controls(props, blur);
+
 	return props;
 }
 
@@ -1103,6 +1224,10 @@ static void background_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, S_DESPILL, 0.6);
 	obs_data_set_default_double(settings, S_REJECT, 24.0);
 	obs_data_set_default_bool(settings, S_SHOW_MASK, false);
+	obs_data_set_default_int(settings, S_BG_MODE, BACKGROUND_MODE_REMOVE);
+	/* At 50 the radius is 3% of the frame height - about 32px at 1080p -
+	 * which reads as clearly out of focus without turning into a smear. */
+	obs_data_set_default_int(settings, S_BLUR_STRENGTH, 50);
 }
 
 struct obs_source_info background_segmentation_filter = {

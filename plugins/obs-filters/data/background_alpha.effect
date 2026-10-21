@@ -127,11 +127,122 @@ float4 PSMaskRGBA(VertData vert_in) : TARGET
 	return lerp(matted, debug, show_mask);
 }
 
+/* ---- Blurred-background mode ------------------------------------------------
+ *
+ * The background is blurred rather than replaced: a reduced copy of the frame is
+ * blurred here and the sharp subject is composited over it by the same matte.
+ *
+ * The blur is weighted by "how much of this pixel is background", then divided
+ * by the total weight (normalised convolution).  A plain Gaussian would smear
+ * the subject's colours into the background around the silhouette, leaving a
+ * halo of skin and clothing tones; weighting by the matte makes the background
+ * blur only from background pixels, and fills the area behind the subject from
+ * its surroundings, which is what the sharp subject is composited over anyway.
+ *
+ * Two passes (horizontal, then vertical) run on a reduced-size target.  The
+ * first writes weighted colour in RGB and the weight in A, so it must target a
+ * float format; the second divides and writes plain colour. */
+
+uniform texture2d blurred_tex;
+
+/* Distance in UV between adjacent taps along the pass direction: (1/w, 0) for
+ * the horizontal pass, (0, 1/h) for the vertical one. */
+uniform float2 blur_step = {0.0, 0.0};
+
+/* 1 / (2 * sigma^2), with sigma in reduced pixels. */
+uniform float blur_inv2s2 = 0.5;
+
+/* 0 for the first pass (input is plain colour), 1 for the second (input is the
+ * weighted output of the first, and the result is resolved to colour). */
+uniform float blur_second_pass = 0.0;
+
+/* The floor keeps the weight positive, so a pixel with no background anywhere
+ * in reach still gets a defined (merely unfiltered) colour instead of 0/0. */
+float background_weight(float2 uv)
+{
+	float background = 1.0 - sample_mask(uv);
+	return background * background + 0.002;
+}
+
+float4 blur_fetch(float2 uv)
+{
+	float4 s = image.Sample(textureSampler, uv);
+	float w = background_weight(uv);
+	return lerp(float4(s.rgb * w, w), s, blur_second_pass);
+}
+
+float4 blur_pair(float2 uv, float k)
+{
+	float2 d = blur_step * k;
+	return exp(-k * k * blur_inv2s2) * (blur_fetch(uv + d) + blur_fetch(uv - d));
+}
+
+/* Unrolled: the effect language has no loops in any shader in this tree.  The
+ * tap count is BACKGROUND_BLUR_TAPS in background-blur.h, and
+ * background-blur-test checks the two agree. */
+float4 PSBlurPass(VertData vert_in) : TARGET
+{
+	float4 sum = blur_fetch(vert_in.uv);
+
+	sum += blur_pair(vert_in.uv, 1.0);
+	sum += blur_pair(vert_in.uv, 2.0);
+	sum += blur_pair(vert_in.uv, 3.0);
+	sum += blur_pair(vert_in.uv, 4.0);
+	sum += blur_pair(vert_in.uv, 5.0);
+	sum += blur_pair(vert_in.uv, 6.0);
+	sum += blur_pair(vert_in.uv, 7.0);
+	sum += blur_pair(vert_in.uv, 8.0);
+	sum += blur_pair(vert_in.uv, 9.0);
+	sum += blur_pair(vert_in.uv, 10.0);
+	sum += blur_pair(vert_in.uv, 11.0);
+	sum += blur_pair(vert_in.uv, 12.0);
+
+	if (blur_second_pass > 0.5)
+		return float4(sum.rgb / max(sum.a, 0.0001), 1.0);
+
+	return sum;
+}
+
+float4 PSBlurredBackground(VertData vert_in) : TARGET
+{
+	float4 rgba = image.Sample(textureSampler, vert_in.uv);
+	float3 blurred = blurred_tex.Sample(textureSampler, vert_in.uv).rgb;
+
+	float coverage = reject_background(sample_mask(vert_in.uv), rgba.rgb);
+
+	/* Same fade as the replace mode: at strength 0 the sharp source shows. No
+	 * edge unmixing here - the blurred background is the same scene as the real
+	 * one, so an edge pixel's own background tint already matches it. */
+	float foreground = lerp(1.0, coverage, mask_strength);
+
+	float4 composite = float4(lerp(blurred, rgba.rgb, foreground), rgba.a);
+	float4 debug = float4(coverage, coverage, coverage, 1.0);
+	return lerp(composite, debug, show_mask);
+}
+
 technique Draw
 {
 	pass
 	{
 		vertex_shader = VSDefault(vert_in);
 		pixel_shader = PSMaskRGBA(vert_in);
+	}
+}
+
+technique BlurPass
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader = PSBlurPass(vert_in);
+	}
+}
+
+technique DrawBlurred
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader = PSBlurredBackground(vert_in);
 	}
 }

@@ -39,6 +39,9 @@ target_sources(
     background-mask.c
     background-mask.h
     background-segmentation-filter.c
+    background-blur.h
+    background-blur-render.c
+    background-blur-render.h
     matting-models.c
     matting-models.h
     matting-ort.c
@@ -105,6 +108,23 @@ if(ENABLE_TEST_INPUT)
   add_executable(background-fade-test background-fade-test.c)
   add_test(NAME background-fade COMMAND background-fade-test)
   set_target_properties(background-fade-test PROPERTIES FOLDER tests)
+
+  add_executable(background-blur-test background-blur-test.c)
+  target_compile_definitions(
+    background-blur-test
+    PRIVATE BLUR_EFFECT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/data/background_alpha.effect"
+  )
+  add_test(NAME background-blur COMMAND background-blur-test)
+  set_target_properties(background-blur-test PROPERTIES FOLDER tests)
+
+  if(OS_WINDOWS)
+    # The blur shader drawn on a real Direct3D 11 device, headless. Not an
+    # add_test: it needs a GPU and has to be run from the directory holding
+    # obs.dll and libobs-d3d11.dll (see the comment at the top of the file).
+    add_executable(background-blur-gpu-test background-blur-gpu-test.c background-blur-render.c)
+    target_link_libraries(background-blur-gpu-test PRIVATE OBS::libobs)
+    set_target_properties(background-blur-gpu-test PROPERTIES FOLDER tests)
+  endif()
 
   add_executable(matting-models-test matting-models.c matting-models-test.c)
   target_link_libraries(matting-models-test PRIVATE OBS::libobs)
