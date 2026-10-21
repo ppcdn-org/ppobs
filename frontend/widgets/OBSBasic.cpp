@@ -734,7 +734,6 @@ bool OBSBasic::InitBasicConfigDefaults()
 	config_set_default_bool(activeConfiguration, "Stream1", "BeautyFilter", false);
 	config_set_default_bool(activeConfiguration, "Stream1", "ClarityFilter", true);
 	config_set_default_bool(activeConfiguration, "Stream1", "QualityScore", true);
-	config_set_default_string(activeConfiguration, "Stream1", "VoiceTemplate", "none");
 	config_set_default_bool(activeConfiguration, "Stream1", "EnableMultitrackVideo", false);
 	config_set_default_bool(activeConfiguration, "Stream1", "MultitrackVideoMaximumAggregateBitrateAuto", true);
 	config_set_default_bool(activeConfiguration, "Stream1", "MultitrackVideoMaximumVideoTracksAuto", true);
@@ -1407,7 +1406,6 @@ void OBSBasic::OnFirstLoad()
 	ApplyTemporalDenoiseSetting();
 	ApplyBeautyFilterSetting();
 	ApplyClarityFilterSetting();
-	ApplyVoiceTemplateSetting();
 
 	bool showLogViewerOnStartup = config_get_bool(App()->GetUserConfig(), "LogViewer", "ShowLogStartup");
 
@@ -1522,141 +1520,6 @@ void OBSBasic::ApplyClarityFilterSetting()
 	};
 
 	obs_enum_sources(cb, &enabled);
-}
-
-namespace {
-
-/* Voice templates are a frontend-level composition of existing audio filters
- * rather than a single plugin-side filter: see docs/audioshift-design.md 6.4.
- * Each row drives audioshift_filter + basic_eq_filter + compressor_filter with
- * one tuned parameter set. Values are design estimates, not ear-validated. */
-struct VoiceTemplateParams {
-	double semitones;
-	double eq_low;
-	double eq_mid;
-	double eq_high;
-	double comp_ratio;
-	double comp_threshold;
-	double comp_output_gain;
-	int comp_attack;
-	int comp_release;
-};
-
-struct VoiceTemplate {
-	const char *id;
-	VoiceTemplateParams params;
-};
-
-const VoiceTemplate voice_templates[] = {
-	{"gentle_baritone", {-3.0, 2.0, 0.0, -3.0, 3.0, -22.0, 2.0, 10, 200}},
-	{"sweet_soprano", {4.0, -2.0, 1.0, 3.0, 3.0, -20.0, 1.0, 8, 150}},
-	{"deep_bass", {-5.0, 3.0, -1.0, -4.0, 4.0, -24.0, 2.0, 12, 250}},
-};
-
-const VoiceTemplate *FindVoiceTemplate(const char *id)
-{
-	for (const VoiceTemplate &tpl : voice_templates) {
-		if (strcmp(tpl.id, id) == 0)
-			return &tpl;
-	}
-	return nullptr;
-}
-
-obs_data_t *MakeAudioShiftSettings(const VoiceTemplateParams &p)
-{
-	obs_data_t *settings = obs_data_create();
-	obs_data_set_string(settings, "preset", "custom");
-	obs_data_set_double(settings, "pitch_semitones", p.semitones);
-	return settings;
-}
-
-obs_data_t *MakeEqSettings(const VoiceTemplateParams &p)
-{
-	obs_data_t *settings = obs_data_create();
-	obs_data_set_double(settings, "low", p.eq_low);
-	obs_data_set_double(settings, "mid", p.eq_mid);
-	obs_data_set_double(settings, "high", p.eq_high);
-	return settings;
-}
-
-obs_data_t *MakeCompressorSettings(const VoiceTemplateParams &p)
-{
-	obs_data_t *settings = obs_data_create();
-	obs_data_set_double(settings, "ratio", p.comp_ratio);
-	obs_data_set_double(settings, "threshold", p.comp_threshold);
-	obs_data_set_int(settings, "attack_time", p.comp_attack);
-	obs_data_set_int(settings, "release_time", p.comp_release);
-	obs_data_set_double(settings, "output_gain", p.comp_output_gain);
-	obs_data_set_string(settings, "sidechain_source", "none");
-	return settings;
-}
-
-/* Idempotently ensures a private filter with the given fixed name exists on
- * the source, updating it in place when it does so switching templates cannot
- * punch an audible gap by removing and re-adding the chain. */
-void ApplyVoiceTemplateFilter(obs_source_t *source, const char *filter_id, const char *filter_name,
-			      obs_data_t *settings)
-{
-	OBSSourceAutoRelease existing = obs_source_get_filter_by_name(source, filter_name);
-	if (existing) {
-		obs_source_update(existing, settings);
-	} else {
-		OBSSourceAutoRelease filter = obs_source_create_private(filter_id, filter_name, settings);
-		if (filter)
-			obs_source_filter_add(source, filter);
-	}
-}
-
-const char *VOICE_TEMPLATE_MIC_ID = "wasapi_input_capture";
-const char *VOICE_TEMPLATE_AUDIOSHIFT_NAME = "AudioShift (Voice Template)";
-const char *VOICE_TEMPLATE_EQ_NAME = "3-Band EQ (Voice Template)";
-const char *VOICE_TEMPLATE_COMPRESSOR_NAME = "Compressor (Voice Template)";
-
-} // namespace
-
-void OBSBasic::ApplyVoiceTemplateSetting()
-{
-	const char *templateId = config_get_string(activeConfiguration, "Stream1", "VoiceTemplate");
-	const VoiceTemplate *tpl = FindVoiceTemplate(templateId);
-	obs_enum_sources(
-		[](void *param, obs_source_t *source) -> bool {
-			const VoiceTemplate *tpl = static_cast<const VoiceTemplate *>(param);
-
-			/* Voice-only: never touch desktop/loopback capture (or
-			 * any other source type), where this chain would just
-			 * damage game/music audio. */
-			if (strcmp(obs_source_get_id(source), VOICE_TEMPLATE_MIC_ID) != 0)
-				return true;
-
-			if (!tpl) {
-				const char *names[] = {VOICE_TEMPLATE_AUDIOSHIFT_NAME, VOICE_TEMPLATE_EQ_NAME,
-						       VOICE_TEMPLATE_COMPRESSOR_NAME};
-				for (const char *name : names) {
-					OBSSourceAutoRelease existing = obs_source_get_filter_by_name(source, name);
-					if (existing)
-						obs_source_filter_remove(source, existing);
-				}
-				return true;
-			}
-
-			OBSDataAutoRelease audioShift = MakeAudioShiftSettings(tpl->params);
-			OBSDataAutoRelease eq = MakeEqSettings(tpl->params);
-			OBSDataAutoRelease compressor = MakeCompressorSettings(tpl->params);
-
-			/* Add order == chain order (AudioShift -> EQ ->
-			 * Compressor): libobs inserts each newly added filter
-			 * at index 0 and points its filter_target at the old
-			 * index 0, so the last one added ends up closest to
-			 * the output. See docs/audioshift-design.md 6.4. */
-			ApplyVoiceTemplateFilter(source, "audioshift_filter", VOICE_TEMPLATE_AUDIOSHIFT_NAME,
-						 audioShift);
-			ApplyVoiceTemplateFilter(source, "basic_eq_filter", VOICE_TEMPLATE_EQ_NAME, eq);
-			ApplyVoiceTemplateFilter(source, "compressor_filter", VOICE_TEMPLATE_COMPRESSOR_NAME,
-						 compressor);
-
-			return true;
-		},
-		const_cast<void *>(static_cast<const void *>(tpl)));
 }
 
 OBSBasic::~OBSBasic()
