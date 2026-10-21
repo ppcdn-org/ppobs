@@ -25,6 +25,8 @@
 #include "obs-ffmpeg-output.h"
 #include "obs-ffmpeg-formats.h"
 #include "obs-ffmpeg-compat.h"
+/* The publish token rides in the streamid, so the URL must not be logged raw. */
+#include "publish-url-redact.h"
 #include "obs-ffmpeg-rist.h"
 #include "obs-ffmpeg-srt.h"
 #include "srt-degrade-client.h"
@@ -573,7 +575,9 @@ static inline int open_output_file(struct ffmpeg_output *stream, struct ffmpeg_d
 	} else if (allowed_proto) {
 		ret = avio_open2(&data->output->pb, data->config.url, AVIO_FLAG_WRITE, NULL, &dict);
 	} else {
-		info("[ffmpeg mpegts muxer]: Invalid protocol: %s", data->config.url);
+		struct dstr safe_url = {0};
+		info("[ffmpeg mpegts muxer]: Invalid protocol: %s", publish_url_redact(&safe_url, data->config.url));
+		dstr_free(&safe_url);
 		return OBS_OUTPUT_BAD_PATH;
 	}
 
@@ -623,8 +627,10 @@ static inline int open_output_file(struct ffmpeg_output *stream, struct ffmpeg_d
 	} else {
 		ret = allocate_custom_aviocontext(stream, rist);
 		if (ret < 0) {
-			info("Couldn't allocate custom avio_context for url: '%s', %s", data->config.url,
-			     av_err2str(ret));
+			struct dstr safe_url = {0};
+			info("Couldn't allocate custom avio_context for url: '%s', %s",
+			     publish_url_redact(&safe_url, data->config.url), av_err2str(ret));
+			dstr_free(&safe_url);
 			return OBS_OUTPUT_ERROR;
 		}
 	}
@@ -682,8 +688,12 @@ static void close_mpegts_url(struct ffmpeg_output *stream, bool is_rist)
 	avio_context_free(&s);
 	s = NULL;
 
-	if (err)
-		info("[ffmpeg mpegts muxer]: Error closing URL %s", stream->ff_data.config.url);
+	if (err) {
+		struct dstr safe_url = {0};
+		info("[ffmpeg mpegts muxer]: Error closing URL %s",
+		     publish_url_redact(&safe_url, stream->ff_data.config.url));
+		dstr_free(&safe_url);
+	}
 }
 
 void ffmpeg_mpegts_data_free(struct ffmpeg_output *stream, struct ffmpeg_data *data)

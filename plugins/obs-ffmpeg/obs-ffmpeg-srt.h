@@ -18,6 +18,8 @@
 #pragma once
 #include <obs-module.h>
 #include "obs-ffmpeg-url.h"
+/* The publish token rides in the streamid, so the URL must not be logged raw. */
+#include "publish-url-redact.h"
 #include <srt/srt.h>
 #include <libavformat/avformat.h>
 #ifdef _WIN32
@@ -285,14 +287,17 @@ static int libsrt_listen_connect(int eid, SRTSOCKET fd, const struct sockaddr *a
 
 	ret = libsrt_network_wait_fd_timeout(h, eid, 1, timeout, &h->interrupt_callback);
 	if (ret < 0) {
+		struct dstr safe_url = {0};
+		const char *logged_url = publish_url_redact(&safe_url, h->url);
 		if (will_try_next) {
 			blog(LOG_WARNING,
 			     "[obs-ffmpeg mpegts muxer / libsrt]: Connection to %s failed (%s), trying next address",
-			     h->url, av_err2str(ret));
+			     logged_url, av_err2str(ret));
 		} else {
-			blog(LOG_ERROR, "[obs-ffmpeg mpegts muxer / libsrt]: Connection to %s failed: %s", h->url,
-			     av_err2str(ret));
+			blog(LOG_ERROR, "[obs-ffmpeg mpegts muxer / libsrt]: Connection to %s failed: %s",
+			     logged_url, av_err2str(ret));
 		}
+		dstr_free(&safe_url);
 	} else {
 		SRT_SOCKSTATUS state = srt_getsockstate(fd);
 		if (state != SRTS_CONNECTED) {

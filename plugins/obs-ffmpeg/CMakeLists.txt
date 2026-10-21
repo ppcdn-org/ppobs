@@ -104,3 +104,13 @@ if(OS_WINDOWS)
 endif()
 
 set_target_properties_obs(obs-ffmpeg PROPERTIES FOLDER plugins/obs-ffmpeg PREFIX "")
+
+if(ENABLE_TEST_INPUT)
+  # publish-url-redact.h is header-only, so this needs nothing of the plugin
+  # itself. It links libobs only for dstr.
+  add_executable(publish-url-redact-test publish-url-redact-test.c)
+  target_include_directories(publish-url-redact-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+  target_link_libraries(publish-url-redact-test PRIVATE OBS::libobs)
+  add_test(NAME publish-url-redact COMMAND publish-url-redact-test)
+  set_target_properties(publish-url-redact-test PROPERTIES FOLDER tests)
+endif()
