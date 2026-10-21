@@ -177,6 +177,59 @@ int main(void)
 		CHECK(left == 0);
 	}
 
+	/* --- frames that arrive together are shown one at a time ---
+	 *
+	 * The worker produces frames in bursts, and the picture used to show the
+	 * newest of each: a mouth that moved a few times a second. A second of audio
+	 * pushed at once makes the stub emit about 25 frames together; played out
+	 * at the frame rate they take about a second to show, so the displayed
+	 * timestamp must walk through them rather than jump to the end. */
+	{
+		struct avatar_engine_config cfg = make_config(AVATAR_WORKER_SCRIPT, python, log_path.array);
+		void *engine = avatar_engine_sidecar_ops.create(&cfg, NULL);
+		CHECK(engine != NULL);
+		CHECK(wait_ready(engine, true, READY_TIMEOUT_MS));
+
+		float block[4096];
+		for (int i = 0; i < 4096; i++)
+			block[i] = 0.4f;
+
+		int64_t pts = 0;
+		for (int i = 0; i < 4; i++) {
+			avatar_engine_sidecar_ops.push_audio(engine, block, 4096, pts);
+			pts += 4096LL * 1000000000LL / TEST_SAMPLE_RATE;
+		}
+
+		int64_t seen[256];
+		int seen_count = 0;
+		int64_t last = -1;
+		bool monotonic = true;
+
+		const uint64_t watch_started = os_gettime_ns();
+		while (elapsed_ms(watch_started) < 2500) {
+			struct avatar_engine_frame frame;
+			if (avatar_engine_sidecar_ops.lock_frame(engine, &frame)) {
+				const int64_t now_pts = frame.pts_ns;
+				avatar_engine_sidecar_ops.unlock_frame(engine);
+
+				if (now_pts != last) {
+					if (now_pts < last)
+						monotonic = false;
+					if (seen_count < 256)
+						seen[seen_count++] = now_pts;
+					last = now_pts;
+				}
+			}
+			os_sleep_ms(5);
+		}
+
+		printf("a burst of frames was shown as %d distinct pictures\n", seen_count);
+		CHECK(monotonic);
+		CHECK(seen_count >= 15);
+
+		avatar_engine_sidecar_ops.destroy(engine);
+	}
+
 	/* --- a worker that dies at once is retried with a growing delay --- */
 	{
 		FILE *script = fopen(crash_script.array, "wb");
@@ -259,6 +312,26 @@ int main(void)
 		printf("pushed a minute of audio at a worker that never reads: slowest push %llu ms, total %llu ms\n",
 		       (unsigned long long)slowest_ms, (unsigned long long)elapsed_ms(push_started));
 		CHECK(slowest_ms < 100);
+
+		/* A worker that takes none of it is as far behind as a worker can be, so
+		 * the engine must ask for fewer frames a second rather than keep throwing
+		 * the audio away. It judges over ten seconds of wall time. */
+		struct avatar_engine_stats stats;
+		avatar_engine_sidecar_ops.get_stats(engine, &stats);
+		CHECK(stats.fps == TEST_FPS);
+
+		const uint64_t watch_started = os_gettime_ns();
+		while (elapsed_ms(watch_started) < 11500) {
+			avatar_engine_sidecar_ops.push_audio(engine, block, 4096, pts);
+			pts += 4096LL * 1000000000LL / TEST_SAMPLE_RATE;
+			os_sleep_ms(30);
+		}
+
+		avatar_engine_sidecar_ops.get_stats(engine, &stats);
+		printf("frame rate after ten seconds of a worker that never reads: %u (asked for %d)\n", stats.fps,
+		       TEST_FPS);
+		CHECK(stats.fps < TEST_FPS);
+		CHECK(stats.fps >= 15);
 
 		const uint64_t destroy_started = os_gettime_ns();
 		avatar_engine_sidecar_ops.destroy(engine);

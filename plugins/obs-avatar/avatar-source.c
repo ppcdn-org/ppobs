@@ -31,6 +31,8 @@
  * in the environment wins, as it does for the worker. */
 #define AVATAR_DEFAULT_MUSETALK_DIR "D:\\github\\MuseTalk"
 
+#define AVATAR_MAX_FPS 25
+
 #define S_MODE_OFF "off"
 #define S_MODE_SIDECAR "sidecar"
 #define S_MODE_VISEME "viseme"
@@ -541,7 +543,18 @@ static void avatar_source_update(void *data, obs_data_t *settings)
 
 	const char *path = obs_data_get_string(settings, S_IMAGE);
 	const char *mode = obs_data_get_string(settings, S_MODE);
-	const uint32_t fps = (uint32_t)obs_data_get_int(settings, S_FPS);
+	uint32_t fps = (uint32_t)obs_data_get_int(settings, S_FPS);
+
+	/* 30 used to be offered, and a scene saved with it would otherwise keep
+	 * asking a worker for twice what it can do. */
+	if (fps > AVATAR_MAX_FPS) {
+		/* Once, not on every edit of an unrelated setting. */
+		if (ctx->fps != AVATAR_MAX_FPS)
+			blog(LOG_WARNING,
+			     "[obs-avatar: '%s'] %u fps is more than the worker can generate in real time; using %u",
+			     obs_source_get_name(ctx->source), fps, AVATAR_MAX_FPS);
+		fps = AVATAR_MAX_FPS;
+	}
 
 	const bool image_changed = !ctx->image_path || strcmp(ctx->image_path, path) != 0;
 	const bool mode_changed = !ctx->mode || strcmp(ctx->mode, mode) != 0;
@@ -937,9 +950,27 @@ static void avatar_report_audio(struct avatar_source *ctx, size_t drained)
 					    (double)m.radius_x, (double)m.radius_y, (double)m.travel,
 					    (double)m.teeth, (double)m.tongue);
 			}
-			else if (os_atomic_load_bool(&ctx->have_frame))
-				dstr_printf(&lag, ", frame lag %.0f ms",
-					    (double)(ctx->audio_pts - ctx->frame_pts) / 1000000.0);
+			else {
+				/* Asked of the engine: one that draws for itself is the
+				 * only place that knows which frame it showed. The
+				 * source's own copy of the timestamp is only updated
+				 * when it uploads a frame, which such an engine never
+				 * lets it do. */
+				struct avatar_engine_stats stats = {0};
+
+				pthread_mutex_lock(&ctx->engine_mutex);
+				if (ctx->ops && ctx->ops->get_stats && ctx->engine)
+					ctx->ops->get_stats(ctx->engine, &stats);
+				const int64_t audio_pts = ctx->audio_pts;
+				pthread_mutex_unlock(&ctx->engine_mutex);
+
+				if (stats.shown)
+					dstr_printf(&lag, ", frame lag %.0f ms, %u fps",
+						    (double)(audio_pts - stats.shown_pts_ns) / 1000000.0, stats.fps);
+				else if (os_atomic_load_bool(&ctx->have_frame))
+					dstr_printf(&lag, ", frame lag %.0f ms",
+						    (double)(ctx->audio_pts - ctx->frame_pts) / 1000000.0);
+			}
 
 			blog(LOG_INFO,
 			     "[obs-avatar: '%s'] tap %s: peak %.1f dBFS, rms %.1f dBFS, "
@@ -1016,11 +1047,11 @@ static void avatar_source_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, S_AUDIO_SOURCE, "none");
 	obs_data_set_default_string(settings, S_MODE, S_MODE_OFF);
-	/* MuseTalk costs about 40 ms a frame on an RTX 4060 with nothing else on
-	 * the GPU, so 25 fps is already no headroom and 30 is slower than real
-	 * time.  A worker that cannot keep up drops audio and the mouth lags and
-	 * skips; 20 leaves room for OBS's own encoders to share the card. */
-	obs_data_set_default_int(settings, S_FPS, 20);
+	/* MuseTalk costs 45-55 ms a frame on an RTX 4060 with nothing else on the
+	 * GPU: 20 fps is exactly real time, 25 and 30 are slower than it.  A worker
+	 * that cannot keep up drops audio and the mouth lags and skips, so the
+	 * default leaves room for OBS's own encoders to share the card. */
+	obs_data_set_default_int(settings, S_FPS, 15);
 	/* Measured on this model: at 1.0 the mouth barely opens on most faces, 2.0
 	 * is clearly visible, and by 3.0 the lip edges start to show artefacts. */
 	obs_data_set_default_double(settings, S_MOUTH_GAIN, 200.0);
@@ -1115,7 +1146,6 @@ static obs_properties_t *avatar_source_properties(void *data)
 	obs_property_list_add_int(fps, "15", 15);
 	obs_property_list_add_int(fps, "20", 20);
 	obs_property_list_add_int(fps, "25", 25);
-	obs_property_list_add_int(fps, "30", 30);
 
 	/* Mode A's worker.  Off means "I start it myself", the way to watch its
 	 * console; the pipe to point it at is shown further down.  An empty

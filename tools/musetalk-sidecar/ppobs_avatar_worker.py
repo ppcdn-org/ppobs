@@ -67,6 +67,7 @@ MSG_ERROR = 7
 MSG_BYE = 8
 MSG_CROP = 9
 MSG_MOUTH_GAIN = 10
+MSG_SET_FPS = 11
 
 READY_REAL_MODEL = 1 << 0
 
@@ -321,6 +322,25 @@ class Session:
             self.engine.mouth_gain = gain
             send_log(self.stream, LOG_INFO, f"mouth gain set to {gain:.2f}")
 
+    def on_set_fps(self, payload: bytes) -> None:
+        if len(payload) != 4:
+            raise ProtocolError(f"SET_FPS carries {len(payload)} bytes, expected 4")
+
+        (fps,) = struct.unpack("<I", payload)
+        if not 1 <= fps <= 120:
+            send_log(self.stream, LOG_WARNING, f"ignoring an unusable frame rate of {fps}")
+            return
+
+        self.fps = fps
+        self.samples_per_frame = max(1, self.sample_rate // fps)
+        self.buffer.clear()
+        self.buffer_pts = None
+
+        if hasattr(self.engine, "set_fps"):
+            self.engine.set_fps(fps)
+
+        send_log(self.stream, LOG_INFO, f"generating at {fps} fps from now on")
+
     def send_region(self, pixels: bytes, pts_ns: int, rect) -> None:
         """A region goes as CROP for the plugin to composite; rect None means
         the engine produced a whole picture and it goes as FRAME."""
@@ -379,6 +399,8 @@ class Session:
                 self.on_audio(payload)
             elif msg_type == MSG_MOUTH_GAIN:
                 self.on_mouth_gain(payload)
+            elif msg_type == MSG_SET_FPS:
+                self.on_set_fps(payload)
             elif msg_type == MSG_BYE:
                 return
             else:
@@ -467,6 +489,10 @@ def selftest() -> int:
     built = AUDIO_HEADER.pack(1000000000, 2) + struct.pack("<2f", 0.5, -0.25)
     assert built == expected_audio, built.hex()
 
+    # SET_FPS (type 11): a header for a 4-byte payload, and 20.
+    assert HEADER.pack(4, MSG_SET_FPS, 0) == bytes.fromhex("04000000" "0B00" "0000")
+    assert struct.pack("<I", 20) == bytes.fromhex("14000000")
+
     # MOUTH_GAIN (type 10): a header for a 4-byte payload, and 2.0f.
     assert HEADER.pack(4, MSG_MOUTH_GAIN, 0) == bytes.fromhex("04000000" "0A00" "0000")
     assert struct.pack("<f", 2.0) == bytes.fromhex("00000040")
@@ -543,4 +569,23 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    except SystemExit:
+        raise
+    except BaseException:
+        # An unhandled error (a CUDA fault, an out-of-memory) leaves the GPU
+        # context in a state where the interpreter's normal shutdown can hang
+        # in the driver, and a worker that is neither working nor gone holds
+        # the pipe, the VRAM and the avatar hostage until someone kills it.
+        # Say what happened and leave at once, so the plugin sees the exit
+        # and starts a fresh one.
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+
+    sys.stdout.flush()
+    sys.exit(code)

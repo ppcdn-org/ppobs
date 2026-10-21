@@ -264,7 +264,9 @@ int main(void)
 
 	/* --- audio out, frames back --- */
 	int64_t pts = 0;
-	pts = push_audio(engine, pts, TEST_FPS, 0.5f); /* one second, loud */
+	/* One second, loud - or two for the real engine, which holds back a window
+	 * and a stretch of look-ahead (together over a second) before its first frame. */
+	pts = push_audio(engine, pts, real ? TEST_FPS * 2 : TEST_FPS, 0.5f);
 
 	if (real) {
 		/* The real engine repaints a region of the artwork rather than

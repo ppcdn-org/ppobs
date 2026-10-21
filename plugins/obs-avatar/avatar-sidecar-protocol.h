@@ -79,6 +79,13 @@ enum avatar_msg_type {
 	 * tuning it does not cost the minute a worker restart takes. A worker
 	 * that predates it ignores it, like any unknown type. */
 	AVATAR_MSG_MOUTH_GAIN = 10,
+
+	/* plugin -> worker: a uint32 frame rate to generate at from now on, without
+	 * reloading anything. The rate negotiated in HELLO is a request; the
+	 * plugin is the one that can see the worker falling behind real time, and
+	 * the cure - fewer frames a second - must not cost the minute a restart
+	 * takes while the mouth lags further. */
+	AVATAR_MSG_SET_FPS = 11,
 };
 
 /* READY flags */
@@ -92,6 +99,9 @@ enum avatar_msg_type {
  * alpha is the blend mask. x/y are in the reference frame's pixel coordinates,
  * which READY reports as its width/height. */
 #define AVATAR_CROP_HEADER_SIZE 24
+
+/* SET_FPS: a single uint32. */
+#define AVATAR_SET_FPS_PAYLOAD_SIZE 4
 
 /* MOUTH_GAIN: a single float32. */
 #define AVATAR_MOUTH_GAIN_PAYLOAD_SIZE 4

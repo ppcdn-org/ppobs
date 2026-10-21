@@ -67,6 +67,30 @@
  * still looks like it is talking. */
 #define SIDECAR_FRAME_STALE_NS 500000000ULL
 
+/* Frames the worker has produced but the picture has not shown yet. The worker
+ * makes them in bursts - a batch of eight arrives together, then nothing for
+ * most of a second - and showing only the newest of each burst turns the
+ * mouth's motion into a few steps a second. They are kept and played out at
+ * the generated frame rate instead. Past SIDECAR_QUEUE_BACKLOG_S of backlog
+ * (a stall that has just cleared) the oldest are dropped, down to
+ * SIDECAR_QUEUE_KEEP_S, because a mouth that catches up by skipping is better
+ * than one that stays a couple of seconds behind for good. */
+#define SIDECAR_QUEUE_SLOTS 64
+#define SIDECAR_QUEUE_BACKLOG_S 1.5
+#define SIDECAR_QUEUE_KEEP_S 0.5
+
+/* A worker that cannot keep up is asked for fewer frames a second. Judged over
+ * a stretch rather than a moment, because OBS starting an encoder or a scene
+ * change can cost a second of audio once without meaning anything: when more
+ * than SIDECAR_FPS_DROP_RATIO of the audio had to be thrown away over
+ * SIDECAR_FPS_WINDOW_NS, the rate goes down one step, never below the floor.
+ * Dropping audio is what the plugin does instead of letting the picture fall
+ * ever further behind, but it leaves holes in the speech the model hears, so
+ * the better answer to a worker that is too slow is less work for it. */
+#define SIDECAR_FPS_WINDOW_NS 10000000000ULL
+#define SIDECAR_FPS_DROP_RATIO 0.25
+#define SIDECAR_FPS_FLOOR 15
+
 /* Relaunch delay for a worker the plugin started: doubling from the minimum
  * to the maximum, so a worker that dies on import (a wrong interpreter, a
  * missing package) is retried a few times a minute instead of spinning, while
@@ -85,6 +109,17 @@
  * sees the pipe close), and after a BYE at shutdown. Past this it is killed. */
 #define SIDECAR_EXIT_GRACE_MS 1000
 #define SIDECAR_BYE_GRACE_MS 2000
+
+struct sidecar_queued {
+	uint8_t *pixels;
+	size_t cap;
+	uint32_t width;
+	uint32_t height;
+	int64_t pts;
+	bool is_region;
+	uint32_t x;
+	uint32_t y;
+};
 
 struct sidecar {
 	obs_source_t *owner;
@@ -135,13 +170,23 @@ struct sidecar {
 	uint64_t drop_reported;
 	float mouth_gain;
 	bool gain_dirty;
+	uint32_t fps_target;
+	bool fps_dirty;
+	uint64_t mon_start;
+	uint64_t mon_pushed;
+	uint64_t mon_dropped;
 	HANDLE tx_event;
 	pthread_t writer;
 	bool writer_valid;
 	bool bye_pending;
 
-	/* The latest frame, handed to the renderer under this lock. */
+	/* The frame being shown, handed to the renderer under this lock, and the
+	 * ones waiting behind it. */
 	pthread_mutex_t frame_mutex;
+	struct sidecar_queued queue[SIDECAR_QUEUE_SLOTS];
+	size_t queue_head;
+	size_t queue_count;
+	uint64_t next_due;
 	uint8_t *frame;
 	size_t frame_cap;
 	uint32_t frame_width;
@@ -149,6 +194,8 @@ struct sidecar {
 	int64_t frame_pts;
 	bool frame_valid;
 	uint64_t frame_arrived;
+	int64_t shown_pts;
+	bool shown_valid;
 
 	/* Set when the frame is only the repainted region: where it goes, and
 	 * the reference frame it is positioned in. */
@@ -356,6 +403,9 @@ static bool sidecar_handle_ready(struct sidecar *sc, const uint8_t *payload, uin
 	/* The reference frame a CROP's coordinates are relative to. */
 	sc->ref_width = width;
 	sc->ref_height = height;
+	/* Whatever was queued came from a worker that is gone. */
+	sc->queue_count = 0;
+	sc->next_due = 0;
 	pthread_mutex_unlock(&sc->frame_mutex);
 
 	pthread_mutex_lock(&sc->state_mutex);
@@ -377,10 +427,108 @@ static bool sidecar_handle_ready(struct sidecar *sc, const uint8_t *payload, uin
 	/* A worker that has just (re)started knows nothing of the setting. */
 	pthread_mutex_lock(&sc->tx_mutex);
 	sc->gain_dirty = true;
+	sc->mon_start = 0;
+	sc->mon_pushed = 0;
+	sc->mon_dropped = 0;
 	pthread_mutex_unlock(&sc->tx_mutex);
 	SetEvent(sc->tx_event);
 
 	return true;
+}
+
+/* Caller holds frame_mutex. */
+static void sidecar_queue_drop_oldest(struct sidecar *sc, size_t count)
+{
+	if (count > sc->queue_count)
+		count = sc->queue_count;
+	sc->queue_head = (sc->queue_head + count) % SIDECAR_QUEUE_SLOTS;
+	sc->queue_count -= count;
+}
+
+static void sidecar_enqueue(struct sidecar *sc, const uint8_t *pixels_in, uint32_t width, uint32_t height, int64_t pts,
+			    bool is_region, uint32_t x, uint32_t y)
+{
+	const size_t pixels = (size_t)width * (size_t)height * 4u;
+	const uint32_t fps = sc->fps ? sc->fps : 25;
+
+	pthread_mutex_lock(&sc->frame_mutex);
+
+	if (sc->queue_count == SIDECAR_QUEUE_SLOTS)
+		sidecar_queue_drop_oldest(sc, 1);
+
+	struct sidecar_queued *slot = &sc->queue[(sc->queue_head + sc->queue_count) % SIDECAR_QUEUE_SLOTS];
+	if (slot->cap < pixels) {
+		slot->pixels = brealloc(slot->pixels, pixels);
+		slot->cap = pixels;
+	}
+	memcpy(slot->pixels, pixels_in, pixels);
+	slot->width = width;
+	slot->height = height;
+	slot->pts = pts;
+	slot->is_region = is_region;
+	slot->x = x;
+	slot->y = y;
+	sc->queue_count++;
+
+	/* Skipping ahead is only for a real backlog; ordinary bursts are shorter. */
+	const size_t backlog = (size_t)(SIDECAR_QUEUE_BACKLOG_S * fps);
+	const size_t keep = (size_t)(SIDECAR_QUEUE_KEEP_S * fps);
+	if (sc->queue_count > backlog)
+		sidecar_queue_drop_oldest(sc, sc->queue_count - keep);
+
+	/* When the worker last produced anything: staleness is about whether it
+	 * is alive, not about whether the queue has run dry. */
+	sc->frame_arrived = os_gettime_ns();
+
+	pthread_mutex_unlock(&sc->frame_mutex);
+}
+
+/* Moves the picture on to the next waiting frame when its time has come. Called
+ * under frame_mutex by whoever is about to read the current frame - the render
+ * path runs once per output, so this is driven by the clock and not by the
+ * number of callers.
+ *
+ * With nothing waiting the last frame stays up and the clock is released, so the
+ * next frame to arrive is shown at once instead of waiting out an interval that
+ * was meant for a frame that never came. */
+static void sidecar_playout_advance(struct sidecar *sc)
+{
+	const uint64_t now = os_gettime_ns();
+	const uint32_t fps = sc->fps ? sc->fps : 25;
+	const uint64_t interval = 1000000000ULL / fps;
+
+	if (!sc->queue_count) {
+		sc->next_due = 0;
+		return;
+	}
+
+	if (sc->next_due && now < sc->next_due)
+		return;
+
+	struct sidecar_queued *slot = &sc->queue[sc->queue_head];
+
+	/* The slot's buffer becomes the current frame's and the old current
+	 * buffer goes back to the slot, so nothing is copied. */
+	uint8_t *old_pixels = sc->frame;
+	const size_t old_cap = sc->frame_cap;
+
+	sc->frame = slot->pixels;
+	sc->frame_cap = slot->cap;
+	slot->pixels = old_pixels;
+	slot->cap = old_cap;
+
+	sc->frame_width = slot->width;
+	sc->frame_height = slot->height;
+	sc->frame_pts = slot->pts;
+	sc->frame_is_region = slot->is_region;
+	sc->region_x = slot->x;
+	sc->region_y = slot->y;
+	sc->frame_valid = true;
+
+	sidecar_queue_drop_oldest(sc, 1);
+
+	/* Keep the cadence through a burst, but never try to make up a long pause. */
+	sc->next_due = (sc->next_due && now - sc->next_due < 2 * interval) ? sc->next_due + interval : now + interval;
 }
 
 static bool sidecar_handle_frame(struct sidecar *sc, const uint8_t *payload, uint32_t len)
@@ -400,21 +548,7 @@ static bool sidecar_handle_frame(struct sidecar *sc, const uint8_t *payload, uin
 		return true;
 	}
 
-	const size_t pixels = (size_t)width * (size_t)height * 4u;
-
-	pthread_mutex_lock(&sc->frame_mutex);
-	if (sc->frame_cap < pixels) {
-		sc->frame = brealloc(sc->frame, pixels);
-		sc->frame_cap = pixels;
-	}
-	memcpy(sc->frame, payload + AVATAR_FRAME_HEADER_SIZE, pixels);
-	sc->frame_width = width;
-	sc->frame_height = height;
-	sc->frame_pts = pts;
-	sc->frame_valid = true;
-	sc->frame_is_region = false;
-	sc->frame_arrived = os_gettime_ns();
-	pthread_mutex_unlock(&sc->frame_mutex);
+	sidecar_enqueue(sc, payload + AVATAR_FRAME_HEADER_SIZE, width, height, pts, false, 0, 0);
 
 	pthread_mutex_lock(&sc->state_mutex);
 	sc->stats.frames++;
@@ -448,23 +582,7 @@ static bool sidecar_handle_crop(struct sidecar *sc, const uint8_t *payload, uint
 		return true;
 	}
 
-	const size_t pixels = (size_t)width * (size_t)height * 4u;
-
-	pthread_mutex_lock(&sc->frame_mutex);
-	if (sc->frame_cap < pixels) {
-		sc->frame = brealloc(sc->frame, pixels);
-		sc->frame_cap = pixels;
-	}
-	memcpy(sc->frame, payload + AVATAR_CROP_HEADER_SIZE, pixels);
-	sc->frame_width = width;
-	sc->frame_height = height;
-	sc->frame_pts = pts;
-	sc->frame_valid = true;
-	sc->frame_is_region = true;
-	sc->region_x = x;
-	sc->region_y = y;
-	sc->frame_arrived = os_gettime_ns();
-	pthread_mutex_unlock(&sc->frame_mutex);
+	sidecar_enqueue(sc, payload + AVATAR_CROP_HEADER_SIZE, width, height, pts, true, x, y);
 
 	pthread_mutex_lock(&sc->state_mutex);
 	sc->stats.frames++;
@@ -966,6 +1084,8 @@ static void *sidecar_writer_thread(void *param)
 	while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) {
 		for (;;) {
 			uint8_t gain_payload[AVATAR_MOUTH_GAIN_PAYLOAD_SIZE];
+			uint8_t fps_payload[AVATAR_SET_FPS_PAYLOAD_SIZE];
+			bool send_fps = false;
 			bool send_gain = false;
 			bool send_bye = false;
 			uint32_t audio_len = 0;
@@ -976,6 +1096,12 @@ static void *sidecar_writer_thread(void *param)
 				avatar_put_f32(gain_payload, sc->mouth_gain);
 				sc->gain_dirty = false;
 				send_gain = true;
+			}
+
+			if (sc->fps_dirty) {
+				avatar_put_u32(fps_payload, sc->fps_target);
+				sc->fps_dirty = false;
+				send_fps = true;
 			}
 
 			size_t count = sc->ring_len;
@@ -1007,7 +1133,7 @@ static void *sidecar_writer_thread(void *param)
 
 			pthread_mutex_unlock(&sc->tx_mutex);
 
-			if (!send_gain && !audio_len && !send_bye)
+			if (!send_gain && !send_fps && !audio_len && !send_bye)
 				break;
 
 			/* Nothing is sent to a worker that is not there; whatever was
@@ -1016,7 +1142,9 @@ static void *sidecar_writer_thread(void *param)
 				continue;
 
 			bool ok = true;
-			if (send_gain)
+			if (send_fps)
+				ok = sidecar_send(sc, AVATAR_MSG_SET_FPS, fps_payload, sizeof(fps_payload));
+			if (ok && send_gain)
 				ok = sidecar_send(sc, AVATAR_MSG_MOUTH_GAIN, gain_payload, sizeof(gain_payload));
 			if (ok && audio_len)
 				ok = sidecar_send(sc, AVATAR_MSG_AUDIO, sc->tx, audio_len);
@@ -1085,6 +1213,8 @@ static void *sidecar_create(const struct avatar_engine_config *cfg, obs_source_t
 	sc->ring_cap = (size_t)(sc->sample_rate ? sc->sample_rate : 16000) * SIDECAR_TX_RING_SECONDS;
 	sc->ring = bmalloc(sc->ring_cap * sizeof(float));
 	sc->mouth_gain = cfg->mouth_gain > 0.0f ? cfg->mouth_gain : 1.0f;
+	sc->fps_target = cfg->fps;
+	sc->stats.fps = cfg->fps;
 
 	/* The pipe name has to be unique per source: two avatar sources in one
 	 * scene would otherwise fight over one pipe, and the second
@@ -1226,6 +1356,9 @@ static void sidecar_destroy(void *data)
 	pthread_mutex_destroy(&sc->state_mutex);
 	pthread_mutex_destroy(&sc->tx_mutex);
 
+	for (size_t i = 0; i < SIDECAR_QUEUE_SLOTS; i++)
+		bfree(sc->queue[i].pixels);
+
 	bfree(sc->ring);
 	bfree(sc->frame);
 	bfree(sc->rx);
@@ -1258,7 +1391,11 @@ static void sidecar_push_audio(void *data, const float *samples, size_t count, i
 		return;
 
 	const uint32_t rate = sc->sample_rate ? sc->sample_rate : 16000;
+	const size_t offered = count;
 	uint64_t dropped_now = 0;
+	uint32_t downshift_to = 0;
+	uint32_t downshift_from = 0;
+	double downshift_ratio = 0.0;
 
 	pthread_mutex_lock(&sc->tx_mutex);
 
@@ -1288,9 +1425,50 @@ static void sidecar_push_audio(void *data, const float *samples, size_t count, i
 	sc->ring_len += count;
 
 	const uint64_t total_dropped = sc->ring_dropped;
+
+	const uint64_t now = os_gettime_ns();
+	if (!sc->mon_start)
+		sc->mon_start = now;
+	sc->mon_pushed += offered;
+	sc->mon_dropped += dropped_now;
+
+	if (now - sc->mon_start >= SIDECAR_FPS_WINDOW_NS) {
+		const double ratio = sc->mon_pushed ? (double)sc->mon_dropped / (double)sc->mon_pushed : 0.0;
+
+		if (ratio > SIDECAR_FPS_DROP_RATIO && sc->fps_target > SIDECAR_FPS_FLOOR) {
+			downshift_from = sc->fps_target;
+			downshift_to = downshift_from > 20 ? 20 : SIDECAR_FPS_FLOOR;
+			downshift_ratio = ratio;
+			sc->fps_target = downshift_to;
+			sc->fps_dirty = true;
+		}
+
+		sc->mon_start = now;
+		sc->mon_pushed = 0;
+		sc->mon_dropped = 0;
+	}
+
 	pthread_mutex_unlock(&sc->tx_mutex);
 
 	SetEvent(sc->tx_event);
+
+	if (downshift_to) {
+		/* Applied here and not when the message is written: the picture's own
+		 * pace has to follow at once, and the pipe may be exactly what is
+		 * stuck. */
+		pthread_mutex_lock(&sc->frame_mutex);
+		sc->fps = downshift_to;
+		pthread_mutex_unlock(&sc->frame_mutex);
+
+		pthread_mutex_lock(&sc->state_mutex);
+		sc->stats.fps = downshift_to;
+		pthread_mutex_unlock(&sc->state_mutex);
+
+		do_log(LOG_WARNING,
+		       "the worker cannot keep up at %u fps (%.0f%% of the audio had to be dropped in the last "
+		       "%.0f s); generating at %u fps instead",
+		       downshift_from, downshift_ratio * 100.0, (double)SIDECAR_FPS_WINDOW_NS / 1e9, downshift_to);
+	}
 
 	if (!dropped_now)
 		return;
@@ -1298,9 +1476,13 @@ static void sidecar_push_audio(void *data, const float *samples, size_t count, i
 	/* The one place this is knowable: audio is being produced faster than the
 	 * worker takes it. Said once in a while, with the remedy, because the
 	 * symptom on stream is a mouth that lags and skips and nothing says why. */
-	const uint64_t now = os_gettime_ns();
 	if (!sc->drop_logged || now - sc->drop_logged >= SIDECAR_DROP_LOG_NS) {
 		const uint64_t since = total_dropped - sc->drop_reported;
+
+		/* A few milliseconds lost at a seam is not a worker that is behind. */
+		if (since < rate / 5)
+			return;
+
 		do_log(LOG_WARNING,
 		       "the worker is not keeping up with real time: dropped %.1f s of audio since the last report. "
 		       "Lower the generated frame rate",
@@ -1332,6 +1514,7 @@ static bool sidecar_lock_frame(void *data, struct avatar_engine_frame *out)
 	struct sidecar *sc = data;
 
 	pthread_mutex_lock(&sc->frame_mutex);
+	sidecar_playout_advance(sc);
 
 	if (!sc->frame_valid) {
 		pthread_mutex_unlock(&sc->frame_mutex);
@@ -1371,9 +1554,14 @@ static bool sidecar_render(void *data, gs_texture_t *base, uint32_t cx, uint32_t
 	struct sidecar *sc = data;
 
 	pthread_mutex_lock(&sc->frame_mutex);
+	sidecar_playout_advance(sc);
 
 	const bool have = sc->frame_valid;
 	const bool fresh = have && (os_gettime_ns() - sc->frame_arrived) < SIDECAR_FRAME_STALE_NS;
+	if (fresh) {
+		sc->shown_pts = sc->frame_pts;
+		sc->shown_valid = true;
+	}
 	const bool is_region = sc->frame_is_region;
 	const uint32_t width = sc->frame_width;
 	const uint32_t height = sc->frame_height;
@@ -1470,6 +1658,11 @@ static void sidecar_get_stats(void *data, struct avatar_engine_stats *out)
 	pthread_mutex_lock(&sc->state_mutex);
 	*out = sc->stats;
 	pthread_mutex_unlock(&sc->state_mutex);
+
+	pthread_mutex_lock(&sc->frame_mutex);
+	out->shown = sc->shown_valid;
+	out->shown_pts_ns = sc->shown_pts;
+	pthread_mutex_unlock(&sc->frame_mutex);
 }
 
 const struct avatar_engine_ops avatar_engine_sidecar_ops = {

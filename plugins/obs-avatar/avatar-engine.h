@@ -103,6 +103,16 @@ struct avatar_engine_stats {
 
 	uint64_t frames;
 	uint64_t dropped;
+
+	/* The frame rate the worker is being asked for now; it can come down from
+	 * the configured one when the worker cannot keep up. */
+	uint32_t fps;
+
+	/* The audio timestamp of the frame most recently drawn, which is how far
+	 * behind the voice the picture is. Engines that draw for themselves are
+	 * the only place that can say; the source cannot see what they showed. */
+	bool shown;
+	int64_t shown_pts_ns;
 };
 
 struct avatar_engine_ops {

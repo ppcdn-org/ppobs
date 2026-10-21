@@ -78,7 +78,10 @@ class MuseTalkEngine:
         batch_size: int = 8,
         extra_margin: int = 10,
         parsing_mode: str = "jaw",
-        window_frames: int = 15,
+        hop_s: float = 0.75,
+        left_s: float = 0.3,
+        right_s: float = 0.3,
+        blend_s: float = 0.15,
         half_decode: bool = True,
         gpu_id: int = 0,
     ) -> None:
@@ -118,8 +121,8 @@ class MuseTalkEngine:
         self.batch_size = batch_size
         self.extra_margin = extra_margin
         self.parsing_mode = parsing_mode
-        self.window_frames = max(1, window_frames)
-        self.window_samples = int(self.sample_rate * self.window_frames / self.fps)
+        self._window_s = (hop_s, left_s, right_s, blend_s)
+        self._set_window(*self._window_s)
         self.half_decode = half_decode
 
         self.device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
@@ -161,7 +164,7 @@ class MuseTalkEngine:
         self.height = height
         self.max_edge = max_edge
 
-        self._pending = np.zeros(0, dtype=np.float32)
+        self._reset_stream()
         self._cycle_pos = 0
         self.stage_us = {"whisper": 0, "unet": 0, "vae": 0, "blend": 0}
         self.decode_start = self.avatar["decode_start_latent"] if self.half_decode else 0
@@ -393,34 +396,103 @@ class MuseTalkEngine:
 
     # -- streaming inference -----------------------------------------------
 
+    # How far apart two audio blocks may be, beyond what their length explains,
+    # before they are taken to be separated by dropped audio.
+    GAP_NS = 60_000_000
+
+    def _set_window(self, hop_s: float, left_s: float, right_s: float, blend_s: float = 0.0) -> None:
+        """Frame counts for the sliding window, from durations so that changing
+        the frame rate keeps the latency and the context roughly where they
+        were."""
+        self.hop_frames = max(1, round(hop_s * self.fps))
+        self.left_frames = max(0, round(left_s * self.fps))
+        self.right_frames = max(0, round(right_s * self.fps))
+        # The blend reads features from the right context, so it can be no
+        # longer than that context.
+        self.blend_frames = min(max(0, round(blend_s * self.fps)), self.right_frames)
+
+    def set_fps(self, fps: int) -> None:
+        """Changes the generated frame rate without reloading anything.
+
+        The window is kept the same length in seconds, so the latency does not
+        move; the audio buffered so far is dropped, since it was cut for the
+        old rate."""
+        fps = max(1, int(fps))
+        if fps == self.fps:
+            return
+
+        self.fps = fps
+        self._set_window(*self._window_s)
+        self._reset_stream()
+
+    def _samples_for(self, frames: int) -> int:
+        return int(round(frames * self.sample_rate / self.fps))
+
+    def _reset_stream(self) -> None:
+        """Forgets the audio timeline. Used at the start and whenever audio
+        went missing: running Whisper over two stretches of speech glued
+        together across a gap gives it a word that was never said."""
+        self._audio = np.zeros(0, dtype=np.float32)
+        self._audio_offset = 0  # absolute sample index of self._audio[0]
+        self._received = 0  # samples received since _t0
+        self._t0 = None  # pts of absolute sample 0
+        self._frame = 0  # next absolute frame to emit
+        self._tail = None  # features the previous window had for this window's first frames
+
     def feed(self, samples, pts_ns: int):
         """Takes 16 kHz mono audio and yields (bgra, pts_ns, rect) per frame.
 
         rect is (x, y, w, h) in the reference frame: the region is composited
         there by the plugin rather than being a picture of its own.
 
-        Audio is buffered until a whole window is available, because
-        get_whisper_chunk needs a clip rather than a sample. Nothing is
-        emitted until then, which is the bulk of mode A's latency.
+        Frames are produced `hop` at a time, each hop from a window that also
+        carries `left` frames of audio before it and `right` frames after. Only
+        the hop's frames are kept; the rest is context. That is the point of the
+        overlap: MuseTalk gives each frame the audio features of the two frames
+        either side of it, and at the ends of a clip those are filled with
+        zeros, while Whisper's encoder sees silence beyond the clip and reads
+        the end of the window as the end of the speech. Cut into plain
+        back-to-back windows, the mouth therefore relaxes at every window
+        boundary - a regular flutter that looks nothing like talking. Context
+        on both sides pushes that into frames that are thrown away.
+
+        The price is the `right` frames of look-ahead, which is latency.
         """
-        # The pts of the oldest buffered sample: the incoming block is stamped
-        # with its own first sample, so whatever is already queued sits that
-        # many samples earlier. Derived from each message rather than carried
-        # forward, which keeps it from drifting.
-        queued = len(self._pending)
-        buffer_pts = pts_ns - int(queued * 1_000_000_000 / self.sample_rate)
+        samples = np.asarray(samples, dtype=np.float32)
 
-        self._pending = np.concatenate([self._pending, np.asarray(samples, dtype=np.float32)])
+        if self._t0 is not None:
+            expected = self._t0 + int(self._received * 1_000_000_000 / self.sample_rate)
+            if abs(pts_ns - expected) > self.GAP_NS:
+                self._reset_stream()
 
-        while len(self._pending) >= self.window_samples:
-            window = self._pending[: self.window_samples]
-            self._pending = self._pending[self.window_samples :]
+        if self._t0 is None:
+            self._t0 = pts_ns
 
-            for (pixels, rect), index in self._run_window(window):
-                frame_pts = buffer_pts + int(index * 1_000_000_000 / self.fps)
+        self._audio = np.concatenate([self._audio, samples])
+        self._received += len(samples)
+
+        while True:
+            frame_end = self._frame + self.hop_frames
+            need_end = self._samples_for(frame_end + self.right_frames)
+            if self._audio_offset + len(self._audio) < need_end:
+                break
+
+            first = max(0, self._frame - self.left_frames)
+            start = self._samples_for(first) - self._audio_offset
+            window = self._audio[start : need_end - self._audio_offset]
+            keep = (self._frame - first, self._frame - first + self.hop_frames)
+
+            for (pixels, rect), index in self._run_window(window, keep):
+                frame_pts = self._t0 + int((self._frame + index) * 1_000_000_000 / self.fps)
                 yield pixels, frame_pts, rect
 
-            buffer_pts += int(self.window_samples * 1_000_000_000 / self.sample_rate)
+            self._frame = frame_end
+
+            # Nothing before the next window's left context is needed again.
+            drop_to = self._samples_for(max(0, self._frame - self.left_frames))
+            if drop_to > self._audio_offset:
+                self._audio = self._audio[drop_to - self._audio_offset :]
+                self._audio_offset = drop_to
 
     def _silent_prediction(self):
         """What the UNet produces for each cycle position when nobody is
@@ -436,7 +508,7 @@ class MuseTalkEngine:
         torch = self._torch
         from musetalk.utils.utils import datagen
 
-        silence = np.zeros(self.window_samples, dtype=np.float32)
+        silence = np.zeros(self._samples_for(self.left_frames + self.hop_frames + self.right_frames), dtype=np.float32)
 
         with torch.no_grad():
             with tempfile.TemporaryDirectory() as tmp:
@@ -489,7 +561,36 @@ class MuseTalkEngine:
         rest = self._rest[indices]
         return rest + gain * (pred - rest)
 
-    def _run_window(self, window: np.ndarray):
+    def _blend_window(self, chunks, keep):
+        """The features for the frames being kept, with the first few eased in
+        from what the previous window thought they were.
+
+        Whisper's encoder uses absolute position embeddings, so the features it
+        gives a sound drift with where in the window that sound falls. Within a
+        window the drift is smooth; from one window to the next it starts over,
+        so the mouth jumps once per window - a sawtooth, measured at about twice
+        the frame-to-frame change of the interior, and no amount of context
+        removes it because it is not caused by missing context.
+
+        Every window already computes features for the `blend` frames just past
+        what it keeps (its right context), and the next window computes the same
+        frames again, near its start. Each frame gets a say from both, the weight
+        moving from the old estimate to the new across the blend, so the drift
+        has no step to show.
+        """
+        kept = chunks[keep[0] : keep[1]]
+        count = self.blend_frames
+
+        if count and self._tail is not None and len(kept) >= count:
+            kept = kept.clone()
+            for i in range(count):
+                weight = (i + 1) / (count + 1)
+                kept[i] = (1.0 - weight) * self._tail[i] + weight * kept[i]
+
+        self._tail = chunks[keep[1] : keep[1] + count].clone() if count and len(chunks) >= keep[1] + count else None
+        return kept
+
+    def _run_window(self, window: np.ndarray, keep):
         """Per-stage timings land in self.stage_us.
 
         Measured because "mode A is too slow" is not actionable while "mode A
@@ -512,6 +613,11 @@ class MuseTalkEngine:
                 chunks = self.audio_processor.get_whisper_chunk(
                     features, self.device, self.weight_dtype, self.whisper, librosa_length, fps=self.fps
                 )
+            # Whisper ran over the context as well; the UNet and the decoder,
+            # which are where the time goes, only run over what is kept.
+            chunks = self._blend_window(chunks, keep)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
             self.stage_us["whisper"] += int((_time.perf_counter() - started) * 1e6)
 
             produced = 0
