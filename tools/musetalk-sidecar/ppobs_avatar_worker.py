@@ -83,7 +83,17 @@ HELLO_PAYLOAD = struct.Struct("<IIII")  # version, sample_rate, fps, asset_len
 
 
 class ProtocolError(Exception):
-    pass
+    """The far end said something this worker cannot act on."""
+
+
+class PipeClosed(ProtocolError):
+    """The plugin went away.
+
+    Not a failure: the worker's whole job is serving that one plugin, so a
+    closed pipe means the job is over. It is a separate type because it must
+    not be reported like a protocol violation - the plugin closes the pipe
+    whenever lip sync is switched off or OBS exits, and with the real engine
+    that routinely lands while a window's frames are still being written."""
 
 
 def read_exact(stream, count: int) -> bytes:
@@ -93,9 +103,12 @@ def read_exact(stream, count: int) -> bytes:
     chunks = []
     remaining = count
     while remaining:
-        chunk = stream.read(remaining)
+        try:
+            chunk = stream.read(remaining)
+        except OSError as exc:
+            raise PipeClosed(f"pipe closed while reading ({exc})") from exc
         if not chunk:
-            raise ProtocolError("pipe closed")
+            raise PipeClosed("pipe closed")
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
@@ -116,10 +129,15 @@ def send_message(stream, msg_type: int, payload: bytes = b"") -> None:
     # a frame payload is a quarter of a megabyte and copying it to prepend
     # eight bytes is pure waste. Only one thread ever writes, so the two
     # writes cannot interleave with another message.
-    stream.write(HEADER.pack(len(payload), msg_type, 0))
-    if payload:
-        stream.write(payload)
-    stream.flush()
+    try:
+        stream.write(HEADER.pack(len(payload), msg_type, 0))
+        if payload:
+            stream.write(payload)
+        stream.flush()
+    except OSError as exc:
+        # The plugin can close the pipe mid-frame; with the real engine a
+        # window's worth of frames is still being written when BYE arrives.
+        raise PipeClosed(f"pipe closed while writing ({exc})") from exc
 
 
 def send_log(stream, level: int, text: str) -> None:
@@ -488,11 +506,17 @@ def main(argv=None) -> int:
         session = handshake(stream, args.engine, args.musetalk_dir)
         session.run()
         print("plugin said goodbye", flush=True)
+    except PipeClosed as exc:
+        # Normal: the plugin is gone, so there is nothing left to serve.
+        print(f"plugin disconnected: {exc}", flush=True)
     except ProtocolError as exc:
         print(f"protocol error: {exc}", file=sys.stderr, flush=True)
         return 1
     finally:
-        stream.close()
+        try:
+            stream.close()
+        except OSError:
+            pass
 
     return 0
 

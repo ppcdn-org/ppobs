@@ -15,6 +15,19 @@
  * Needs Python, which not every machine building OBS has, so a missing or
  * unstartable interpreter SKIPs loudly rather than failing. Set
  * AVATAR_TEST_PYTHON to choose the interpreter.
+ *
+ * By default it drives the stub engine, which runs anywhere. Pointed at the
+ * real one it verifies the half of the protocol the stub never exercises -
+ * CROP, where the worker sends only the repainted region and the plugin
+ * composites it:
+ *
+ *   set AVATAR_TEST_ENGINE=musetalk
+ *   set AVATAR_TEST_ASSET=D:\media\images\greg02.jpg
+ *   set AVATAR_TEST_PYTHON=D:\github\MuseTalk\venv\Scripts\python.exe
+ *
+ * That path loads 3.4GB of weights and prepares the avatar before the first
+ * frame, so it is given a much longer handshake timeout and is not something
+ * to run on every build.
  */
 
 #include "avatar-engine-sidecar.h"
@@ -40,6 +53,9 @@
 #define TEST_CHUNK 640 /* one frame's worth of audio at 25 fps */
 
 #define READY_TIMEOUT_MS 30000
+/* The real engine loads 3.4GB and prepares the avatar before it answers;
+ * 54.8s measured, so this leaves room for a cold page cache. */
+#define READY_TIMEOUT_REAL_MS 180000
 #define FRAME_TIMEOUT_MS 15000
 #define EXIT_TIMEOUT_MS 10000
 #define POLL_MS 25
@@ -72,10 +88,11 @@ static uint64_t elapsed_ms(uint64_t since_ns)
 	return (os_gettime_ns() - since_ns) / 1000000ULL;
 }
 
-static bool spawn_worker(const char *python, const char *pipe_name, PROCESS_INFORMATION *pi)
+static bool spawn_worker(const char *python, const char *engine, const char *pipe_name, PROCESS_INFORMATION *pi)
 {
 	struct dstr cmd = {0};
-	dstr_printf(&cmd, "\"%s\" \"%s\" --pipe \"%s\" --engine stub", python, AVATAR_WORKER_SCRIPT, pipe_name);
+	dstr_printf(&cmd, "\"%s\" \"%s\" --pipe \"%s\" --engine %s", python, AVATAR_WORKER_SCRIPT, pipe_name,
+		    engine);
 
 	printf("starting worker: %s\n", cmd.array);
 	fflush(stdout);
@@ -175,8 +192,24 @@ int main(void)
 	if (!python || !*python)
 		python = "python";
 
+	/* The stub needs no artwork and runs anywhere; the real engine needs
+	 * both an asset to prepare and MuseTalk's own interpreter. */
+	const char *engine_name = getenv("AVATAR_TEST_ENGINE");
+	if (!engine_name || !*engine_name)
+		engine_name = "stub";
+
+	const char *asset = getenv("AVATAR_TEST_ASSET");
+	if (!asset)
+		asset = "";
+
+	const bool real = strcmp(engine_name, "stub") != 0;
+	if (real && !*asset)
+		skip("AVATAR_TEST_ENGINE is set but AVATAR_TEST_ASSET is not");
+
+	printf("engine: %s%s%s\n", engine_name, *asset ? ", asset: " : "", asset);
+
 	const struct avatar_engine_config cfg = {
-		.asset_path = "",
+		.asset_path = asset,
 		/* Empty: the test starts the worker itself, which is also how a
 		 * developer drives the skeleton by hand. */
 		.worker_command = "",
@@ -197,7 +230,7 @@ int main(void)
 	CHECK(!avatar_engine_sidecar_ops.ready(engine));
 
 	PROCESS_INFORMATION pi = {0};
-	if (!spawn_worker(python, pipe_name, &pi)) {
+	if (!spawn_worker(python, engine_name, pipe_name, &pi)) {
 		avatar_engine_sidecar_ops.destroy(engine);
 		skip("could not start the Python interpreter (set AVATAR_TEST_PYTHON)");
 	}
@@ -212,8 +245,9 @@ int main(void)
 	size_t open_mouth = 0;
 
 	/* --- handshake --- */
+	const uint64_t ready_timeout = real ? READY_TIMEOUT_REAL_MS : READY_TIMEOUT_MS;
 	const uint64_t connect_started = os_gettime_ns();
-	while (!avatar_engine_sidecar_ops.ready(engine) && elapsed_ms(connect_started) < READY_TIMEOUT_MS)
+	while (!avatar_engine_sidecar_ops.ready(engine) && elapsed_ms(connect_started) < ready_timeout)
 		os_sleep_ms(POLL_MS);
 
 	CHECK(avatar_engine_sidecar_ops.ready(engine));
@@ -221,15 +255,63 @@ int main(void)
 	struct avatar_engine_stats stats;
 	avatar_engine_sidecar_ops.get_stats(engine, &stats);
 	CHECK(stats.connected);
-	/* The stub must not claim to be a model: the source will use this flag
-	 * to decide whether the avatar can be trusted on stream. */
-	CHECK(!stats.real_model);
-	CHECK(strstr(stats.engine, "stub") != NULL);
+	/* Whether the worker is the model or the stub has to be reported
+	 * honestly, because the source uses this flag to decide whether the
+	 * avatar can be trusted on stream. */
+	CHECK(stats.real_model == real);
+	if (!real)
+		CHECK(strstr(stats.engine, "stub") != NULL);
 	printf("handshake ok: engine='%s', real_model=%d\n", stats.engine, (int)stats.real_model);
 
 	/* --- audio out, frames back --- */
 	int64_t pts = 0;
 	pts = push_audio(engine, pts, TEST_FPS, 0.5f); /* one second, loud */
+
+	if (real) {
+		/* The real engine repaints a region of the artwork rather than
+		 * producing a picture, so what is checked here is the part the
+		 * stub can never exercise: that CROP arrives, that it is marked
+		 * as a region, and that it lands inside the reference frame -
+		 * the plugin has to place it there, so a rect that did not fit
+		 * would be a texture drawn off the artwork. */
+		const uint64_t waited = os_gettime_ns();
+		bool got = false;
+		while (!got && elapsed_ms(waited) < FRAME_TIMEOUT_MS) {
+			got = capture(engine, &open_frame);
+			if (!got)
+				os_sleep_ms(POLL_MS);
+		}
+
+		if (!got) {
+			printf("FAIL: no region arrived from the real engine\n");
+			goto done;
+		}
+
+		struct avatar_engine_frame frame;
+		CHECK(avatar_engine_sidecar_ops.lock_frame(engine, &frame));
+		const bool is_region = frame.is_region;
+		const uint32_t rx = frame.x, ry = frame.y;
+		const uint32_t rw = frame.width, rh = frame.height;
+		const uint32_t fw = frame.ref_width, fh = frame.ref_height;
+		avatar_engine_sidecar_ops.unlock_frame(engine);
+
+		printf("region: %ux%u at %u,%u in %ux%u, pts=%lld ns\n", rw, rh, rx, ry, fw, fh,
+		       (long long)open_frame.pts_ns);
+
+		CHECK(is_region);
+		CHECK(rw > 0 && rh > 0);
+		CHECK(fw > 0 && fh > 0);
+		CHECK(rx + rw <= fw);
+		CHECK(ry + rh <= fh);
+		CHECK(open_frame.pts_ns >= 0);
+
+		avatar_engine_sidecar_ops.get_stats(engine, &stats);
+		printf("stats: frames=%llu\n", (unsigned long long)stats.frames);
+		CHECK(stats.frames > 0);
+
+		status = 0;
+		goto done;
+	}
 
 	if (!wait_for_mouth(engine, true, &open_frame)) {
 		printf("FAIL: no frame with an open mouth arrived\n");
