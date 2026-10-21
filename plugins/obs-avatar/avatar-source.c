@@ -2,6 +2,7 @@
 #include "avatar-assets.h"
 #include "avatar-audio-tap.h"
 #include "avatar-engine-sidecar.h"
+#include "avatar-engine-viseme.h"
 
 #include <graphics/image-file.h>
 #include <graphics/vec4.h>
@@ -20,6 +21,28 @@
 
 #define S_MODE_OFF "off"
 #define S_MODE_SIDECAR "sidecar"
+#define S_MODE_VISEME "viseme"
+
+#define S_MOUTH_X "mouth_x"
+#define S_MOUTH_Y "mouth_y"
+#define S_MOUTH_W "mouth_w"
+#define S_MOUTH_H "mouth_h"
+#define S_MOUTH_TRAVEL "mouth_travel"
+#define S_SENSITIVITY "sensitivity"
+#define S_TEETH "mouth_teeth"
+#define S_TONGUE "mouth_tongue"
+#define S_SHOW_MOUTH "show_mouth"
+
+/* Slider limits, repeated here because the mouse handlers clamp to the same
+ * range the sliders do - a wheel that could drive the size outside what the
+ * dialog can express would leave a value the user cannot see or undo. */
+#define AVATAR_MOUTH_W_MIN 1.0
+#define AVATAR_MOUTH_W_MAX 60.0
+#define AVATAR_MOUTH_H_MIN 1.0
+#define AVATAR_MOUTH_H_MAX 40.0
+
+/* Size change per wheel notch. */
+#define AVATAR_WHEEL_STEP 0.08
 
 #define MT_ obs_module_text
 #define TEXT_SOURCE_NAME MT_("Avatar.Source")
@@ -33,7 +56,18 @@
 #define TEXT_MODE MT_("Avatar.Mode")
 #define TEXT_MODE_OFF MT_("Avatar.Mode.Off")
 #define TEXT_MODE_SIDECAR MT_("Avatar.Mode.Sidecar")
+#define TEXT_MODE_VISEME MT_("Avatar.Mode.Viseme")
 #define TEXT_FPS MT_("Avatar.Fps")
+#define TEXT_MOUTH_X MT_("Avatar.Mouth.X")
+#define TEXT_MOUTH_Y MT_("Avatar.Mouth.Y")
+#define TEXT_MOUTH_W MT_("Avatar.Mouth.Width")
+#define TEXT_MOUTH_H MT_("Avatar.Mouth.Height")
+#define TEXT_MOUTH_TRAVEL MT_("Avatar.Mouth.Travel")
+#define TEXT_SENSITIVITY MT_("Avatar.Sensitivity")
+#define TEXT_MOUTH_HINT MT_("Avatar.Mouth.Hint")
+#define TEXT_SHOW_MOUTH MT_("Avatar.Mouth.Show")
+#define TEXT_TEETH MT_("Avatar.Mouth.Teeth")
+#define TEXT_TONGUE MT_("Avatar.Mouth.Tongue")
 #define TEXT_PIPE MT_("Avatar.Pipe")
 #define TEXT_PIPE_IDLE MT_("Avatar.Pipe.Idle")
 
@@ -89,6 +123,9 @@ struct avatar_source {
 
 	float *drain;
 
+	/* Set while the left button is held inside the interact window. */
+	bool dragging;
+
 	/* The engine, and the running audio timeline its frames are labelled
 	 * with.  Guarded because update() runs on the UI thread while the
 	 * graphics and video threads are reading it. */
@@ -112,6 +149,11 @@ struct avatar_source {
 	volatile bool have_frame;
 	volatile bool stale_logged;
 };
+
+/* Defined with the rest of the geometry below; the mouse handlers need them to
+ * turn source coordinates into fractions of the artwork. */
+static uint32_t avatar_source_get_width(void *data);
+static uint32_t avatar_source_get_height(void *data);
 
 /* Clears the accumulated summary back to "nothing heard". */
 static void avatar_reset_pending(struct avatar_source *ctx)
@@ -182,11 +224,159 @@ static void avatar_load_image(struct avatar_source *ctx)
 
 static const struct avatar_engine_ops *avatar_ops_for_mode(const char *mode)
 {
-	if (mode && strcmp(mode, S_MODE_SIDECAR) == 0)
+	if (!mode)
+		return NULL;
+	if (strcmp(mode, S_MODE_SIDECAR) == 0)
 		return &avatar_engine_sidecar_ops;
-
-	/* Mode B (viseme sprites) joins this switch in stage B. */
+	if (strcmp(mode, S_MODE_VISEME) == 0)
+		return &avatar_engine_viseme_ops;
 	return NULL;
+}
+
+/* Mode B's mouth region, read straight from the settings.  Percentages in the
+ * UI, fractions of the image in the engine: the numbers then survive the asset
+ * being re-exported at a different resolution. */
+static void avatar_apply_mouth(struct avatar_source *ctx, obs_data_t *settings)
+{
+	pthread_mutex_lock(&ctx->engine_mutex);
+	const bool viseme = ctx->ops == &avatar_engine_viseme_ops && ctx->engine;
+	void *engine = ctx->engine;
+	pthread_mutex_unlock(&ctx->engine_mutex);
+
+	if (!viseme)
+		return;
+
+	const float sensitivity = (float)obs_data_get_double(settings, S_SENSITIVITY) / 100.0f;
+
+	struct avatar_viseme_mouth mouth = {
+		.center_x = (float)obs_data_get_double(settings, S_MOUTH_X) / 100.0f,
+		.center_y = (float)obs_data_get_double(settings, S_MOUTH_Y) / 100.0f,
+		.radius_x = (float)obs_data_get_double(settings, S_MOUTH_W) / 100.0f,
+		.radius_y = (float)obs_data_get_double(settings, S_MOUTH_H) / 100.0f,
+		.travel = (float)obs_data_get_double(settings, S_MOUTH_TRAVEL) / 100.0f,
+	};
+
+	/* Sensitivity moves the gate rather than scaling the openness: turning
+	 * it up should make a quiet voice open the mouth fully, not make a loud
+	 * one overshoot.  The span above the gate is kept fixed so the mouth's
+	 * dynamic range does not change shape as the slider moves. */
+	mouth.gate_db = -35.0f - 25.0f * sensitivity;
+	mouth.full_db = mouth.gate_db + 30.0f;
+	mouth.teeth = (float)obs_data_get_double(settings, S_TEETH) / 100.0f;
+	mouth.tongue = (float)obs_data_get_double(settings, S_TONGUE) / 100.0f;
+	mouth.show_region = obs_data_get_bool(settings, S_SHOW_MOUTH);
+
+	avatar_engine_viseme_set_mouth(engine, &mouth);
+}
+
+/* ---------------------------------------------------------------------------
+ * Placing the mouth with the mouse
+ *
+ * Six sliders can express where a mouth is, but nobody finds a mouth by
+ * dragging numbers. With OBS_SOURCE_INTERACTION the source gets mouse events
+ * in its own coordinate space, so the region can be dragged onto the mouth
+ * directly - right-click the source and choose Interact.
+ *
+ * The values are written back into the source's settings rather than kept
+ * beside them, so a drag persists across restarts and the sliders show where
+ * the mouse put things.
+ * ------------------------------------------------------------------------- */
+
+static void avatar_set_mouth_center(struct avatar_source *ctx, int32_t x, int32_t y)
+{
+	const uint32_t cx = avatar_source_get_width(ctx);
+	const uint32_t cy = avatar_source_get_height(ctx);
+	if (!cx || !cy)
+		return;
+
+	double px = 100.0 * (double)x / (double)cx;
+	double py = 100.0 * (double)y / (double)cy;
+
+	/* A drag that leaves the source still has to land somewhere usable. */
+	px = (px < 0.0) ? 0.0 : (px > 100.0 ? 100.0 : px);
+	py = (py < 0.0) ? 0.0 : (py > 100.0 ? 100.0 : py);
+
+	obs_data_t *settings = obs_source_get_settings(ctx->source);
+	obs_data_set_double(settings, S_MOUTH_X, px);
+	obs_data_set_double(settings, S_MOUTH_Y, py);
+	obs_source_update(ctx->source, settings);
+	obs_data_release(settings);
+}
+
+static void avatar_scale_mouth(struct avatar_source *ctx, int notches)
+{
+	if (!notches)
+		return;
+
+	const double factor = 1.0 + AVATAR_WHEEL_STEP * (double)notches;
+
+	obs_data_t *settings = obs_source_get_settings(ctx->source);
+
+	double w = obs_data_get_double(settings, S_MOUTH_W) * factor;
+	double h = obs_data_get_double(settings, S_MOUTH_H) * factor;
+
+	w = (w < AVATAR_MOUTH_W_MIN) ? AVATAR_MOUTH_W_MIN : (w > AVATAR_MOUTH_W_MAX ? AVATAR_MOUTH_W_MAX : w);
+	h = (h < AVATAR_MOUTH_H_MIN) ? AVATAR_MOUTH_H_MIN : (h > AVATAR_MOUTH_H_MAX ? AVATAR_MOUTH_H_MAX : h);
+
+	obs_data_set_double(settings, S_MOUTH_W, w);
+	obs_data_set_double(settings, S_MOUTH_H, h);
+	obs_source_update(ctx->source, settings);
+	obs_data_release(settings);
+}
+
+/* Mode B only: a worker does its own face detection, so dragging a region at
+ * it would do nothing. */
+static bool avatar_mouse_applies(struct avatar_source *ctx)
+{
+	pthread_mutex_lock(&ctx->engine_mutex);
+	const bool viseme = ctx->ops == &avatar_engine_viseme_ops && ctx->engine;
+	pthread_mutex_unlock(&ctx->engine_mutex);
+	return viseme;
+}
+
+static void avatar_mouse_click(void *data, const struct obs_mouse_event *event, int32_t type, bool mouse_up,
+			       uint32_t click_count)
+{
+	struct avatar_source *ctx = data;
+
+	UNUSED_PARAMETER(click_count);
+
+	if (type != MOUSE_LEFT || !avatar_mouse_applies(ctx))
+		return;
+
+	ctx->dragging = !mouse_up;
+	if (!mouse_up)
+		avatar_set_mouth_center(ctx, event->x, event->y);
+}
+
+static void avatar_mouse_move(void *data, const struct obs_mouse_event *event, bool mouse_leave)
+{
+	struct avatar_source *ctx = data;
+
+	if (mouse_leave) {
+		/* The button-up will never arrive if the pointer left while
+		 * held, so the drag has to end here or it would resume on the
+		 * next move. */
+		ctx->dragging = false;
+		return;
+	}
+
+	if (ctx->dragging && avatar_mouse_applies(ctx))
+		avatar_set_mouth_center(ctx, event->x, event->y);
+}
+
+static void avatar_mouse_wheel(void *data, const struct obs_mouse_event *event, int x_delta, int y_delta)
+{
+	struct avatar_source *ctx = data;
+
+	UNUSED_PARAMETER(event);
+	UNUSED_PARAMETER(x_delta);
+
+	if (!avatar_mouse_applies(ctx))
+		return;
+
+	/* A notch is 120 units by convention. */
+	avatar_scale_mouth(ctx, y_delta / 120);
 }
 
 /* Installs a new engine and returns the old one for the caller to destroy.
@@ -283,6 +473,11 @@ static void avatar_source_update(void *data, obs_data_t *settings)
 	 * it is not the cheapest. */
 	if (mode_changed || fps_changed || image_changed)
 		avatar_apply_engine(ctx);
+
+	/* After the engine exists, and on every edit: the mouth sliders are
+	 * dragged live, so they are pushed onto the running engine rather than
+	 * carried in the config and costing a restart per pixel moved. */
+	avatar_apply_mouth(ctx, settings);
 }
 
 static void *avatar_source_create(obs_data_t *settings, obs_source_t *source)
@@ -392,7 +587,7 @@ static void avatar_upload_frame(struct avatar_source *ctx)
 {
 	pthread_mutex_lock(&ctx->engine_mutex);
 
-	if (!ctx->ops) {
+	if (!ctx->ops || !ctx->ops->lock_frame) {
 		pthread_mutex_unlock(&ctx->engine_mutex);
 		return;
 	}
@@ -478,30 +673,50 @@ static void avatar_draw_texture(gs_texture_t *texture, uint32_t cx, uint32_t cy,
 	gs_enable_framebuffer_srgb(previous);
 }
 
+/* Gives a GPU-compositing engine (mode B) its turn.  It needs the artwork, so
+ * without one there is nothing for it to deform and the caller falls through to
+ * the placeholder. */
+static bool avatar_render_engine(struct avatar_source *ctx, gs_texture_t *base, uint32_t cx, uint32_t cy)
+{
+	if (!base)
+		return false;
+
+	pthread_mutex_lock(&ctx->engine_mutex);
+	const bool drawn = ctx->ops && ctx->ops->render && ctx->ops->render(ctx->engine, base, cx, cy);
+	pthread_mutex_unlock(&ctx->engine_mutex);
+
+	return drawn;
+}
+
 static void avatar_source_render(void *data, gs_effect_t *unused)
 {
 	struct avatar_source *ctx = data;
 
 	UNUSED_PARAMETER(unused);
 
-	avatar_upload_frame(ctx);
-
 	const uint32_t cx = avatar_source_get_width(ctx);
 	const uint32_t cy = avatar_source_get_height(ctx);
 
-	/* A fresh generated frame wins.  When it goes stale the static asset
-	 * comes back, which is the only fallback available until mode B exists;
-	 * after that this is where the sprite engine takes over. */
-	if (avatar_frame_fresh(ctx)) {
+	struct gs_image_file *const image = ctx->image_loaded ? &ctx->if4.image3.image2.image : NULL;
+	gs_texture_t *const base = image ? image->texture : NULL;
+
+	/* Mode B draws the artwork itself, so it goes first and there is no
+	 * staleness to consider: it is synchronous and always has an answer. */
+	if (avatar_render_engine(ctx, base, cx, cy))
+		return;
+
+	avatar_upload_frame(ctx);
+
+	/* A fresh generated frame wins.  When it goes stale the still artwork
+	 * comes back - once both modes can run, this is where mode B would take
+	 * over from a dropped worker instead. */
+	if (avatar_frame_fresh(ctx) && ctx->texture) {
 		avatar_draw_texture(ctx->texture, cx, cy, false);
 		return;
 	}
 
-	struct gs_image_file *const image = ctx->image_loaded ? &ctx->if4.image3.image2.image : NULL;
-	gs_texture_t *const texture = image ? image->texture : NULL;
-
-	if (texture)
-		avatar_draw_texture(texture, image->cx, image->cy, true);
+	if (base)
+		avatar_draw_texture(base, image->cx, image->cy, true);
 	else
 		avatar_draw_placeholder();
 }
@@ -583,8 +798,36 @@ static void avatar_report_audio(struct avatar_source *ctx, size_t drained)
 			blog(LOG_INFO, "[obs-avatar: '%s'] tap attached but no audio arrived",
 			     obs_source_get_name(ctx->source));
 		} else {
+			/* Mode A reports how far the picture is behind the voice;
+			 * mode B has no lag worth naming (it renders from the
+			 * audio it was just handed), so it reports how far open
+			 * the mouth got instead. */
 			struct dstr lag = {0};
-			if (ctx->have_frame)
+
+			pthread_mutex_lock(&ctx->engine_mutex);
+			const bool viseme = ctx->ops == &avatar_engine_viseme_ops && ctx->engine;
+			const float openness = viseme ? avatar_engine_viseme_openness(ctx->engine) : 0.0f;
+			pthread_mutex_unlock(&ctx->engine_mutex);
+
+			if (viseme) {
+				/* The parameters come back from the engine, not
+				 * from the settings: that is the half of the
+				 * chain worth proving when the opening is
+				 * visible but its contents are not. */
+				struct avatar_viseme_mouth m = {0};
+				pthread_mutex_lock(&ctx->engine_mutex);
+				if (ctx->ops == &avatar_engine_viseme_ops && ctx->engine)
+					avatar_engine_viseme_get_mouth(ctx->engine, &m);
+				pthread_mutex_unlock(&ctx->engine_mutex);
+
+				dstr_printf(&lag,
+					    ", mouth %.0f%% [centre %.2f,%.2f radius %.2f,%.2f "
+					    "travel %.2f teeth %.2f tongue %.2f]",
+					    (double)openness * 100.0, (double)m.center_x, (double)m.center_y,
+					    (double)m.radius_x, (double)m.radius_y, (double)m.travel,
+					    (double)m.teeth, (double)m.tongue);
+			}
+			else if (os_atomic_load_bool(&ctx->have_frame))
 				dstr_printf(&lag, ", frame lag %.0f ms",
 					    (double)(ctx->audio_pts - ctx->frame_pts) / 1000000.0);
 
@@ -664,6 +907,23 @@ static void avatar_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, S_AUDIO_SOURCE, "none");
 	obs_data_set_default_string(settings, S_MODE, S_MODE_OFF);
 	obs_data_set_default_int(settings, S_FPS, 25);
+
+	/* Lower-middle of the frame, which is where a mouth is on most
+	 * head-and-shoulders artwork.  It will not be right for any particular
+	 * avatar - that is what the sliders are for - but it puts the
+	 * deformation somewhere plausible so the first drag is an adjustment
+	 * rather than a search. */
+	obs_data_set_default_double(settings, S_MOUTH_X, 50.0);
+	obs_data_set_default_double(settings, S_MOUTH_Y, 68.0);
+	obs_data_set_default_double(settings, S_MOUTH_W, 16.0);
+	obs_data_set_default_double(settings, S_MOUTH_H, 9.0);
+	obs_data_set_default_double(settings, S_MOUTH_TRAVEL, 80.0);
+	obs_data_set_default_double(settings, S_SENSITIVITY, 50.0);
+	obs_data_set_default_double(settings, S_TEETH, 70.0);
+	obs_data_set_default_double(settings, S_TONGUE, 60.0);
+	/* On by default: the first thing anyone has to do with this mode is put
+	 * the region on the mouth, and that is far easier when it is visible. */
+	obs_data_set_default_bool(settings, S_SHOW_MOUTH, true);
 	/* On by default while the log is still the clearest evidence that the
 	 * tap and the engine are working. */
 	obs_data_set_default_bool(settings, S_LOG_LEVEL, true);
@@ -681,16 +941,26 @@ static bool avatar_add_audio_source(void *data, obs_source_t *source)
 	return true;
 }
 
-/* The frame rate only means anything once something is generating frames, so
- * it follows the mode rather than sitting there inert. */
+/* Each mode's controls follow that mode.  A visible control that does nothing
+ * is the same lie as shipping one that is not wired up: the frame rate is
+ * negotiated with a worker and means nothing to the in-process mouth, and the
+ * mouth region means nothing to a worker that does its own face detection. */
 static bool avatar_mode_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(property);
 
 	const char *mode = obs_data_get_string(settings, S_MODE);
-	const bool driving = mode && strcmp(mode, S_MODE_OFF) != 0;
+	const bool sidecar = mode && strcmp(mode, S_MODE_SIDECAR) == 0;
+	const bool viseme = mode && strcmp(mode, S_MODE_VISEME) == 0;
 
-	obs_property_set_visible(obs_properties_get(props, S_FPS), driving);
+	obs_property_set_visible(obs_properties_get(props, S_FPS), sidecar);
+
+	static const char *const mouth_props[] = {"mouth_hint", S_MOUTH_X,      S_MOUTH_Y,     S_MOUTH_W,
+						  S_MOUTH_H,    S_MOUTH_TRAVEL, S_SENSITIVITY, S_TEETH,
+						  S_TONGUE,     S_SHOW_MOUTH};
+	for (size_t i = 0; i < sizeof(mouth_props) / sizeof(mouth_props[0]); i++)
+		obs_property_set_visible(obs_properties_get(props, mouth_props[i]), viseme);
+
 	return true;
 }
 
@@ -712,6 +982,7 @@ static obs_properties_t *avatar_source_properties(void *data)
 	obs_property_t *mode = obs_properties_add_list(props, S_MODE, TEXT_MODE, OBS_COMBO_TYPE_LIST,
 						       OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(mode, TEXT_MODE_OFF, S_MODE_OFF);
+	obs_property_list_add_string(mode, TEXT_MODE_VISEME, S_MODE_VISEME);
 	obs_property_list_add_string(mode, TEXT_MODE_SIDECAR, S_MODE_SIDECAR);
 	obs_property_set_modified_callback(mode, avatar_mode_modified);
 
@@ -721,6 +992,20 @@ static obs_properties_t *avatar_source_properties(void *data)
 	obs_property_list_add_int(fps, "20", 20);
 	obs_property_list_add_int(fps, "25", 25);
 	obs_property_list_add_int(fps, "30", 30);
+
+	/* Mode B's mouth.  There is no detecting where an animal's mouth is -
+	 * that is exactly what MuseTalk's face parsing cannot do either - so
+	 * the user points at it, in percentages of the artwork. */
+	obs_properties_add_text(props, "mouth_hint", TEXT_MOUTH_HINT, OBS_TEXT_INFO);
+	obs_properties_add_float_slider(props, S_MOUTH_X, TEXT_MOUTH_X, 0.0, 100.0, 0.5);
+	obs_properties_add_float_slider(props, S_MOUTH_Y, TEXT_MOUTH_Y, 0.0, 100.0, 0.5);
+	obs_properties_add_float_slider(props, S_MOUTH_W, TEXT_MOUTH_W, 1.0, 60.0, 0.5);
+	obs_properties_add_float_slider(props, S_MOUTH_H, TEXT_MOUTH_H, 1.0, 40.0, 0.5);
+	obs_properties_add_float_slider(props, S_MOUTH_TRAVEL, TEXT_MOUTH_TRAVEL, 0.0, 200.0, 5.0);
+	obs_properties_add_float_slider(props, S_SENSITIVITY, TEXT_SENSITIVITY, 0.0, 100.0, 1.0);
+	obs_properties_add_float_slider(props, S_TEETH, TEXT_TEETH, 0.0, 100.0, 1.0);
+	obs_properties_add_float_slider(props, S_TONGUE, TEXT_TONGUE, 0.0, 100.0, 1.0);
+	obs_properties_add_bool(props, S_SHOW_MOUTH, TEXT_SHOW_MOUTH);
 
 	obs_properties_add_bool(props, S_LOG_LEVEL, TEXT_LOG_LEVEL);
 
@@ -761,7 +1046,11 @@ struct obs_source_info avatar_source_info = {
 	 * frame use different effects and blend modes: outside custom-draw mode
 	 * libobs has already opened a technique pass, and a second one cannot
 	 * be started inside it. */
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_SRGB,
+	/* INTERACTION is what puts "Interact" on the source's context menu and
+	 * delivers mouse events in source coordinates, which is how the mouth
+	 * region gets dragged onto the mouth instead of hunted for with
+	 * sliders. */
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_SRGB | OBS_SOURCE_INTERACTION,
 	.get_name = avatar_source_get_name,
 	.create = avatar_source_create,
 	.destroy = avatar_source_destroy,
@@ -772,5 +1061,8 @@ struct obs_source_info avatar_source_info = {
 	.get_height = avatar_source_get_height,
 	.video_render = avatar_source_render,
 	.video_tick = avatar_source_tick,
+	.mouse_click = avatar_mouse_click,
+	.mouse_move = avatar_mouse_move,
+	.mouse_wheel = avatar_mouse_wheel,
 	.icon_type = OBS_ICON_TYPE_IMAGE,
 };

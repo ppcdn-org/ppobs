@@ -11,10 +11,22 @@
  * replaced later (TensorRT, or in-process ONNX Runtime if the export ever
  * lands) without the source changing at all.
  *
- * Frames are borrowed rather than copied: lock_frame holds the engine's frame
- * lock so the renderer can upload straight from the engine's buffer, and
- * unlock_frame releases it. The renderer must not hold the lock across
- * anything slow - the engine's reader thread is blocked on it meanwhile.
+ * There are two ways an engine can affect the picture, and an engine provides
+ * exactly one of them:
+ *
+ *   lock_frame / unlock_frame - the engine produces pixels of its own. Frames
+ *       are borrowed rather than copied: lock_frame holds the engine's frame
+ *       lock so the renderer can upload straight from the engine's buffer. The
+ *       renderer must not hold that lock across anything slow, since the
+ *       engine's reader thread is blocked on it meanwhile.
+ *
+ *   render - the engine composites the source's own artwork on the GPU. It
+ *       produces no pixels to hand over; it needs the base texture instead.
+ *
+ * Mode A is the first kind: its pixels come from another process. Mode B is
+ * the second: it deforms the avatar the user already chose, and routing that
+ * through a CPU frame buffer would mean reading a texture back, warping it on
+ * the CPU and uploading it again - three steps to avoid one shader.
  */
 
 #pragma once
@@ -52,6 +64,15 @@ struct avatar_engine_frame {
 	/* The audio timestamp this frame was generated for, which is what the
 	 * sync offset has to be measured against - not the time it arrived. */
 	int64_t pts_ns;
+
+	/* When set, this is only the repainted region and its alpha is the
+	 * blend mask: it has to be composited over the artwork at (x, y) in a
+	 * space `ref_width` by `ref_height`, not shown on its own. */
+	bool is_region;
+	uint32_t x;
+	uint32_t y;
+	uint32_t ref_width;
+	uint32_t ref_height;
 };
 
 struct avatar_engine_stats {
@@ -80,10 +101,19 @@ struct avatar_engine_ops {
 
 	void (*push_audio)(void *data, const float *samples, size_t count, int64_t pts_ns);
 
-	/* True when a frame is available; the caller must then call
-	 * unlock_frame. False leaves nothing locked. */
+	/* Pixel-producing engines: true when a frame is available, in which case
+	 * the caller must call unlock_frame. False leaves nothing locked.
+	 * NULL on engines that render instead. */
 	bool (*lock_frame)(void *data, struct avatar_engine_frame *out);
 	void (*unlock_frame)(void *data);
+
+	/* GPU-compositing engines: draw the avatar at cx by cy from `base`.
+	 * Called on the graphics thread from inside the source's own render, so
+	 * the context is current and no effect loop is open. Returns false when
+	 * it could not draw, which makes the source fall back to the plain
+	 * artwork rather than leaving a hole. NULL on engines that produce
+	 * frames instead. */
+	bool (*render)(void *data, gs_texture_t *base, uint32_t cx, uint32_t cy);
 
 	void (*get_stats)(void *data, struct avatar_engine_stats *out);
 };

@@ -1,0 +1,179 @@
+// Mode B's mouth: opens a jaw on whatever artwork the user chose.
+//
+// Why a deformation rather than mouth sprites. A viseme sprite set is the
+// better-looking answer, but it only exists if someone drew one. What a user
+// actually has for "make my dog talk" is one photograph, and no set of drawn
+// mouths will match it. So the mouth is made by pulling the picture apart along
+// a line and filling the gap, which needs nothing but the photo and a rectangle
+// saying where the mouth is.
+//
+// The split is symmetric: content below the mouth line is displaced down and
+// content above it up, each by the same amount, so the jaw opens without the
+// head appearing to grow. Sampling for the lower half therefore reaches
+// *upwards* - an output pixel below the line shows what used to be higher up.
+//
+// What is drawn inside the opening matters more than the opening itself. A flat
+// dark patch does not read as a mouth; it reads as a smudge. An open mouth is
+// recognised by its teeth first, then by the dark of the throat behind them and
+// the tongue below. So the interior is layered in that order, and the teeth
+// occupy a fixed slice of the mouth rather than a share of the opening - a
+// barely-open mouth is mostly teeth, a wide one shows cavity and tongue beneath
+// them. That ordering is most of what sells it.
+//
+// Everything is in the base texture's UV space, and the participation weight
+// falls off towards the ellipse edge so the deformed region blends into the
+// undeformed face instead of showing a seam.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+// Mouth ellipse, in UV: centre and half-extents.
+uniform float2 mouth_center;
+uniform float2 mouth_radius;
+
+// 0 shut, 1 fully open.
+uniform float openness;
+
+// How far the jaw travels at openness 1, as a fraction of mouth_radius.y.
+uniform float travel;
+
+// Cavity colour. Alpha comes from the artwork so a cut-out avatar does not gain
+// an opaque rectangle where its mouth should be.
+uniform float3 interior;
+
+// How strongly the teeth and the tongue show, 0..1. Worth having as dials
+// rather than constants: a cartoon or a long-muzzled animal can look wrong with
+// a full set of human-looking teeth, while a face-on portrait needs them.
+uniform float teeth;
+uniform float tongue;
+
+// Draws the region being deformed. Without it, a mouth placed over the chin
+// looks like the effect is broken rather than misplaced - the deformation is
+// plainly happening, just not where the mouth is.
+uniform float show_region;
+
+sampler_state def_sampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertInOut {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertInOut VSDefault(VertInOut vert_in)
+{
+	VertInOut vert_out;
+	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = vert_in.uv;
+	return vert_out;
+}
+
+float4 PSMouth(VertInOut vert_in) : TARGET
+{
+	float2 uv = vert_in.uv;
+
+	// Unit-ellipse coordinates around the mouth.
+	float2 d = (uv - mouth_center) / max(mouth_radius, float2(1e-5, 1e-5));
+	float r = length(d);
+
+	// On top of everything, because it exists to be seen while being
+	// positioned, not to look good.
+	if (show_region > 0.5 && (abs(r - 1.0) < 0.025 || r < 0.08))
+		return float4(0.0, 0.9, 0.2, 1.0);
+
+	if (r >= 1.0 || openness <= 0.0)
+		return image.Sample(def_sampler, uv);
+
+	// Fade participation out towards the ellipse edge, so the deformation
+	// does not end in a visible step.
+	float weight = 1.0 - smoothstep(0.55, 1.0, r);
+
+	// Half-height of the opening, in UV.
+	float gap = openness * travel * mouth_radius.y * weight;
+	float dy = uv.y - mouth_center.y;
+
+	// The corners of a mouth close up even when it is open, so the interior
+	// detail fades out there rather than running to the ellipse edge.
+	float corner = 1.0 - smoothstep(0.55, 0.95, abs(d.x));
+
+	if (abs(dy) < gap) {
+		// With the region shown, the opening is flooded with opaque
+		// magenta. This is a diagnostic, not decoration: "the mouth is
+		// moving but I see no teeth" has two very different causes -
+		// this branch never running, or running and then being blended
+		// away to nothing - and they look identical on screen. Magenta
+		// ignores both the artwork's alpha and every colour layer
+		// below, so if it appears the branch runs and the problem is
+		// further down; if it does not, the opening is not being
+		// reached at all.
+		if (show_region > 0.5)
+			return float4(1.0, 0.0, 1.0, 1.0);
+
+		// Alpha from outside the gap, so the mouth interior exists only
+		// where the avatar does. Both sides are sampled and the larger
+		// taken: one sample can land on a transparent pixel when the
+		// mouth sits near the edge of a cut-out, and that would make the
+		// whole interior vanish rather than just that row.
+		float4 above = image.Sample(def_sampler, float2(uv.x, mouth_center.y - gap));
+		float4 below = image.Sample(def_sampler, float2(uv.x, mouth_center.y + gap));
+		float a = max(above.a, below.a);
+
+		// -1 at the upper lip, +1 at the lower.
+		float t = dy / max(gap, 1e-5);
+
+		// Cavity: darkest behind the teeth, warming towards the lower
+		// lip, which is the direction light actually falls into a
+		// mouth. It is deliberately not black at the front - a pure
+		// black opening reads as a hole punched in the picture, while a
+		// dark red-brown reads as the inside of a mouth.
+		float depth = 0.55 + 1.30 * smoothstep(-0.35, 1.0, t);
+		float3 colour = interior * depth;
+
+		// Upper teeth, hung from the upper jaw: a fixed slice of the
+		// mouth rather than a share of the opening, capped so they can
+		// never be taller than the opening itself. Over half the height
+		// when wide open, because the teeth are the cue that makes an
+		// opening read as a mouth at all - at a third they were present
+		// but too thin to notice on a small avatar.
+		float teeth_h = min(mouth_radius.y * 0.55, gap * 0.85);
+		float teeth_edge = -gap + teeth_h;
+		float teeth_amt = teeth * corner *
+				  (1.0 - smoothstep(teeth_edge - teeth_h * 0.35, teeth_edge, dy));
+		colour = lerp(colour, float3(0.93, 0.91, 0.86), saturate(teeth_amt));
+
+		// Tongue: low, central, and in as soon as there is any room, so
+		// the bottom of the opening is not left as flat dark either.
+		float tongue_amt = tongue * corner * smoothstep(0.00, 0.55, t) *
+				   (1.0 - smoothstep(0.85, 1.0, t));
+		colour = lerp(colour, float3(0.56, 0.18, 0.19), saturate(tongue_amt));
+
+		// Premultiplied, to match how the artwork was loaded.
+		return float4(colour * a, a);
+	}
+
+	// Outside the opening: reach across the gap, which moves this part of
+	// the face away from the mouth line.
+	float2 src = float2(uv.x, uv.y - sign(dy) * gap);
+	float4 colour = image.Sample(def_sampler, src);
+
+	// A shadow where the lip meets the opening. Without it the interior ends
+	// at a hard colour boundary and the lips look painted on rather than
+	// parted. Only the colour is scaled - the alpha is already premultiplied
+	// and must not be touched.
+	float rim = 1.0 - smoothstep(gap, gap + mouth_radius.y * 0.20, abs(dy));
+	colour.rgb *= 1.0 - 0.45 * rim * weight;
+
+	return colour;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader  = PSMouth(vert_in);
+	}
+}

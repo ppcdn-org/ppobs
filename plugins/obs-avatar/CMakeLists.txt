@@ -21,6 +21,9 @@ target_sources(
     avatar-assets.h
     avatar-engine.h
     avatar-engine-sidecar.c
+    avatar-engine-sidecar.h
+    avatar-engine-viseme.c
+    avatar-engine-viseme.h
     avatar-sidecar-protocol.h
 )
 
@@ -48,6 +51,13 @@ if(ENABLE_TEST_INPUT)
   add_executable(avatar-protocol-test avatar-protocol-test.c)
   add_test(NAME avatar-protocol COMMAND avatar-protocol-test)
   set_target_properties(avatar-protocol-test PROPERTIES FOLDER tests)
+
+  # Mode B's openness mapping and smoothing, which are static inline in
+  # avatar-engine-viseme.h so this needs none of the engine's graphics code.
+  add_executable(avatar-viseme-test avatar-viseme-test.c)
+  target_link_libraries(avatar-viseme-test PRIVATE OBS::libobs)
+  add_test(NAME avatar-viseme COMMAND avatar-viseme-test)
+  set_target_properties(avatar-viseme-test PROPERTIES FOLDER tests)
 
   # The one test that makes the two ends actually talk: it compiles the real
   # client in and starts the real worker as a child process. Fixtures prove
