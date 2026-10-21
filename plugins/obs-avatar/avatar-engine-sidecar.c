@@ -41,6 +41,11 @@
  * A crashed worker that is being restarted should not spin this thread. */
 #define SIDECAR_RECONNECT_MS 1000
 
+/* How old the newest frame may be before the source stops showing it. A
+ * frozen mouth left on stream is worse than a still avatar, because it
+ * still looks like it is talking. */
+#define SIDECAR_FRAME_STALE_NS 500000000ULL
+
 struct sidecar {
 	obs_source_t *owner;
 
@@ -72,6 +77,23 @@ struct sidecar {
 	uint32_t frame_height;
 	int64_t frame_pts;
 	bool frame_valid;
+	uint64_t frame_arrived;
+
+	/* Set when the frame is only the repainted region: where it goes, and
+	 * the reference frame it is positioned in. */
+	bool frame_is_region;
+	uint32_t region_x;
+	uint32_t region_y;
+	uint32_t ref_width;
+	uint32_t ref_height;
+
+	/* Owned by the graphics thread, inside render(). */
+	gs_texture_t *texture;
+	uint32_t tex_width;
+	uint32_t tex_height;
+	int64_t uploaded_pts;
+	bool uploaded;
+	bool stale_logged;
 
 	pthread_mutex_t state_mutex;
 	struct avatar_engine_stats stats;
@@ -250,10 +272,20 @@ static bool sidecar_handle_ready(struct sidecar *sc, const uint8_t *payload, uin
 		return false;
 	}
 
-	if (!width || !height || width > AVATAR_FRAME_MAX_EDGE || height > AVATAR_FRAME_MAX_EDGE) {
-		do_log(LOG_ERROR, "worker announced an unusable frame size %ux%u", width, height);
+	/* This is the reference frame - the coordinate space a CROP's x/y are in
+	 * - not a payload, so it is bounded far more loosely than a frame's
+	 * edge: a 1080p avatar is a perfectly reasonable reference even though
+	 * no single message may carry one. */
+	if (!width || !height || width > 8192 || height > 8192) {
+		do_log(LOG_ERROR, "worker announced an unusable reference size %ux%u", width, height);
 		return false;
 	}
+
+	pthread_mutex_lock(&sc->frame_mutex);
+	/* The reference frame a CROP's coordinates are relative to. */
+	sc->ref_width = width;
+	sc->ref_height = height;
+	pthread_mutex_unlock(&sc->frame_mutex);
 
 	pthread_mutex_lock(&sc->state_mutex);
 	sc->stats.connected = true;
@@ -302,6 +334,58 @@ static bool sidecar_handle_frame(struct sidecar *sc, const uint8_t *payload, uin
 	sc->frame_height = height;
 	sc->frame_pts = pts;
 	sc->frame_valid = true;
+	sc->frame_is_region = false;
+	sc->frame_arrived = os_gettime_ns();
+	pthread_mutex_unlock(&sc->frame_mutex);
+
+	pthread_mutex_lock(&sc->state_mutex);
+	sc->stats.frames++;
+	pthread_mutex_unlock(&sc->state_mutex);
+	return true;
+}
+
+/* The repainted region only. Its alpha is the blend mask, so compositing it
+ * over the artwork is a plain alpha blend - which is why this can be left to
+ * the GPU instead of costing 72ms a frame on the worker's CPU. */
+static bool sidecar_handle_crop(struct sidecar *sc, const uint8_t *payload, uint32_t len)
+{
+	if (len < AVATAR_CROP_HEADER_SIZE)
+		return false;
+
+	const int64_t pts = avatar_get_i64(payload);
+	const uint32_t x = avatar_get_u32(payload + 8);
+	const uint32_t y = avatar_get_u32(payload + 12);
+	const uint32_t width = avatar_get_u32(payload + 16);
+	const uint32_t height = avatar_get_u32(payload + 20);
+
+	pthread_mutex_lock(&sc->frame_mutex);
+	const uint32_t ref_width = sc->ref_width;
+	const uint32_t ref_height = sc->ref_height;
+	pthread_mutex_unlock(&sc->frame_mutex);
+
+	if (!avatar_crop_payload_valid(len, x, y, width, height, ref_width, ref_height)) {
+		do_log(LOG_WARNING, "discarding a CROP of %ux%u at %u,%u that does not fit a %ux%u frame (%u bytes)",
+		       width, height, x, y, ref_width, ref_height, len);
+		/* The framing is intact, so only this message is lost. */
+		return true;
+	}
+
+	const size_t pixels = (size_t)width * (size_t)height * 4u;
+
+	pthread_mutex_lock(&sc->frame_mutex);
+	if (sc->frame_cap < pixels) {
+		sc->frame = brealloc(sc->frame, pixels);
+		sc->frame_cap = pixels;
+	}
+	memcpy(sc->frame, payload + AVATAR_CROP_HEADER_SIZE, pixels);
+	sc->frame_width = width;
+	sc->frame_height = height;
+	sc->frame_pts = pts;
+	sc->frame_valid = true;
+	sc->frame_is_region = true;
+	sc->region_x = x;
+	sc->region_y = y;
+	sc->frame_arrived = os_gettime_ns();
 	pthread_mutex_unlock(&sc->frame_mutex);
 
 	pthread_mutex_lock(&sc->state_mutex);
@@ -440,6 +524,15 @@ static void sidecar_session(struct sidecar *sc)
 				return;
 			}
 			if (!sidecar_handle_frame(sc, sc->rx, msg.payload_len))
+				return;
+			break;
+
+		case AVATAR_MSG_CROP:
+			if (!ready) {
+				do_log(LOG_WARNING, "worker sent a crop before READY; dropping the connection");
+				return;
+			}
+			if (!sidecar_handle_crop(sc, sc->rx, msg.payload_len))
 				return;
 			break;
 
@@ -613,6 +706,12 @@ static void sidecar_destroy(void *data)
 	if (sc->thread_valid)
 		pthread_join(sc->thread, NULL);
 
+	if (sc->texture) {
+		obs_enter_graphics();
+		gs_texture_destroy(sc->texture);
+		obs_leave_graphics();
+	}
+
 	if (sc->pipe != INVALID_HANDLE_VALUE) {
 		CancelIoEx(sc->pipe, NULL);
 		DisconnectNamedPipe(sc->pipe);
@@ -694,6 +793,11 @@ static bool sidecar_lock_frame(void *data, struct avatar_engine_frame *out)
 	out->width = sc->frame_width;
 	out->height = sc->frame_height;
 	out->pts_ns = sc->frame_pts;
+	out->is_region = sc->frame_is_region;
+	out->x = sc->region_x;
+	out->y = sc->region_y;
+	out->ref_width = sc->ref_width;
+	out->ref_height = sc->ref_height;
 	return true;
 }
 
@@ -701,6 +805,113 @@ static void sidecar_unlock_frame(void *data)
 {
 	struct sidecar *sc = data;
 	pthread_mutex_unlock(&sc->frame_mutex);
+}
+
+/* Draws whatever the worker last sent.
+ *
+ * A CROP is composited over the artwork here rather than worker-side: the
+ * paste was over half of mode A's per-frame cost and none of it on the GPU,
+ * while the GPU already holds the artwork. A FRAME (the stub's whole picture)
+ * simply replaces it.
+ *
+ * Returns false when there is nothing recent to draw, which makes the source
+ * fall back to the still artwork. Staleness lives here rather than in the
+ * source because only the engine knows when its last frame arrived. */
+static bool sidecar_render(void *data, gs_texture_t *base, uint32_t cx, uint32_t cy)
+{
+	struct sidecar *sc = data;
+
+	pthread_mutex_lock(&sc->frame_mutex);
+
+	const bool have = sc->frame_valid;
+	const bool fresh = have && (os_gettime_ns() - sc->frame_arrived) < SIDECAR_FRAME_STALE_NS;
+	const bool is_region = sc->frame_is_region;
+	const uint32_t width = sc->frame_width;
+	const uint32_t height = sc->frame_height;
+	const uint32_t x = sc->region_x;
+	const uint32_t y = sc->region_y;
+	const uint32_t ref_width = sc->ref_width ? sc->ref_width : width;
+	const uint32_t ref_height = sc->ref_height ? sc->ref_height : height;
+
+	if (fresh && sc->frame_pts != sc->uploaded_pts) {
+		if (!sc->texture || sc->tex_width != width || sc->tex_height != height) {
+			gs_texture_destroy(sc->texture);
+			sc->texture = gs_texture_create(width, height, GS_BGRA, 1, NULL, GS_DYNAMIC);
+			sc->tex_width = width;
+			sc->tex_height = height;
+		}
+		if (sc->texture) {
+			gs_texture_set_image(sc->texture, sc->frame, width * 4, false);
+			sc->uploaded_pts = sc->frame_pts;
+			sc->uploaded = true;
+		}
+	}
+
+	pthread_mutex_unlock(&sc->frame_mutex);
+
+	if (!fresh || !sc->uploaded || !sc->texture) {
+		if (have && !fresh && !sc->stale_logged) {
+			sc->stale_logged = true;
+			do_log(LOG_WARNING, "no frame for %llu ms; falling back to the still avatar",
+			       (unsigned long long)(SIDECAR_FRAME_STALE_NS / 1000000ULL));
+		}
+		return false;
+	}
+
+	if (sc->stale_logged) {
+		sc->stale_logged = false;
+		do_log(LOG_INFO, "frames resumed");
+	}
+
+	const bool previous = gs_framebuffer_srgb_enabled();
+	gs_enable_framebuffer_srgb(true);
+
+	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+
+	if (!is_region) {
+		/* A whole picture of its own: it replaces the artwork. */
+		gs_blend_state_push();
+		gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+		gs_effect_set_texture_srgb(gs_effect_get_param_by_name(effect, "image"), sc->texture);
+		while (gs_effect_loop(effect, "Draw"))
+			gs_draw_sprite(sc->texture, 0, cx, cy);
+		gs_blend_state_pop();
+		gs_enable_framebuffer_srgb(previous);
+		return true;
+	}
+
+	if (!base) {
+		gs_enable_framebuffer_srgb(previous);
+		return false;
+	}
+
+	/* Artwork first, premultiplied as it was loaded. */
+	gs_blend_state_push();
+	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+	gs_effect_set_texture_srgb(gs_effect_get_param_by_name(effect, "image"), base);
+	while (gs_effect_loop(effect, "Draw"))
+		gs_draw_sprite(base, 0, cx, cy);
+	gs_blend_state_pop();
+
+	/* Then the region, mapped from the reference frame's pixels onto
+	 * whatever size the source is drawing at. Straight alpha, because the
+	 * mask arrives as an alpha channel rather than premultiplied in. */
+	const float sx = (float)cx / (float)ref_width;
+	const float sy = (float)cy / (float)ref_height;
+
+	gs_blend_state_push();
+	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+	gs_matrix_push();
+	gs_matrix_translate3f((float)x * sx, (float)y * sy, 0.0f);
+
+	gs_effect_set_texture_srgb(gs_effect_get_param_by_name(effect, "image"), sc->texture);
+	while (gs_effect_loop(effect, "Draw"))
+		gs_draw_sprite(sc->texture, 0, (uint32_t)((float)width * sx), (uint32_t)((float)height * sy));
+
+	gs_matrix_pop();
+	gs_blend_state_pop();
+	gs_enable_framebuffer_srgb(previous);
+	return true;
 }
 
 static void sidecar_get_stats(void *data, struct avatar_engine_stats *out)
@@ -720,5 +931,9 @@ const struct avatar_engine_ops avatar_engine_sidecar_ops = {
 	.push_audio = sidecar_push_audio,
 	.lock_frame = sidecar_lock_frame,
 	.unlock_frame = sidecar_unlock_frame,
+	/* Preferred by the source: a region has to be composited over the
+	 * artwork, which needs the base texture. lock_frame stays for callers
+	 * that want the pixels themselves, such as the loopback test. */
+	.render = sidecar_render,
 	.get_stats = sidecar_get_stats,
 };

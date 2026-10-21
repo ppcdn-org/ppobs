@@ -163,6 +163,49 @@ static void test_frame_payload_validation(void)
 	CHECK(!avatar_frame_payload_valid(AVATAR_FRAME_HEADER_SIZE, 65536, 65536));
 }
 
+static void test_crop_payload_validation(void)
+{
+	const uint32_t frame_w = 768;
+	const uint32_t frame_h = 1024;
+
+	/* A plausible repainted region: a face bbox expanded by MuseTalk's own
+	 * crop factor, somewhere in the upper middle of a portrait. */
+	CHECK(avatar_crop_payload_valid(AVATAR_CROP_HEADER_SIZE + 300 * 360 * 4, 230, 180, 300, 360, frame_w,
+					frame_h));
+
+	/* Dimensions disagreeing with the length, as for frames. */
+	CHECK(!avatar_crop_payload_valid(AVATAR_CROP_HEADER_SIZE + 300 * 360 * 4, 230, 180, 300, 359, frame_w,
+					 frame_h));
+	CHECK(!avatar_crop_payload_valid(AVATAR_CROP_HEADER_SIZE, 230, 180, 300, 360, frame_w, frame_h));
+
+	/* The region has to sit inside the reference frame. An x/y taken on
+	 * trust would place a texture outside the artwork - or, added to a
+	 * width, wrap and appear to fit. */
+	CHECK(!avatar_crop_payload_valid(AVATAR_CROP_HEADER_SIZE + 300 * 360 * 4, 600, 180, 300, 360, frame_w,
+					 frame_h));
+	CHECK(!avatar_crop_payload_valid(AVATAR_CROP_HEADER_SIZE + 300 * 360 * 4, 230, 800, 300, 360, frame_w,
+					 frame_h));
+	CHECK(!avatar_crop_payload_valid(AVATAR_CROP_HEADER_SIZE + 16 * 16 * 4, 0xFFFFFFF0u, 0, 16, 16, frame_w,
+					 frame_h));
+
+	/* Flush against the far edge is legal. */
+	CHECK(avatar_crop_payload_valid(AVATAR_CROP_HEADER_SIZE + 300 * 360 * 4, frame_w - 300, frame_h - 360, 300,
+					360, frame_w, frame_h));
+
+	/* Zero dimensions, and an edge beyond what a payload may carry. */
+	CHECK(!avatar_crop_payload_valid(AVATAR_CROP_HEADER_SIZE, 0, 0, 0, 0, frame_w, frame_h));
+	CHECK(!avatar_crop_payload_valid(AVATAR_CROP_HEADER_SIZE + 2000 * 16 * 4, 0, 0, 2000, 16, 4096, 4096));
+}
+
+static void test_protocol_version(void)
+{
+	/* CROP arrived in 2. The version is checked rather than relying on the
+	 * unknown-type skip: a plugin that ignored every CROP would show a
+	 * still avatar and look like a worker that had stopped. */
+	CHECK(AVATAR_PROTOCOL_VERSION == 2);
+	CHECK(AVATAR_CROP_HEADER_SIZE == 24);
+}
+
 int main(void)
 {
 	test_header_fixture();
@@ -172,5 +215,7 @@ int main(void)
 	test_header_accepts_unknown_type();
 	test_audio_payload_validation();
 	test_frame_payload_validation();
+	test_crop_payload_validation();
+	test_protocol_version();
 	return 0;
 }

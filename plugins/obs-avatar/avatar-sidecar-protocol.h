@@ -36,7 +36,11 @@ extern "C" {
 /* Bumped on any incompatible change. The worker reports its own version in
  * READY and the plugin refuses a mismatch outright: a half-understood frame
  * stream is worse than no avatar, because it would show the viewer garbage. */
-#define AVATAR_PROTOCOL_VERSION 1
+/* 2 added CROP. Bumped rather than relying on the unknown-type skip, because a
+ * plugin that silently ignored every CROP would show a still avatar and look
+ * like a worker that had stopped producing. Refusing the connection says what
+ * is actually wrong. */
+#define AVATAR_PROTOCOL_VERSION 2
 
 #define AVATAR_MSG_HEADER_SIZE 8
 
@@ -55,6 +59,19 @@ enum avatar_msg_type {
 	AVATAR_MSG_LOG = 6,   /* worker -> plugin: a line for OBS's log */
 	AVATAR_MSG_ERROR = 7, /* worker -> plugin: fatal, with a reason */
 	AVATAR_MSG_BYE = 8,   /* plugin -> worker: shut down cleanly */
+
+	/* worker -> plugin: just the repainted region, with the blend mask in
+	 * its alpha, to be composited over the artwork the plugin already has.
+	 *
+	 * This exists because compositing it worker-side was over half of mode
+	 * A's per-frame cost - 72ms of 143ms measured on an RTX 4060 - and none
+	 * of it on the GPU. MuseTalk's own blend converts the whole frame to
+	 * PIL and back twice to paste a region a fraction of its size; sending
+	 * the region instead moves the paste onto the GPU, which already holds
+	 * the artwork as a texture, and shrinks the payload from megabytes to
+	 * a couple of hundred kilobytes. The mask is the alpha channel, so the
+	 * feathered edge survives the move. */
+	AVATAR_MSG_CROP = 9,
 };
 
 /* READY flags */
@@ -63,6 +80,11 @@ enum avatar_msg_type {
 /* Payload header sizes, i.e. everything before the variable-length tail. */
 #define AVATAR_AUDIO_HEADER_SIZE 12 /* int64 pts_ns + uint32 sample_count */
 #define AVATAR_FRAME_HEADER_SIZE 16 /* int64 pts_ns + uint32 w + uint32 h */
+
+/* CROP: int64 pts_ns + uint32 x, y, width, height, then BGRA pixels whose
+ * alpha is the blend mask. x/y are in the reference frame's pixel coordinates,
+ * which READY reports as its width/height. */
+#define AVATAR_CROP_HEADER_SIZE 24
 
 /* STAT: whisper_us, unet_us, vae_us, queue_depth, dropped. */
 #define AVATAR_STAT_PAYLOAD_SIZE 20
@@ -219,6 +241,25 @@ static inline bool avatar_frame_payload_valid(uint32_t payload_len, uint32_t wid
 
 	const uint64_t pixels = (uint64_t)width * (uint64_t)height * 4ull;
 	return (uint64_t)payload_len == (uint64_t)AVATAR_FRAME_HEADER_SIZE + pixels;
+}
+
+/* Same arithmetic care as the frame validator, plus the region has to sit
+ * inside the reference frame: an x/y the plugin trusted blindly would place a
+ * texture outside the artwork, or wrap. */
+static inline bool avatar_crop_payload_valid(uint32_t payload_len, uint32_t x, uint32_t y, uint32_t width,
+					     uint32_t height, uint32_t frame_width, uint32_t frame_height)
+{
+	if (payload_len < AVATAR_CROP_HEADER_SIZE)
+		return false;
+	if (!width || !height)
+		return false;
+	if (width > AVATAR_FRAME_MAX_EDGE || height > AVATAR_FRAME_MAX_EDGE)
+		return false;
+	if ((uint64_t)x + width > frame_width || (uint64_t)y + height > frame_height)
+		return false;
+
+	const uint64_t pixels = (uint64_t)width * (uint64_t)height * 4ull;
+	return (uint64_t)payload_len == (uint64_t)AVATAR_CROP_HEADER_SIZE + pixels;
 }
 
 #ifdef __cplusplus

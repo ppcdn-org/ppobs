@@ -20,12 +20,20 @@ Two engines:
                   verified, and its latency seen, before MuseTalk weights
                   exist.
 
-  MuseTalkEngine  the real thing. Not implemented yet; it reports what is
-                  missing rather than pretending, and the worker falls back to
-                  the stub so the pipe still comes up.
+  MuseTalkEngine  the real thing, in musetalk_engine.py. It needs MuseTalk's
+                  own environment (Python 3.10 + CUDA + mmcv/mmpose), so it is
+                  imported lazily: --engine stub and --selftest keep working in
+                  a bare Python. When it cannot be built it says why, and
+                  --engine auto falls back to the stub rather than failing.
 
 Usage:
-    python ppobs_avatar_worker.py --pipe \\\\.\\pipe\\ppobs-avatar-1234-0000
+    # stub, any Python
+    python ppobs_avatar_worker.py --pipe \\\\.\\pipe\\ppobs-avatar-1234-0000 --engine stub
+
+    # real model, in MuseTalk's environment
+    D:\\github\\MuseTalk\\venv\\Scripts\\python.exe ppobs_avatar_worker.py ^
+        --pipe \\\\.\\pipe\\ppobs-avatar-1234-0000 --engine musetalk
+
     python ppobs_avatar_worker.py --selftest
 """
 
@@ -42,7 +50,7 @@ import time
 # Protocol (keep in step with avatar-sidecar-protocol.h)
 # --------------------------------------------------------------------------
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 HEADER = struct.Struct("<IHH")
 HEADER_SIZE = 8
@@ -57,6 +65,7 @@ MSG_STAT = 5
 MSG_LOG = 6
 MSG_ERROR = 7
 MSG_BYE = 8
+MSG_CROP = 9
 
 READY_REAL_MODEL = 1 << 0
 
@@ -68,6 +77,7 @@ LOG_DEBUG = 400
 
 AUDIO_HEADER = struct.Struct("<qI")  # pts_ns, sample_count
 FRAME_HEADER = struct.Struct("<qII")  # pts_ns, width, height
+CROP_HEADER = struct.Struct("<qIIII")  # pts_ns, x, y, width, height
 STAT_PAYLOAD = struct.Struct("<IIIII")  # whisper_us, unet_us, vae_us, queue, dropped
 HELLO_PAYLOAD = struct.Struct("<IIII")  # version, sample_rate, fps, asset_len
 
@@ -199,31 +209,24 @@ class StubEngine:
         return bytes(frame)
 
 
-class MuseTalkEngine:
-    """The real engine. Not implemented yet.
+def build_musetalk(musetalk_dir: str, asset_path: str, fps: int, sample_rate: int):
+    """Builds the real engine, or explains why it cannot be built.
 
-    When it lands, construction loads the prepared avatar bundle (coords,
-    latents, masks) plus whisper-tiny, the UNet and the VAE decoder, and
-    render() runs whisper -> UNet -> VAE decode -> blend for one audio window.
-    Weights belong in the asset directory the plugin logs at startup, under
-    background-models/musetalk/.
+    Imported here rather than at module scope so the stub path stays free of
+    torch: this worker is meant to be runnable in a bare Python for protocol
+    work, and only mode A needs MuseTalk's environment.
     """
+    from musetalk_engine import MuseTalkEngine, MuseTalkUnavailable
 
-    name = "musetalk"
-    real_model = True
-
-    # MuseTalk's own inpainting resolution; the blend back into the full frame
-    # happens worker-side, so this is what the plugin will receive.
-    width = 256
-    height = 256
-
-    @staticmethod
-    def available(asset_path: str) -> tuple[bool, str]:
-        if not asset_path:
-            return False, "no avatar bundle was given"
-        if not os.path.isdir(asset_path):
-            return False, f"avatar bundle '{asset_path}' is not a prepared directory"
-        return False, "the MuseTalk engine is not implemented yet (stage C)"
+    try:
+        return MuseTalkEngine(
+            musetalk_dir=musetalk_dir,
+            asset_path=asset_path,
+            fps=fps,
+            sample_rate=sample_rate,
+        ), None
+    except MuseTalkUnavailable as exc:
+        return None, str(exc)
 
 
 # --------------------------------------------------------------------------
@@ -238,8 +241,14 @@ class Session:
         self.sample_rate = sample_rate
         self.engine = engine
 
-        # One frame per 1/fps of audio, which is also how the real engine will
-        # be driven: a frame belongs to an audio window, not to a wall clock.
+        # A streaming engine does its own windowing - MuseTalk's audio API is
+        # clip-shaped, so it has to buffer more than one frame's worth before
+        # it can run at all. The stub has no such constraint and is driven a
+        # frame at a time here.
+        self.streaming = hasattr(engine, "feed")
+
+        # One frame per 1/fps of audio: a frame belongs to an audio window,
+        # not to a wall clock.
         self.samples_per_frame = max(1, sample_rate // fps)
 
         self.buffer: list[float] = []
@@ -260,6 +269,11 @@ class Session:
 
         samples = struct.unpack_from(f"<{count}f", payload, AUDIO_HEADER.size) if count else ()
 
+        if self.streaming:
+            for pixels, frame_pts, rect in self.engine.feed(samples, pts_ns):
+                self.send_region(pixels, frame_pts, rect)
+            return
+
         if self.buffer_pts is None:
             self.buffer_pts = pts_ns
 
@@ -274,6 +288,24 @@ class Session:
 
             self.emit_frame(window, window_pts)
 
+    def send_region(self, pixels: bytes, pts_ns: int, rect) -> None:
+        """A region goes as CROP for the plugin to composite; rect None means
+        the engine produced a whole picture and it goes as FRAME."""
+        if rect is None:
+            self.send_frame(pixels, pts_ns)
+            return
+
+        x, y, w, h = rect
+        send_message(self.stream, MSG_CROP, CROP_HEADER.pack(pts_ns, x, y, w, h) + pixels)
+        self.frames += 1
+        self.report_stats()
+
+    def send_frame(self, pixels: bytes, pts_ns: int) -> None:
+        header = FRAME_HEADER.pack(pts_ns, self.engine.width, self.engine.height)
+        send_message(self.stream, MSG_FRAME, header + pixels)
+        self.frames += 1
+        self.report_stats()
+
     def emit_frame(self, window, pts_ns: int) -> None:
         peak = max((abs(s) for s in window), default=0.0)
         rms = math.sqrt(sum(s * s for s in window) / len(window)) if window else 0.0
@@ -282,10 +314,9 @@ class Session:
         pixels = self.engine.render(rms, peak)
         self.render_us = int((time.perf_counter() - started) * 1_000_000)
 
-        header = FRAME_HEADER.pack(pts_ns, self.engine.width, self.engine.height)
-        send_message(self.stream, MSG_FRAME, header + pixels)
-        self.frames += 1
+        self.send_frame(pixels, pts_ns)
 
+    def report_stats(self) -> None:
         now = time.monotonic()
         if now - self.last_stat >= 1.0:
             self.last_stat = now
@@ -321,7 +352,7 @@ class Session:
                 send_log(self.stream, LOG_DEBUG, f"ignoring message type {msg_type}")
 
 
-def handshake(stream, requested_engine: str):
+def handshake(stream, requested_engine: str, musetalk_dir: str):
     msg_type, payload = read_message(stream)
     if msg_type != MSG_HELLO:
         raise ProtocolError(f"expected HELLO, got message type {msg_type}")
@@ -341,13 +372,13 @@ def handshake(stream, requested_engine: str):
 
     engine = None
     if requested_engine in ("auto", "musetalk"):
-        ok, why = MuseTalkEngine.available(asset_path)
-        if ok:
-            engine = MuseTalkEngine()
-        elif requested_engine == "musetalk":
-            send_error(stream, 3, f"MuseTalk unavailable: {why}")
-            raise ProtocolError(f"MuseTalk unavailable: {why}")
-        else:
+        engine, why = build_musetalk(musetalk_dir, asset_path, fps, sample_rate)
+        if engine is None:
+            if requested_engine == "musetalk":
+                # Asked for by name, so failing loudly beats quietly handing
+                # back something that is not the model.
+                send_error(stream, 3, f"MuseTalk unavailable: {why}")
+                raise ProtocolError(f"MuseTalk unavailable: {why}")
             engine = StubEngine()
             send_log(stream, LOG_WARNING, f"falling back to the stub engine: {why}")
     else:
@@ -410,6 +441,7 @@ def selftest() -> int:
     assert AUDIO_HEADER.size == 12
     assert FRAME_HEADER.size == 16
     assert STAT_PAYLOAD.size == 20
+    assert CROP_HEADER.size == 24
 
     # Signed timestamps have to survive the extremes.
     for value in (-(2**63), 2**63 - 1, -1, 0):
@@ -435,6 +467,10 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="ppobs avatar lip-sync worker")
     parser.add_argument("--pipe", help=r"named pipe created by the plugin, e.g. \\.\pipe\ppobs-avatar-123-0")
     parser.add_argument("--engine", default="auto", choices=["auto", "musetalk", "stub"])
+    # The weights stay where the MuseTalk checkout has them: its own modules
+    # reach for relative paths like ./models/face-parse-bisent, and copying
+    # 6.8 GB into OBS's config directory would break those for nothing.
+    parser.add_argument("--musetalk-dir", default=os.environ.get("MUSETALK_DIR", r"D:\github\MuseTalk"))
     parser.add_argument("--connect-timeout", type=float, default=30.0)
     parser.add_argument("--selftest", action="store_true", help="check the wire format and exit")
     args = parser.parse_args(argv)
@@ -449,7 +485,7 @@ def main(argv=None) -> int:
     stream = connect(args.pipe, args.connect_timeout)
 
     try:
-        session = handshake(stream, args.engine)
+        session = handshake(stream, args.engine, args.musetalk_dir)
         session.run()
         print("plugin said goodbye", flush=True)
     except ProtocolError as exc:
