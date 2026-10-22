@@ -28,6 +28,7 @@
 #include "obs-ffmpeg-rist.h"
 #include "obs-ffmpeg-srt.h"
 #include "srt-degrade-client.h"
+#include "ppobs-incident-proc.h"
 #include <libavutil/channel_layout.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/mastering_display_metadata.h>
@@ -366,6 +367,24 @@ static bool mpegts_sample_srt_loss(struct ffmpeg_output *stream)
 		warn("SRT windowed unrecoverable loss above threshold, forcing reconnect");
 
 	return reconnect;
+}
+
+/* Best-effort abnormal-reconnect report to ppcenter (see ppobs-incident-proc.h).
+ * Called right before the output signals the disconnect that makes libobs
+ * reconnect; asynchronous and can never affect the stream or the reconnect. */
+static void mpegts_report_reconnect(struct ffmpeg_output *stream, const char *reason, const char *detail,
+				    double loss_pct)
+{
+	if (!stream->ff_data.config.is_srt)
+		return;
+
+	int latency_ms = -1;
+	if (stream->h && stream->h->priv_data) {
+		SRTContext *s = (SRTContext *)stream->h->priv_data;
+		if (s->latency > 0)
+			latency_ms = (int)(s->latency / 1000); /* stored in microseconds */
+	}
+	ppobs_report_reconnect(stream->output, reason, detail, "srt", NULL, loss_pct, -1, latency_ms);
 }
 
 static inline int connect_mpegts_url(struct ffmpeg_output *stream, bool is_rist)
@@ -949,9 +968,13 @@ static void *write_thread(void *data)
 			if (stream->ff_data.config.is_srt) {
 				SRTContext *s = (SRTContext *)stream->h->priv_data;
 				SRT_SOCKSTATUS srt_sock_state = srt_getsockstate(s->fd);
-				if (srt_sock_state == SRTS_BROKEN || srt_sock_state == SRTS_NONEXIST)
+				if (srt_sock_state == SRTS_BROKEN || srt_sock_state == SRTS_NONEXIST) {
+					char detail[160];
+					snprintf(detail, sizeof(detail), "SRT write failed (ret=%d), socket state=%d", ret,
+						 (int)srt_sock_state);
+					mpegts_report_reconnect(stream, PPOBS_RECONNECT_REASON_SRT_LOST, detail, -1.0);
 					obs_output_signal_stop(stream->output, OBS_OUTPUT_DISCONNECTED);
-				else
+				} else
 					obs_output_signal_stop(stream->output, OBS_OUTPUT_ERROR);
 			} else if (stream->ff_data.config.is_rist) {
 				obs_output_signal_stop(stream->output, OBS_OUTPUT_DISCONNECTED);
@@ -972,6 +995,13 @@ static void *write_thread(void *data)
 		 * here avoids two differently-tuned judges fighting over the same
 		 * decision. */
 		if (mpegts_sample_srt_loss(stream) && !srt_degrade_connected(stream->output)) {
+			char detail[192];
+			snprintf(detail, sizeof(detail),
+				 "local SRT windowed unrecoverable loss %.2f%% above threshold %.2f%% (window %llds)",
+				 stream->loss_monitor.last_trigger_pct, stream->loss_monitor.threshold_pct,
+				 (long long)(stream->loss_monitor.window_ms / 1000));
+			mpegts_report_reconnect(stream, PPOBS_RECONNECT_REASON_HIGH_LOSS, detail,
+						stream->loss_monitor.last_trigger_pct);
 			obs_output_signal_stop(stream->output, OBS_OUTPUT_DISCONNECTED);
 			break;
 		}

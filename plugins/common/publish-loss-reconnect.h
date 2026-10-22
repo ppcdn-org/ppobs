@@ -52,6 +52,9 @@ struct publish_loss_monitor {
 	int64_t period_ms;
 	int64_t window_ms;
 	double threshold_pct;
+	/* Window loss rate (%) that tripped the last reconnect verdict; kept after
+	 * the reset so the caller can put it in the reconnect report. */
+	double last_trigger_pct;
 	int64_t start_ms; /* first record() after (re)arm; 0 until then */
 	int64_t next_sample_ms;
 	uint64_t acc_lost;
@@ -202,6 +205,7 @@ static inline bool publish_loss_monitor_record(struct publish_loss_monitor *m, u
 	double win_pct = (double)win_lost * 100.0 / (double)win_expected;
 	if (win_pct > m->threshold_pct) {
 		publish_loss_monitor_reset(m);
+		m->last_trigger_pct = win_pct;
 		return true;
 	}
 	return false;

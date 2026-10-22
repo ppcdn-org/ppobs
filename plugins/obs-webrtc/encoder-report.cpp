@@ -42,6 +42,25 @@ std::string DeriveEncoderReportUrl(const std::string &publish_url)
 	return publish_url.substr(0, pos + marker.size()) + "encoders/report";
 }
 
+static std::string DeriveV1Url(const std::string &publish_url, const char *path)
+{
+	const std::string marker = "/v1/";
+	auto pos = publish_url.find(marker);
+	if (pos == std::string::npos)
+		return "";
+	return publish_url.substr(0, pos + marker.size()) + path;
+}
+
+std::string DeriveCrashReportUrl(const std::string &publish_url)
+{
+	return DeriveV1Url(publish_url, "ppobs/crashes");
+}
+
+std::string DeriveReconnectReportUrl(const std::string &publish_url)
+{
+	return DeriveV1Url(publish_url, "ppobs/reconnects");
+}
+
 std::string EncoderReportNowUtc()
 {
 	const std::time_t t = std::time(nullptr);

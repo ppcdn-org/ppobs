@@ -1,5 +1,6 @@
 #include "srt-degrade-client.h"
 #include "publish-loss-reconnect.h"
+#include "ppobs-incident-proc.h"
 
 #include <obs.hpp>
 #include <nlohmann/json.hpp>
@@ -514,6 +515,17 @@ void SrtDegradeRegistry::ApplyIfNeeded(Channel *ch, const TargetState &target)
 	} else {
 		snprintf(reason, sizeof(reason), "apply codec=%s layers=%d", ch->codec.c_str(), ch->target.layers);
 	}
+	if (restart_requested) {
+		// Operators want to know why a publisher reconnected: tag this one as
+		// an mmx command (best-effort, async - see ppobs-incident-proc.h). A
+		// pure layer-count restart (no reconnect flag) is a normal degrade
+		// step and deliberately not reported as an abnormal reconnect.
+		char detail[192];
+		snprintf(detail, sizeof(detail), "mmx reconnect request (codec=%s): %s", ch->codec.c_str(),
+			 target.reason.empty() ? "no reason" : target.reason.c_str());
+		ppobs_report_reconnect(ch->output, PPOBS_RECONNECT_REASON_PPMMX_COMMAND, detail, "srt",
+				       ch->codec.c_str(), -1.0, -1, -1);
+	}
 	if (!RestartOutput(ch, reason)) {
 		// Didn't go inactive in time: roll back the optimistic state update
 		// so the idempotency check at the top doesn't swallow mmx's retry
@@ -595,6 +607,12 @@ void SrtDegradeRegistry::HandleLossSample(Channel *ch, uint64_t unrecoverable_de
 
 	do_log(LOG_WARNING, "mmx-reported windowed unrecoverable loss above threshold (codec=%s), forcing reconnect",
 	       ch->codec.c_str());
+	char detail[192];
+	snprintf(detail, sizeof(detail), "mmx-reported windowed unrecoverable loss %.2f%% above threshold %.2f%% (window %llds)",
+		 ch->loss_monitor.last_trigger_pct, ch->loss_monitor.threshold_pct,
+		 (long long)(ch->loss_monitor.window_ms / 1000));
+	ppobs_report_reconnect(ch->output, PPOBS_RECONNECT_REASON_HIGH_LOSS, detail, "srt", ch->codec.c_str(),
+			       ch->loss_monitor.last_trigger_pct, -1, -1);
 	RestartOutput(ch, "mmx-reported unrecoverable loss above local window threshold");
 }
 

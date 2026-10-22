@@ -1,5 +1,6 @@
 #include "whip-codec-session.h"
 #include "whip-utils.h"
+#include "incident-reporter.h"
 
 #include <obs.hpp>
 #include <util/dstr.h>
@@ -898,6 +899,28 @@ void WHIPCodecSession::WorkerLoop(uint64_t generation)
 
 		if (strcmp(reason, "stopping") == 0)
 			return;
+
+		// Best-effort, async diagnostics for ppcenter (see incident-reporter.h):
+		// the reason is decided here, where the disconnect is known. Never
+		// blocks or affects the reconnect below.
+		{
+			ReconnectEvent event;
+			event.codec = label;
+			if (strcmp(reason, "loss-reconnect") == 0) {
+				event.reason = ReconnectReason::HighPacketLoss;
+				event.loss_pct = loss_monitor.last_trigger_pct;
+				char detail[160];
+				snprintf(detail, sizeof(detail),
+					 "WHIP windowed RTP loss %.2f%% above threshold %.2f%% (window %llds)",
+					 loss_monitor.last_trigger_pct, loss_monitor.threshold_pct,
+					 (long long)(loss_monitor.window_ms / 1000));
+				event.detail = detail;
+			} else {
+				event.reason = ReconnectReason::WhipConnectionLost;
+				event.detail = std::string(label) + " session lost: " + reason;
+			}
+			ReportReconnectForOutput(output, "whip", std::move(event));
+		}
 
 		if (!ReconnectOnce(reason))
 			return;

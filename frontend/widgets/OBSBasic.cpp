@@ -39,6 +39,7 @@
 #include <dialogs/OBSBasicTransform.hpp>
 #include <models/SceneCollection.hpp>
 #include <settings/OBSBasicSettings.hpp>
+#include <utility/PPCDNIncident.hpp>
 #include <utility/QuickTransition.hpp>
 #include <utility/SceneRenameDelegate.hpp>
 #if defined(_WIN32) || defined(WHATSNEW_ENABLED)
@@ -1411,6 +1412,11 @@ void OBSBasic::OnFirstLoad()
 
 	if (showLogViewerOnStartup)
 		on_actionViewCurrentLog_triggered();
+
+	// Modules (incl. obs-webrtc's reporter) and the service are loaded by now:
+	// report crash logs left by previous sessions. Runs on a background thread
+	// and is a no-op until PPCenter is configured (StartStreaming retries).
+	PPCDNIncident::ReportPendingCrashes(service);
 }
 
 static const char *TEMPORAL_DENOISE_FILTER_ID = "temporal_denoise_filter";

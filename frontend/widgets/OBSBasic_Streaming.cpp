@@ -26,6 +26,7 @@
 #endif
 
 #include <utility/PPCDNPublishEndpoint.hpp>
+#include <utility/PPCDNIncident.hpp>
 
 #include <qt-wrappers.hpp>
 
@@ -38,6 +39,9 @@ void OBSBasic::DisplayStreamStartError()
 							    : QTStr("Output.StartFailedGeneric");
 
 	emit StreamingStopped();
+
+	// The publish never went live: don't let a later crash be attributed to it.
+	PPCDNIncident::RecordPublish(service, false);
 
 	if (sysTrayStream) {
 		sysTrayStream->setText(QTStr("Basic.Main.StartStreaming"));
@@ -86,6 +90,10 @@ void OBSBasic::StartStreaming()
 		sysTrayStream->setText("Basic.Main.PreparingStream");
 	}
 
+	// PPCenter config may have been entered since startup: (re)try the
+	// once-per-process crash-log report. Async and a no-op until configured.
+	PPCDNIncident::ReportPendingCrashes(service);
+
 	// An SRT Server URL may carry the "{ppcdn_publish_endpoint}" placeholder:
 	// ask PPCenter which Origin to push to and fold the answer into the
 	// service before the output is created. A no-op for every other service.
@@ -100,6 +108,10 @@ void OBSBasic::StartStreaming()
 			return;
 		}
 	}
+
+	// Remember what is being published so a crash report can say what the
+	// publisher was doing (best-effort, deactivated again in StreamingStop).
+	PPCDNIncident::RecordPublish(service, true);
 
 	auto finish_stream_setup = [&](bool setupStreamingResult) {
 		if (!setupStreamingResult) {
@@ -378,6 +390,8 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 		dstr_copy(errorMessage, errorDescription);
 
 	ui->statusbar->StreamStopped();
+
+	PPCDNIncident::RecordPublish(service, false);
 
 	qualityScorer.Stop();
 	qualityScoreUpdateNs = 0;

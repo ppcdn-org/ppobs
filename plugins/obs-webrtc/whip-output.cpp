@@ -8,6 +8,7 @@
 #include "nat-probe.h"
 #include "device-registration.h"
 #include "encoder-report.h"
+#include "incident-reporter.h"
 #include "uplink-qos-policy.h"
 
 #include <obs.hpp>
@@ -44,8 +45,10 @@ WHIPOutput::WHIPOutput(obs_data_t *, obs_output_t *output_, bool p2pOnly) : outp
 
 WHIPOutput::~WHIPOutput()
 {
-	if (p2pSignal)
+	{
+		std::unique_lock<std::shared_mutex> dataLock(dataMutex);
 		p2pSignal.reset();
+	}
 	Stop();
 
 	std::lock_guard<std::mutex> l(start_stop_mutex);
@@ -204,6 +207,10 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 		obs_output_signal_stop(output, OBS_OUTPUT_ENCODE_ERROR);
 		return;
 	}
+
+	// Shared for the whole packet; see dataMutex. The null-packet path above
+	// calls Stop(), which takes it exclusive, so it must stay outside.
+	std::shared_lock<std::shared_mutex> dataLock(dataMutex);
 
 	CheckUplinkQos();
 	CheckNatProbeRefresh();
@@ -723,6 +730,11 @@ bool WHIPOutput::Setup(uint64_t generation)
 			       deviceId.c_str());
 		} else {
 			do_log(LOG_INFO, "device registered: deviceId=%s", deviceId.c_str());
+			// Diagnostics reports (reconnects/crashes) must carry the same
+			// registered device id as the publish request. A generated
+			// fallback id is deliberately not shared: it would pin reports
+			// to the fallback for the rest of the process.
+			SeedIncidentDeviceId(deviceId);
 		}
 		request.device_id = deviceId;
 		if (p2pEnabled) {
@@ -1031,10 +1043,13 @@ void WHIPOutput::OnSessionPermanentFailure(const std::string &codecLabel, const 
 	// elsewhere. obs_output_signal_stop() itself is safe to call from
 	// any thread.
 	std::thread([this]() {
-		if (h264Session)
-			h264Session->Stop();
-		if (hevcSession)
-			hevcSession->Stop();
+		{
+			std::shared_lock<std::shared_mutex> dataLock(dataMutex);
+			if (h264Session)
+				h264Session->Stop();
+			if (hevcSession)
+				hevcSession->Stop();
+		}
 		obs_output_set_reconnect_delay(output, reconnect_backoff_sec * 1000);
 		obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
 	}).detach();
@@ -1129,18 +1144,22 @@ void WHIPOutput::StartThread(uint64_t generation)
 void WHIPOutput::StopThread(bool signal, uint64_t generation)
 {
 	running = false;
-	if (p2pSignal)
-		p2pSignal.reset();
-	// Drop our reference; the shared sync stops when the last holder does.
-	timeSync.reset();
+	{
+		// Exclusive: waits for any in-flight Data() before freeing what it uses.
+		std::unique_lock<std::shared_mutex> dataLock(dataMutex);
+		if (p2pSignal)
+			p2pSignal.reset();
+		// Drop our reference; the shared sync stops when the last holder does.
+		timeSync.reset();
 
-	if (h264Session) {
-		h264Session->Stop();
-		h264Session.reset();
-	}
-	if (hevcSession) {
-		hevcSession->Stop();
-		hevcSession.reset();
+		if (h264Session) {
+			h264Session->Stop();
+			h264Session.reset();
+		}
+		if (hevcSession) {
+			hevcSession->Stop();
+			hevcSession.reset();
+		}
 	}
 
 	if (signal && IsActiveGeneration(generation))
@@ -1335,6 +1354,15 @@ std::string WHIPOutput::AcquireP2PToken(bool force)
 		do_log(LOG_WARNING,
 		       "P2P signal token refresh failed: %s (keeping the current token; will retry on the next reconnect)",
 		       error.empty() ? "response carried no signal token" : error.c_str());
+		// Best-effort diagnostics (see incident-reporter.h); dedup'd hard for
+		// this reason because the signaling loop can retry every few seconds.
+		{
+			ReconnectEvent event;
+			event.reason = ReconnectReason::PpcenterTokenRefreshFailed;
+			event.detail = std::string("P2P signal token refresh failed: ") +
+				       (error.empty() ? "response carried no signal token" : error.c_str());
+			ReportReconnectForOutput(output, "", std::move(event));
+		}
 		return p2pToken;
 	}
 	p2pToken = response.signal_token;

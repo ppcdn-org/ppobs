@@ -43,6 +43,12 @@ struct ObsEncoderConfig {
 // Returns "" when the publish URL has no "/v1/" segment.
 std::string DeriveEncoderReportUrl(const std::string &publish_url);
 
+// Same derivation for the diagnostics endpoints (see incident-report.h):
+// "https://host/v1/publish/requests" -> "https://host/v1/ppobs/crashes" and
+// "https://host/v1/ppobs/reconnects". "" when there is no "/v1/" segment.
+std::string DeriveCrashReportUrl(const std::string &publish_url);
+std::string DeriveReconnectReportUrl(const std::string &publish_url);
+
 // Pure: builds the report request body. Never throws.
 std::string BuildEncoderReportJson(const std::string &app_id, const std::string &app_secret,
 				   const std::string &stream_name, const std::string &device_id,

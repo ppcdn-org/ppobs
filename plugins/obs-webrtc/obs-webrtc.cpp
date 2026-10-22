@@ -2,6 +2,7 @@
 
 #include "whip-output.h"
 #include "whip-service.h"
+#include "incident-reporter.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-webrtc", "en-US")
@@ -14,6 +15,9 @@ bool obs_module_load()
 {
 	register_whip_output();
 	register_whip_service();
+	// Cross-module diagnostics entry points (reconnect/crash reports to
+	// ppcenter) for obs-ffmpeg and the frontend; see incident-reporter.h.
+	RegisterIncidentProcs();
 
 	return true;
 }

@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <vector>
 
@@ -105,6 +106,12 @@ private:
 	// setting is on and a HEVC layer 0 encoder is actually attached
 	// (see Setup()/UIValidation - the frontend blocks starting with the
 	// checkbox on but no HEVC encoder configured).
+	// Data() runs on libobs' encoder threads and keeps using the members
+	// below (sessions, p2pSignal) until obs_output_end_data_capture(), which
+	// only happens after StopThread() has torn them down. Data() therefore
+	// holds this shared; StopThread()/~WHIPOutput() hold it exclusive while
+	// destroying them, so an in-flight packet can never touch a freed object.
+	std::shared_mutex dataMutex;
 	std::unique_ptr<WHIPCodecSession> h264Session;
 	std::unique_ptr<WHIPCodecSession> hevcSession;
 	std::atomic<bool> multitrack_permanent_failure{false};

@@ -2,6 +2,7 @@
 #include "ui_StatusBarWidget.h"
 
 #include <widgets/OBSBasic.hpp>
+#include <utility/PPCDNIncident.hpp>
 
 #include "moc_OBSBasicStatusBar.cpp"
 
@@ -399,6 +400,12 @@ void OBSBasicStatusBar::Reconnect(int seconds)
 
 		delaySecTotal = obs_output_get_active_delay(output);
 		UpdateDelayMsg();
+
+		// First reconnect of an outage only (libobs signals every retry): tell
+		// PPCenter the publish dropped. Async, best-effort, deduplicated
+		// against a more specific reason reported by the transport itself.
+		if (!retries)
+			PPCDNIncident::ReportReconnect(output);
 
 		retries++;
 	}
