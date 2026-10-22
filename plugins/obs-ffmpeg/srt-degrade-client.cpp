@@ -29,6 +29,12 @@ constexpr int kReconnectBackoffMaxMs = 30000;
 struct TargetState {
 	int layers = 0;
 	int bitrate_percent = 100;
+	// One-shot restart request (mmx's TARGET_STATE.reconnect). The receiver
+	// asks the publisher to restart so a newly raised SRT latency is
+	// negotiated by a fresh handshake; layers/bitrate are the current values,
+	// not a change.
+	bool reconnect = false;
+	std::string reason;
 };
 
 bool ParseTargetState(const std::string &json, TargetState &out)
@@ -41,6 +47,10 @@ bool ParseTargetState(const std::string &json, TargetState &out)
 			out.layers = j["layers"];
 		if (j.contains("bitrate_percent"))
 			out.bitrate_percent = j["bitrate_percent"];
+		if (j.contains("reconnect"))
+			out.reconnect = j["reconnect"].get<bool>();
+		if (j.contains("reason"))
+			out.reason = j["reason"].get<std::string>();
 	} catch (const std::exception &e) {
 		do_log(LOG_DEBUG, "JSON parse error: %s", e.what());
 		return false;
@@ -442,6 +452,7 @@ bool SrtDegradeRegistry::IsConnected(obs_output_t *output) const
 void SrtDegradeRegistry::ApplyIfNeeded(Channel *ch, const TargetState &target)
 {
 	bool layer_changed = false;
+	const bool restart_requested = target.reconnect;
 	TargetState prev;
 	bool prev_set = false;
 	int prev_pct = 100;
@@ -461,12 +472,16 @@ void SrtDegradeRegistry::ApplyIfNeeded(Channel *ch, const TargetState &target)
 		else
 			layer_changed = (new_layers != ch->target.layers);
 
-		do_log(LOG_INFO, "TARGET_STATE codec=%s layers=%d (was %d) bitrate=%d%%", ch->codec.c_str(),
-		       new_layers, current, target.bitrate_percent);
+		do_log(LOG_INFO, "TARGET_STATE codec=%s layers=%d (was %d) bitrate=%d%%%s", ch->codec.c_str(),
+		       new_layers, current, target.bitrate_percent, restart_requested ? " reconnect=1" : "");
+		if (restart_requested)
+			do_log(LOG_INFO, "Reconnect requested for codec=%s (%s)", ch->codec.c_str(),
+			       target.reason.empty() ? "no reason" : target.reason.c_str());
 
-		if (!layer_changed && ch->target_set && ch->last_pct == target.bitrate_percent) {
+		if (!layer_changed && !restart_requested && ch->target_set && ch->last_pct == target.bitrate_percent) {
 			ch->target = target;
 			ch->target.layers = new_layers;
+			ch->target.reconnect = false;
 			return;
 		}
 
@@ -476,12 +491,15 @@ void SrtDegradeRegistry::ApplyIfNeeded(Channel *ch, const TargetState &target)
 
 		ch->target = target;
 		ch->target.layers = new_layers;
+		// One-shot: clear the flag now that this message has been acted on, so
+		// mmx's unchanged retry cannot trigger a second restart.
+		ch->target.reconnect = false;
 		ch->target_set = true;
 		ch->last_pct = target.bitrate_percent;
 
 		ApplyBitrateLocked(*ch, target.bitrate_percent, !layer_changed);
 
-		if (!layer_changed) {
+		if (!layer_changed && !restart_requested) {
 			do_log(LOG_INFO, "Applied codec=%s bitrate=%d%% (live, no restart)", ch->codec.c_str(),
 			       target.bitrate_percent);
 			return;
@@ -489,8 +507,13 @@ void SrtDegradeRegistry::ApplyIfNeeded(Channel *ch, const TargetState &target)
 
 	}
 
-	char reason[96];
-	snprintf(reason, sizeof(reason), "apply codec=%s layers=%d", ch->codec.c_str(), ch->target.layers);
+	char reason[192];
+	if (restart_requested && !layer_changed) {
+		snprintf(reason, sizeof(reason), "mmx reconnect request (codec=%s): %s", ch->codec.c_str(),
+			 target.reason.empty() ? "no reason" : target.reason.c_str());
+	} else {
+		snprintf(reason, sizeof(reason), "apply codec=%s layers=%d", ch->codec.c_str(), ch->target.layers);
+	}
 	if (!RestartOutput(ch, reason)) {
 		// Didn't go inactive in time: roll back the optimistic state update
 		// so the idempotency check at the top doesn't swallow mmx's retry

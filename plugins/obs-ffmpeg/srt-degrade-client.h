@@ -47,8 +47,10 @@ int srt_degrade_target_layers(obs_output_t *output);
 /* True while this output's degrade WS is registered AND currently connected
  * (not just reconnecting/backed-off). mmx's own receive-side ULR is already
  * the authority driving TARGET_STATE and - once the ladder bottoms out -
- * its own forced reconnect (raising SRT's TSBPD latency then closing the
- * connection, see docs/design/publish-degrade-protocol.zh-CN.md and
+ * its own forced reconnect (raising SRT's TSBPD latency then asking the
+ * publisher to restart via TARGET_STATE.reconnect, falling back to closing
+ * the connection only if the executor ignores it; see
+ * docs/design/publish-degrade-protocol.zh-CN.md and
  * internal/degrade/degrade.go's terminal case). obs-ffmpeg-mpegts.c's local
  * loss-reconnect safety net (plugins/common/publish-loss-reconnect.h, fed
  * from this output's own sender-side srt_bstats()) is a *different*,
