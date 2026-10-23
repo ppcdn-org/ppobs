@@ -2665,6 +2665,7 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	ui->confirmOnExit->setChecked(confirmOnExit);
 	ui->ppcdnP2PEnabled->setChecked(p2pEnabled);
 	ui->ppcdnP2PMaxSessions->setValue(p2pMaxSessions);
+	UpdateP2PAvailability();
 
 	ui->filenameFormatting->setText(filename);
 	ui->overwriteIfExists->setChecked(overwriteIfExists);

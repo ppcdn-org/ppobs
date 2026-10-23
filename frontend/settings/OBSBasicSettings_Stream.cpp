@@ -1214,8 +1214,28 @@ void OBSBasicSettings::on_customServer_textChanged(const QString &)
 	UpdateWHIPSimulcastControls();
 }
 
+void OBSBasicSettings::UpdateP2PAvailability()
+{
+	// P2P is only allowed for WHIP publishes (SRT/ERTMP no longer start the P2P
+	// companion). The saved values are left untouched; the controls are just
+	// greyed out with a note so a non-WHIP user is not misled.
+	const bool allowed = IsWHIP();
+	const bool enabled = ui->ppcdnP2PEnabled->isChecked();
+
+	ui->ppcdnP2PEnabled->setEnabled(allowed);
+	ui->ppcdnP2PMaxSessionsLabel->setEnabled(allowed && enabled);
+	ui->ppcdnP2PMaxSessions->setEnabled(allowed && enabled);
+
+	QString description = QTStr("Basic.Settings.Advanced.P2P.Description");
+	if (!allowed)
+		description += QStringLiteral("\n") + QTStr("Basic.Settings.Advanced.P2P.WHIPOnly");
+	ui->ppcdnP2PDescription->setText(description);
+}
+
 void OBSBasicSettings::ServiceChanged(bool resetFields)
 {
+	UpdateP2PAvailability();
+
 	std::string service = QT_TO_UTF8(ui->service->currentText());
 	bool custom = IsRTMPCustomFamily();
 	bool whip = IsWHIP();

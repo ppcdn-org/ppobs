@@ -472,6 +472,15 @@ void BasicOutputHandler::StartP2PCompanion(obs_encoder_t *videoEnc, obs_encoder_
 	if (protocol && astrcmpi(protocol, "RTSP") == 0)
 		return;
 
+	// P2P is allowed for WHIP publishes only (they run it inside whip_output,
+	// handled above). The companion code stays; flip this to re-enable it for
+	// SRT/ERTMP.
+	constexpr bool kP2PCompanionForNonWHIP = false;
+	if (!kP2PCompanionForNonWHIP) {
+		blog(LOG_INFO, "[PPCDN] P2P companion disabled: P2P is only allowed for WHIP publishes");
+		return;
+	}
+
 	if (!P2PStreamingEnabled()) {
 		blog(LOG_INFO, "[PPCDN] P2P companion disabled in Settings > Advanced");
 		return;
