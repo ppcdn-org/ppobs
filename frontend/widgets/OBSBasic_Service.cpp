@@ -74,8 +74,19 @@ bool OBSBasic::LoadService()
 	if (!service)
 		return false;
 
-	/* Enforce Opus on WHIP if needed */
-	if (strcmp(obs_service_get_protocol(service), "WHIP") == 0) {
+	/* Enforce Opus on WHIP, SRT and ERTMP if needed. ppmmx refuses any other
+	 * audio on these protocols (AAC is only accepted on RTSP/ERTSP), and the
+	 * settings dialog only offers Opus for them; this covers a profile that
+	 * was saved or imported with AAC without the dialog ever being opened. SRT
+	 * and ERTMP are rtmp_custom services told apart the same way
+	 * OBSBasicSettings does: an srt:// server URL, or the "is_ertmp" marker. */
+	const char *serviceProtocol = obs_service_get_protocol(service);
+	bool opusOnly = serviceProtocol && strcmp(serviceProtocol, "WHIP") == 0;
+	if (!opusOnly && strcmp(type, "rtmp_custom") == 0) {
+		const char *server = obs_data_get_string(settings, "server");
+		opusOnly = obs_data_get_bool(settings, "is_ertmp") || (server && strncmp(server, "srt://", 6) == 0);
+	}
+	if (opusOnly) {
 		const char *option = config_get_string(activeConfiguration, "SimpleOutput", "StreamAudioEncoder");
 		if (strcmp(option, "opus") != 0)
 			config_set_string(activeConfiguration, "SimpleOutput", "StreamAudioEncoder", "opus");
