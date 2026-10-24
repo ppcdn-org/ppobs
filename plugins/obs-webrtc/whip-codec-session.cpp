@@ -859,6 +859,16 @@ bool WHIPCodecSession::ReconnectOnce(const char *disconnectReason)
 
 		const uint64_t generation = active_generation.fetch_add(1) + 1;
 		last_failure_permanent = false;
+		// Tearing down the previous generation (or a connect attempt that
+		// failed) closes its PeerConnection while that generation was still
+		// the active one, so its Closed event was accepted and is still
+		// pending. Left in place, the new generation's RunUntilDisconnect()
+		// would consume it and tear the fresh session down at once. Events
+		// from older generations are ignored from here on, so this is safe.
+		{
+			std::lock_guard<std::mutex> lk(cv_mutex);
+			pending_pc_event = PCEvent::None;
+		}
 		std::string resourceURL;
 		if (DoConnect(generation, resourceURL)) {
 			do_log(LOG_INFO, "WHIPCodecSession: reconnected");
