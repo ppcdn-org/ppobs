@@ -839,6 +839,12 @@ bool WHIPCodecSession::ReconnectOnce(const char *disconnectReason)
 	// extended outage with max_reconnect_attempts == 0 (retry forever)
 	// can't grow the call stack without bound.
 	std::string reason = disconnectReason;
+	// A mid-session 401/403/404/406 is not necessarily final: while the node
+	// restarts, its publish whitelist is empty and it answers 403 until it
+	// re-syncs from ppcenter. The growing backoff (3s, 6s, ...) means a few
+	// tolerated rejections span that window; only repeated rejections stop.
+	constexpr int kMaxRejectedReconnects = 6;
+	int rejected_reconnects = 0;
 	for (;;) {
 		reconnect_attempt.fetch_add(1);
 		if (cfg.max_reconnect_attempts > 0 && reconnect_attempt.load() > cfg.max_reconnect_attempts) {
@@ -873,10 +879,15 @@ bool WHIPCodecSession::ReconnectOnce(const char *disconnectReason)
 		if (stop_requested.load())
 			return false;
 		if (last_failure_permanent.load()) {
-			do_log(LOG_WARNING, "WHIP reconnect permanently rejected, not retrying");
-			if (callbacks.onPermanentFailure)
-				callbacks.onPermanentFailure("whip-rejected");
-			return false;
+			if (++rejected_reconnects >= kMaxRejectedReconnects) {
+				do_log(LOG_WARNING, "WHIP reconnect rejected %d times in a row, not retrying",
+				       rejected_reconnects);
+				if (callbacks.onPermanentFailure)
+					callbacks.onPermanentFailure("whip-rejected");
+				return false;
+			}
+			do_log(LOG_INFO, "WHIP reconnect rejected (%d/%d), retrying in case the node is restarting",
+			       rejected_reconnects, kMaxRejectedReconnects);
 		}
 		reason = "connect-failed";
 	}
