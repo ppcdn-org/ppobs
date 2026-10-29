@@ -883,6 +883,8 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 		// SRT (and any non-WHIP) publish joins the P2P mesh via a companion
 		// output sharing the same (bf=0) H264 + audio encoders; no-op for WHIP.
 		StartP2PCompanion(videoStreaming, audioStreaming);
+		// Optional H264-only crop publish (Settings > Video > General).
+		StartCropOutput(service, videoStreaming, audioStreaming);
 		return true;
 	}
 
@@ -1047,6 +1049,8 @@ bool SimpleOutput::StartReplayBuffer()
 
 void SimpleOutput::StopStreaming(bool force)
 {
+	StopCropOutput(force);
+
 	auto output = StreamingOutput();
 	if (force && output)
 		obs_output_force_stop(output);

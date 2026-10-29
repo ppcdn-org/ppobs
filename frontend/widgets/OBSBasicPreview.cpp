@@ -3,6 +3,9 @@
 #include <utility/display-helpers.hpp>
 #include <widgets/OBSBasic.hpp>
 
+#include <algorithm>
+#include <cmath>
+
 #include "moc_OBSBasicPreview.cpp"
 
 #define HANDLE_RADIUS 4.0f
@@ -55,6 +58,236 @@ vec2 OBSBasicPreview::GetMouseEventPos(QMouseEvent *event)
 		 (qtPos.y() - main->previewY / pixelRatio) * scale);
 
 	return pos;
+}
+
+struct CropOverlayRect {
+	bool valid = false;
+	int x = 0;
+	int y = 0;
+	int w = 0;
+	int h = 0;
+	int outW = 0;
+	int outH = 0;
+	int baseW = 0;
+	int baseH = 0;
+};
+
+static CropOverlayRect GetCropOverlayRect()
+{
+	CropOverlayRect rect;
+
+	struct obs_video_info ovi;
+	if (!obs_get_video_info(&ovi) || ovi.base_width == 0 || ovi.base_height == 0 || ovi.output_width == 0 ||
+	    ovi.output_height == 0)
+		return rect;
+
+	OBSBasic *main = OBSBasic::Get();
+	// In Studio Mode the main preview shows the preview scene, not the
+	// program being cropped, so the box would not correspond to the output.
+	if (main->IsPreviewProgramMode())
+		return rect;
+	if (!config_get_bool(main->Config(), "Video", "CropOutputEnabled"))
+		return rect;
+
+	rect.baseW = (int)ovi.base_width;
+	rect.baseH = (int)ovi.base_height;
+	rect.outW = (int)ovi.output_width;
+	rect.outH = (int)ovi.output_height;
+	rect.x = (int)config_get_int(main->Config(), "Video", "CropX");
+	rect.y = (int)config_get_int(main->Config(), "Video", "CropY");
+	rect.w = (int)config_get_int(main->Config(), "Video", "CropWidth");
+	rect.h = (int)config_get_int(main->Config(), "Video", "CropHeight");
+
+	if (rect.w <= 0)
+		rect.w = rect.outW;
+	if (rect.h <= 0)
+		rect.h = rect.outH;
+
+	rect.x = std::clamp(rect.x, 0, rect.outW - 2);
+	rect.y = std::clamp(rect.y, 0, rect.outH - 2);
+	rect.w = std::clamp(rect.w, 2, rect.outW - rect.x);
+	rect.h = std::clamp(rect.h, 2, rect.outH - rect.y);
+	rect.valid = true;
+	return rect;
+}
+
+static void BaseToOutput(const CropOverlayRect &rect, const vec2 &pos, float &x, float &y)
+{
+	x = pos.x * (float)rect.outW / (float)rect.baseW;
+	y = pos.y * (float)rect.outH / (float)rect.baseH;
+}
+
+CropHandle OBSBasicPreview::HitTestCropBox(const vec2 &pos) const
+{
+	CropOverlayRect rect = GetCropOverlayRect();
+	if (!rect.valid)
+		return CropHandle::None;
+
+	const float baseX = (float)rect.x * rect.baseW / rect.outW;
+	const float baseY = (float)rect.y * rect.baseH / rect.outH;
+	const float baseW = (float)rect.w * rect.baseW / rect.outW;
+	const float baseH = (float)rect.h * rect.baseH / rect.outH;
+
+	OBSBasic *main = OBSBasic::Get();
+	const float tolerance = 8.0f * main->GetDevicePixelRatio() / main->previewScale;
+
+	const bool nearLeft = std::fabs(pos.x - baseX) <= tolerance;
+	const bool nearRight = std::fabs(pos.x - (baseX + baseW)) <= tolerance;
+	const bool nearTop = std::fabs(pos.y - baseY) <= tolerance;
+	const bool nearBottom = std::fabs(pos.y - (baseY + baseH)) <= tolerance;
+	const bool withinX = pos.x >= baseX - tolerance && pos.x <= baseX + baseW + tolerance;
+	const bool withinY = pos.y >= baseY - tolerance && pos.y <= baseY + baseH + tolerance;
+
+	if (nearTop && nearLeft && withinX && withinY)
+		return CropHandle::TopLeft;
+	if (nearTop && nearRight && withinX && withinY)
+		return CropHandle::TopRight;
+	if (nearBottom && nearLeft && withinX && withinY)
+		return CropHandle::BottomLeft;
+	if (nearBottom && nearRight && withinX && withinY)
+		return CropHandle::BottomRight;
+	if (nearLeft && withinY)
+		return CropHandle::Left;
+	if (nearRight && withinY)
+		return CropHandle::Right;
+	if (nearTop && withinX)
+		return CropHandle::Top;
+	if (nearBottom && withinX)
+		return CropHandle::Bottom;
+	if (withinX && withinY)
+		return CropHandle::Move;
+	return CropHandle::None;
+}
+
+void OBSBasicPreview::SetCropCursor(CropHandle handle)
+{
+	switch (handle) {
+	case CropHandle::Move:
+		setCursor(Qt::SizeAllCursor);
+		break;
+	case CropHandle::Left:
+	case CropHandle::Right:
+		setCursor(Qt::SizeHorCursor);
+		break;
+	case CropHandle::Top:
+	case CropHandle::Bottom:
+		setCursor(Qt::SizeVerCursor);
+		break;
+	case CropHandle::TopLeft:
+	case CropHandle::BottomRight:
+		setCursor(Qt::SizeFDiagCursor);
+		break;
+	case CropHandle::TopRight:
+	case CropHandle::BottomLeft:
+		setCursor(Qt::SizeBDiagCursor);
+		break;
+	default:
+		unsetCursor();
+		break;
+	}
+}
+
+bool OBSBasicPreview::BeginCropDrag(const vec2 &pos)
+{
+	CropHandle handle = HitTestCropBox(pos);
+	if (handle == CropHandle::None)
+		return false;
+
+	CropOverlayRect rect = GetCropOverlayRect();
+	if (!rect.valid)
+		return false;
+
+	cropDragHandle = handle;
+	cropDragging = true;
+	cropDragMoved = false;
+	cropDragStartX = rect.x;
+	cropDragStartY = rect.y;
+	cropDragStartW = rect.w;
+	cropDragStartH = rect.h;
+	cropDragOutW = rect.outW;
+	cropDragOutH = rect.outH;
+	BaseToOutput(rect, pos, cropDragStartMouse.x, cropDragStartMouse.y);
+
+	SetCropCursor(handle);
+	return true;
+}
+
+void OBSBasicPreview::UpdateCropDrag(const vec2 &pos)
+{
+	if (!cropDragging || cropDragOutW <= 0 || cropDragOutH <= 0)
+		return;
+
+	struct obs_video_info ovi;
+	if (!obs_get_video_info(&ovi) || ovi.base_width == 0 || ovi.base_height == 0)
+		return;
+
+	CropOverlayRect rect;
+	rect.outW = cropDragOutW;
+	rect.outH = cropDragOutH;
+	rect.baseW = (int)ovi.base_width;
+	rect.baseH = (int)ovi.base_height;
+
+	float mouseX, mouseY;
+	BaseToOutput(rect, pos, mouseX, mouseY);
+	const int dx = (int)std::lround(mouseX - cropDragStartMouse.x);
+	const int dy = (int)std::lround(mouseY - cropDragStartMouse.y);
+
+	constexpr int kMinSize = 16;
+
+	const bool left = cropDragHandle == CropHandle::Left || cropDragHandle == CropHandle::TopLeft ||
+			  cropDragHandle == CropHandle::BottomLeft;
+	const bool right = cropDragHandle == CropHandle::Right || cropDragHandle == CropHandle::TopRight ||
+			   cropDragHandle == CropHandle::BottomRight;
+	const bool top = cropDragHandle == CropHandle::Top || cropDragHandle == CropHandle::TopLeft ||
+			 cropDragHandle == CropHandle::TopRight;
+	const bool bottom = cropDragHandle == CropHandle::Bottom || cropDragHandle == CropHandle::BottomLeft ||
+			    cropDragHandle == CropHandle::BottomRight;
+
+	int newX = cropDragStartX;
+	int newY = cropDragStartY;
+	int newW = cropDragStartW;
+	int newH = cropDragStartH;
+
+	if (cropDragHandle == CropHandle::Move) {
+		newX = std::clamp(cropDragStartX + dx, 0, cropDragOutW - cropDragStartW);
+		newY = std::clamp(cropDragStartY + dy, 0, cropDragOutH - cropDragStartH);
+	} else {
+		if (left) {
+			newX = std::clamp(cropDragStartX + dx, 0, cropDragStartX + cropDragStartW - kMinSize);
+			newW = cropDragStartW + (cropDragStartX - newX);
+		} else if (right) {
+			newW = std::clamp(cropDragStartW + dx, kMinSize, cropDragOutW - cropDragStartX);
+		}
+
+		if (top) {
+			newY = std::clamp(cropDragStartY + dy, 0, cropDragStartY + cropDragStartH - kMinSize);
+			newH = cropDragStartH + (cropDragStartY - newY);
+		} else if (bottom) {
+			newH = std::clamp(cropDragStartH + dy, kMinSize, cropDragOutH - cropDragStartY);
+		}
+	}
+
+	OBSBasic *main = OBSBasic::Get();
+	if (newX != (int)config_get_int(main->Config(), "Video", "CropX") ||
+	    newY != (int)config_get_int(main->Config(), "Video", "CropY") ||
+	    newW != (int)config_get_int(main->Config(), "Video", "CropWidth") ||
+	    newH != (int)config_get_int(main->Config(), "Video", "CropHeight")) {
+		config_set_int(main->Config(), "Video", "CropX", newX);
+		config_set_int(main->Config(), "Video", "CropY", newY);
+		config_set_int(main->Config(), "Video", "CropWidth", newW);
+		config_set_int(main->Config(), "Video", "CropHeight", newH);
+		cropDragMoved = true;
+	}
+}
+
+void OBSBasicPreview::EndCropDrag()
+{
+	if (cropDragging && cropDragMoved)
+		config_save_safe(OBSBasic::Get()->Config(), "tmp", nullptr);
+
+	cropDragging = false;
+	cropDragMoved = false;
+	cropDragHandle = CropHandle::None;
 }
 
 static void RotatePos(vec2 *pos, float rot)
@@ -562,6 +795,11 @@ void OBSBasicPreview::mousePressEvent(QMouseEvent *event)
 		return;
 	}
 
+	if (event->button() == Qt::LeftButton && BeginCropDrag(GetMouseEventPos(event))) {
+		OBSQTDisplay::mousePressEvent(event);
+		return;
+	}
+
 	OBSBasic *main = OBSBasic::Get();
 	float pixelRatio = main->GetDevicePixelRatio();
 	float x = pos.x() - main->previewX / pixelRatio;
@@ -716,6 +954,13 @@ void OBSBasicPreview::mouseReleaseEvent(QMouseEvent *event)
 {
 	if (scrollMode)
 		setCursor(Qt::OpenHandCursor);
+
+	if (cropDragging) {
+		EndCropDrag();
+		SetCropCursor(HitTestCropBox(GetMouseEventPos(event)));
+		OBSQTDisplay::mouseReleaseEvent(event);
+		return;
+	}
 
 	if (locked) {
 		OBSQTDisplay::mouseReleaseEvent(event);
@@ -1546,6 +1791,19 @@ void OBSBasicPreview::mouseMoveEvent(QMouseEvent *event)
 	if (locked)
 		return;
 
+	if (cropDragging) {
+		UpdateCropDrag(GetMouseEventPos(event));
+		return;
+	}
+
+	if (!mouseDown) {
+		CropHandle cropHandle = HitTestCropBox(GetMouseEventPos(event));
+		if (cropHandle != CropHandle::None) {
+			SetCropCursor(cropHandle);
+			return;
+		}
+	}
+
 	bool updateCursor = false;
 
 	if (mouseDown) {
@@ -2161,9 +2419,69 @@ void OBSBasicPreview::DrawSceneEditing()
 		}
 	}
 
+	gs_matrix_push();
+	gs_matrix_scale3f(main->previewScale, main->previewScale, 1.0f);
+	DrawCropOverlay();
+	gs_matrix_pop();
+
 	gs_load_vertexbuffer(nullptr);
 
 	GS_DEBUG_MARKER_END();
+}
+
+void OBSBasicPreview::DrawCropOverlay()
+{
+	CropOverlayRect rect = GetCropOverlayRect();
+	if (!rect.valid)
+		return;
+
+	OBSBasic *main = OBSBasic::Get();
+	const float pixelRatio = main->GetDevicePixelRatio();
+
+	const float x = (float)rect.x * rect.baseW / rect.outW;
+	const float y = (float)rect.y * rect.baseH / rect.outH;
+	const float w = (float)rect.w * rect.baseW / rect.outW;
+	const float h = (float)rect.h * rect.baseH / rect.outH;
+
+	vec2 boxScale;
+	vec2_set(&boxScale, main->previewScale, main->previewScale);
+
+	QColor cropColor = main->GetCropColor();
+	vec4 color;
+	vec4_set(&color, cropColor.redF(), cropColor.greenF(), cropColor.blueF(), 1.0f);
+
+	const float thickness = HANDLE_RADIUS * pixelRatio / 2.0f;
+
+	gs_eparam_t *lineColor = gs_effect_get_param_by_name(stripedLineEffect, "color");
+	gs_effect_set_vec4(lineColor, &color);
+
+	DrawStripedLine(x, y, x + w, y, thickness, boxScale);
+	DrawStripedLine(x, y + h, x + w, y + h, thickness, boxScale);
+	DrawStripedLine(x, y, x, y + h, thickness, boxScale);
+	DrawStripedLine(x + w, y, x + w, y + h, thickness, boxScale);
+
+	gs_eparam_t *solidColor = gs_effect_get_param_by_name(solidEffect, "color");
+	gs_effect_set_vec4(solidColor, &color);
+
+	gs_technique_t *tech = gs_effect_get_technique(solidEffect, "Solid");
+	gs_technique_begin(tech);
+	gs_technique_begin_pass(tech, 0);
+
+	gs_load_vertexbuffer(main->box);
+
+	DrawSquareAtPos(x, y, pixelRatio);
+	DrawSquareAtPos(x + w * 0.5f, y, pixelRatio);
+	DrawSquareAtPos(x + w, y, pixelRatio);
+	DrawSquareAtPos(x, y + h * 0.5f, pixelRatio);
+	DrawSquareAtPos(x + w, y + h * 0.5f, pixelRatio);
+	DrawSquareAtPos(x, y + h, pixelRatio);
+	DrawSquareAtPos(x + w * 0.5f, y + h, pixelRatio);
+	DrawSquareAtPos(x + w, y + h, pixelRatio);
+
+	gs_load_vertexbuffer(nullptr);
+
+	gs_technique_end_pass(tech);
+	gs_technique_end(tech);
 }
 
 void OBSBasicPreview::ResetScrollingOffset()

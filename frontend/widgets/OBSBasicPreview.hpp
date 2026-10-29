@@ -31,6 +31,19 @@ enum class ItemHandle : uint32_t {
 	Rot = ITEM_ROT
 };
 
+enum class CropHandle {
+	None,
+	Move,
+	Left,
+	Top,
+	Right,
+	Bottom,
+	TopLeft,
+	TopRight,
+	BottomLeft,
+	BottomRight,
+};
+
 class OBSBasicPreview : public OBSQTDisplay {
 	Q_OBJECT
 
@@ -71,6 +84,20 @@ private:
 	bool scrollMode = false;
 	bool fixedScaling = false;
 	bool selectionBox = false;
+
+	/* Settings > Video > General crop-output box. It is drawn and edited
+	 * in the preview while the crop publish is enabled; values persist in
+	 * the Video config section (output/scaled pixel coordinates). */
+	CropHandle cropDragHandle = CropHandle::None;
+	bool cropDragging = false;
+	bool cropDragMoved = false;
+	int cropDragStartX = 0;
+	int cropDragStartY = 0;
+	int cropDragStartW = 0;
+	int cropDragStartH = 0;
+	int cropDragOutW = 0;
+	int cropDragOutH = 0;
+	vec2 cropDragStartMouse;
 
 	bool overflowHidden = false;
 	bool overflowSelectionHidden = false;
@@ -116,6 +143,12 @@ private:
 
 	void ProcessClick(const vec2 &pos);
 
+	bool BeginCropDrag(const vec2 &pos);
+	void UpdateCropDrag(const vec2 &pos);
+	void EndCropDrag();
+	CropHandle HitTestCropBox(const vec2 &pos) const;
+	void SetCropCursor(CropHandle handle);
+
 	void DrawStripedLine(float x1, float y1, float x2, float y2, float thickness, vec2 scale);
 
 	OBSDataAutoRelease wrapper = nullptr;
@@ -141,6 +174,7 @@ public:
 
 	void DrawOverflow();
 	void DrawSceneEditing();
+	void DrawCropOverlay();
 
 	inline void SetLocked(bool newLockedVal) { locked = newLockedVal; }
 	inline void ToggleLocked() { locked = !locked; }

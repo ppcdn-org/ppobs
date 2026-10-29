@@ -15,6 +15,9 @@
 
 #include <QThreadPool>
 
+#include <algorithm>
+#include <cmath>
+
 using namespace std;
 
 extern bool EncoderAvailable(const char *encoder);
@@ -73,6 +76,8 @@ void OBSStopStreaming(void *data, calldata_t *params)
 	// The P2P companion (if any) is tied to the primary publish's lifetime the
 	// same way - never leave it publishing on its own.
 	output->StopP2PCompanion();
+	// The crop publish is likewise never left publishing on its own.
+	output->StopCropOutput(true);
 
 	output->streamingActive = false;
 	output->delayActive = false;
@@ -603,7 +608,280 @@ uint64_t BasicOutputHandler::TotalStreamingBytes() const
 	uint64_t total = obs_output_get_total_bytes(StreamingOutput());
 	if (hevcStreamOutput)
 		total += obs_output_get_total_bytes(hevcStreamOutput);
+	if (cropOutput)
+		total += obs_output_get_total_bytes(cropOutput);
 	return total;
+}
+
+// Bitrate for the crop publish: the main stream's bitrate scaled by the crop
+// region's share of the main output's pixel area (Settings > Video > General
+// documents it as crop area / main output area * main bitrate).
+static int64_t CropOutputProportionalBitrate(int64_t mainBitrate, uint32_t mainWidth, uint32_t mainHeight,
+					     uint32_t cropWidth, uint32_t cropHeight)
+{
+	if (mainWidth == 0 || mainHeight == 0)
+		return mainBitrate > 0 ? mainBitrate : 1;
+
+	int64_t bitrate =
+		mainBitrate * (int64_t)cropWidth * cropHeight / ((int64_t)mainWidth * mainHeight);
+	return bitrate > 0 ? bitrate : 1;
+}
+
+void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *videoEncoder,
+					 obs_encoder_t *audioEncoder)
+{
+	if (cropOutput)
+		return;
+	if (!config_get_bool(main->Config(), "Video", "CropOutputEnabled"))
+		return;
+	if (!service || !videoEncoder || !audioEncoder)
+		return;
+
+	video_t *mainVideo = obs_get_video();
+	struct obs_video_info ovi;
+	if (!mainVideo || !obs_get_video_info(&ovi)) {
+		blog(LOG_WARNING, "[crop] no main video to crop");
+		return;
+	}
+
+	const uint32_t outWidth = video_output_get_width(mainVideo);
+	const uint32_t outHeight = video_output_get_height(mainVideo);
+	if (outWidth == 0 || outHeight == 0)
+		return;
+
+	int x = (int)config_get_int(main->Config(), "Video", "CropX");
+	int y = (int)config_get_int(main->Config(), "Video", "CropY");
+	int width = (int)config_get_int(main->Config(), "Video", "CropWidth");
+	int height = (int)config_get_int(main->Config(), "Video", "CropHeight");
+
+	// Crop coordinates are in the main *output* (scaled) resolution, the
+	// same space the bitrate ratio is computed in.
+	x = std::max(x, 0);
+	y = std::max(y, 0);
+	if (x >= (int)outWidth || y >= (int)outHeight) {
+		blog(LOG_WARNING, "[crop] crop origin %d,%d is outside the %ux%u output", x, y, outWidth, outHeight);
+		return;
+	}
+	width = std::min(width, (int)outWidth - x);
+	height = std::min(height, (int)outHeight - y);
+	if (width < 2 || height < 2) {
+		blog(LOG_WARNING, "[crop] invalid crop size %dx%d", width, height);
+		return;
+	}
+
+	// H264 wants even dimensions.
+	width &= ~1;
+	height &= ~1;
+
+	const double scaleX = (double)ovi.base_width / (double)outWidth;
+	const double scaleY = (double)ovi.base_height / (double)outHeight;
+	int64_t baseX = (int64_t)std::llround(x * scaleX);
+	int64_t baseY = (int64_t)std::llround(y * scaleY);
+	uint32_t baseWidth = (uint32_t)std::max<int64_t>(2, ((int64_t)std::llround(width * scaleX)) & ~1LL);
+	uint32_t baseHeight = (uint32_t)std::max<int64_t>(2, ((int64_t)std::llround(height * scaleY)) & ~1LL);
+
+	baseX = std::max<int64_t>(baseX, 0);
+	baseY = std::max<int64_t>(baseY, 0);
+	if (baseX >= (int64_t)ovi.base_width || baseY >= (int64_t)ovi.base_height) {
+		blog(LOG_WARNING, "[crop] crop origin %lld,%lld is outside the %ux%u canvas", (long long)baseX,
+		     (long long)baseY, ovi.base_width, ovi.base_height);
+		return;
+	}
+	baseWidth = std::min<uint32_t>(baseWidth, (ovi.base_width - (uint32_t)baseX) & ~1u);
+	baseHeight = std::min<uint32_t>(baseHeight, (ovi.base_height - (uint32_t)baseY) & ~1u);
+	if (baseWidth < 2 || baseHeight < 2) {
+		blog(LOG_WARNING, "[crop] invalid canvas crop size %ux%u", baseWidth, baseHeight);
+		return;
+	}
+
+	// A private canvas renders the program's scene source offset by the crop
+	// origin, clipped to the crop size, then scaled to the requested output
+	// size. Keeping it separate from the main canvas leaves the normal
+	// program output untouched.
+	struct obs_video_info cropOvi = ovi;
+	cropOvi.base_width = baseWidth;
+	cropOvi.base_height = baseHeight;
+	cropOvi.output_width = (uint32_t)width;
+	cropOvi.output_height = (uint32_t)height;
+	if (cropOvi.scale_type == OBS_SCALE_DISABLE)
+		cropOvi.scale_type = OBS_SCALE_BICUBIC;
+
+	cropCanvas = obs_canvas_create_private("crop_output_canvas", &cropOvi, 0);
+	if (!cropCanvas) {
+		blog(LOG_WARNING, "[crop] failed to create the crop canvas");
+		return;
+	}
+
+	cropScene = obs_canvas_scene_create(cropCanvas, "crop_output_scene");
+	if (!cropScene) {
+		blog(LOG_WARNING, "[crop] failed to create the crop scene");
+		StopCropOutput(true);
+		return;
+	}
+
+	OBSSourceAutoRelease program = obs_get_output_source(0);
+	if (!program) {
+		blog(LOG_WARNING, "[crop] no program source to crop");
+		StopCropOutput(true);
+		return;
+	}
+
+	obs_sceneitem_t *item = obs_scene_add(cropScene, program);
+	if (!item) {
+		blog(LOG_WARNING, "[crop] failed to add the program source to the crop scene");
+		StopCropOutput(true);
+		return;
+	}
+	// Sources with audio are added hidden by libobs; the crop scene always
+	// shows the program.
+	obs_sceneitem_set_visible(item, true);
+
+	struct vec2 pos;
+	pos.x = (float)(-baseX);
+	pos.y = (float)(-baseY);
+	obs_sceneitem_set_pos(item, &pos);
+
+	obs_canvas_set_channel(cropCanvas, 0, obs_scene_get_source(cropScene));
+
+	// Derive the crop publish URL from the service the main publish actually
+	// uses (so a PPCenter per-codec token/path is inherited), appending the
+	// "-h5" marker to the stream name. The crop publish is always H264.
+	obs_service_t *primary = PrimaryPublishService(service);
+	OBSDataAutoRelease original = obs_service_get_settings(primary);
+	OBSDataAutoRelease settings = original ? obs_data_create_from_json(obs_data_get_json(original)) : nullptr;
+	if (!settings) {
+		blog(LOG_WARNING, "[crop] failed to copy the publish service settings");
+		StopCropOutput(true);
+		return;
+	}
+
+	const char *server = obs_data_get_string(settings, "server");
+	if (!server || !*server) {
+		blog(LOG_WARNING, "[crop] the publish service has no Server URL");
+		StopCropOutput(true);
+		return;
+	}
+
+	std::string cropUrl = AppendPublishPathSuffix(server, "-h5");
+	// Mirror the main publish's codec-path convention, but always as H264 -
+	// e.g. a HEVC main publish's ".../h264" becomes "...-h5/h264".
+	if (!PublishCodecFromURL(server).empty())
+		cropUrl = WithPublishCodec(cropUrl, "h264");
+	obs_data_set_string(settings, "server", cropUrl.c_str());
+
+	cropService =
+		obs_service_create(obs_service_get_id(primary), "crop_stream_service", settings, nullptr);
+	if (!cropService) {
+		blog(LOG_WARNING, "[crop] failed to create the crop publish service");
+		StopCropOutput(true);
+		return;
+	}
+
+	const char *mainEncoderId = obs_encoder_get_id(videoEncoder);
+	const std::string h264EncoderId = ResolveWHIPH264EncoderId(mainEncoderId ? mainEncoderId : "");
+	OBSDataAutoRelease mainSettings = obs_encoder_get_settings(videoEncoder);
+	OBSDataAutoRelease cropSettings =
+		mainSettings ? obs_data_create_from_json(obs_data_get_json(mainSettings)) : obs_data_create();
+
+	// The settings are copied from the main encoder, which may be HEVC/AV1.
+	// Drop a profile H264 cannot use (e.g. HEVC's "main10") so the H264
+	// encoder gets a valid one.
+	const char *profile = obs_data_get_string(cropSettings, "profile");
+	if (profile && *profile && strcmp(profile, "baseline") != 0 && strcmp(profile, "main") != 0 &&
+	    strcmp(profile, "high") != 0)
+		obs_data_set_string(cropSettings, "profile", "high");
+
+	const int64_t mainBitrate = obs_data_get_int(cropSettings, "bitrate");
+	const int64_t cropBitrate =
+		CropOutputProportionalBitrate(mainBitrate, outWidth, outHeight, (uint32_t)width, (uint32_t)height);
+	obs_data_set_int(cropSettings, "bitrate", cropBitrate);
+
+	const int64_t mainMaxBitrate = obs_data_get_int(cropSettings, "max_bitrate");
+	if (mainMaxBitrate > 0) {
+		int64_t cropMaxBitrate = mainBitrate > 0 ? mainMaxBitrate * cropBitrate / mainBitrate : mainMaxBitrate;
+		if (cropMaxBitrate < cropBitrate)
+			cropMaxBitrate = cropBitrate;
+		obs_data_set_int(cropSettings, "max_bitrate", cropMaxBitrate);
+	}
+
+	cropVideoEncoder =
+		obs_video_encoder_create(h264EncoderId.c_str(), "crop_stream_video", cropSettings, nullptr);
+	if (!cropVideoEncoder) {
+		blog(LOG_WARNING, "[crop] failed to create the H264 encoder '%s'", h264EncoderId.c_str());
+		StopCropOutput(true);
+		return;
+	}
+	obs_encoder_set_video(cropVideoEncoder, obs_canvas_get_video(cropCanvas));
+	// The crop publish is always 8-bit H264, even when the main stream is
+	// 10-bit HEVC/AV1 (the copied settings must not force P010/I010 on it).
+	obs_encoder_set_preferred_video_format(cropVideoEncoder, VIDEO_FORMAT_NV12);
+	ForceEncoderNoBFrames(cropVideoEncoder);
+
+	const char *type = GetStreamOutputType(cropService);
+	if (!type) {
+		blog(LOG_WARNING, "[crop] no output type for the crop publish");
+		StopCropOutput(true);
+		return;
+	}
+
+	cropOutput = obs_output_create(type, "crop_stream", nullptr, nullptr);
+	if (!cropOutput) {
+		blog(LOG_WARNING, "[crop] failed to create the crop output");
+		StopCropOutput(true);
+		return;
+	}
+
+	obs_output_add_packet_callback(cropOutput, abs_ts_sei_inject, nullptr);
+	obs_output_set_service(cropOutput, cropService);
+	obs_output_set_video_encoder(cropOutput, cropVideoEncoder);
+	obs_output_set_audio_encoder(cropOutput, audioEncoder, 0);
+
+	bool reconnect = config_get_bool(main->Config(), "Output", "Reconnect");
+	int retryDelay = config_get_uint(main->Config(), "Output", "RetryDelay");
+	int maxRetries = config_get_uint(main->Config(), "Output", "MaxRetries");
+	if (!reconnect)
+		maxRetries = 0;
+	obs_output_set_reconnect_settings(cropOutput, maxRetries, retryDelay);
+
+	if (!obs_output_start(cropOutput)) {
+		const char *error = obs_output_get_last_error(cropOutput);
+		blog(LOG_WARNING, "[crop] failed to start the crop publish (%s); main publish continues",
+		     (error && *error) ? error : "unknown error");
+		StopCropOutput(true);
+		return;
+	}
+
+	blog(LOG_INFO, "[crop] publishing %dx%d at %lld kbps to %s", width, height, (long long)cropBitrate,
+	     cropUrl.c_str());
+}
+
+void BasicOutputHandler::StopCropOutput(bool force)
+{
+	UNUSED_PARAMETER(force);
+
+	if (!cropOutput && !cropCanvas && !cropVideoEncoder && !cropService)
+		return;
+
+	// Always force-stop: the output is about to be released, and its stop
+	// path must have finished before the video/encoder it references goes
+	// away (same reasoning as StopP2PCompanion).
+	if (cropOutput)
+		obs_output_force_stop(cropOutput);
+	cropOutput = nullptr;
+	cropVideoEncoder = nullptr;
+	cropService = nullptr;
+
+	if (cropCanvas)
+		obs_canvas_set_channel(cropCanvas, 0, nullptr);
+	cropCanvas = nullptr;
+	cropScene = nullptr;
+}
+
+BasicOutputHandler::~BasicOutputHandler()
+{
+	// The crop publish references a private canvas/encoder owned here, so it
+	// must be torn down before those members are destroyed.
+	StopCropOutput(true);
 }
 
 BasicOutputHandler::BasicOutputHandler(OBSBasic *main_) : main(main_)

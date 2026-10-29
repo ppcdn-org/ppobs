@@ -76,6 +76,24 @@ struct BasicOutputHandler {
 	OBSServiceAutoRelease singleCodecStreamService;
 	OBSSignal hevcStopStreaming;
 
+	// Optional crop publish (Settings > Video > General): a second,
+	// H264-only single-stream publish of a cropped region of the program.
+	// It goes to the main stream name with "-h5" appended and reuses the
+	// main publish's audio encoder; encoding parameters follow the main
+	// stream except for the bitrate, which is scaled by the crop/main pixel
+	// area ratio. Never carries HEVC or a Simulcast ladder.
+	OBSOutputAutoRelease cropOutput;
+	OBSServiceAutoRelease cropService;
+	OBSEncoderAutoRelease cropVideoEncoder;
+	OBSCanvasAutoRelease cropCanvas;
+	OBSSceneAutoRelease cropScene;
+
+	// Creates and starts the crop publish, if enabled in Settings > Video.
+	// Best-effort: a crop failure is logged but never blocks or stops the
+	// main publish.
+	void StartCropOutput(obs_service_t *service, obs_encoder_t *videoEncoder, obs_encoder_t *audioEncoder);
+	void StopCropOutput(bool force = false);
+
 	// P2P companion output (ppcenter_p2p_output): started alongside a non-WHIP
 	// (e.g. SRT) primary publish so that publish can still join the P2P mesh -
 	// a WHIP publish runs P2P inside its own whip_output and needs none of
@@ -190,7 +208,7 @@ struct BasicOutputHandler {
 
 	BasicOutputHandler(OBSBasic *main_);
 
-	virtual ~BasicOutputHandler() {};
+	virtual ~BasicOutputHandler();
 
 	virtual std::shared_future<void> SetupStreaming(obs_service_t *service,
 							SetupStreamingContinuation_t continuation) = 0;

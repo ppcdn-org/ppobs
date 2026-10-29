@@ -6823,17 +6823,114 @@
              </widget>
             </item>
             <item row="4" column="0">
-             <spacer name="horizontalSpacer_24">
-              <property name="orientation">
-               <enum>Qt::Horizontal</enum>
+             <widget class="QLabel" name="cropOutputLabel">
+              <property name="text">
+               <string>Basic.Settings.Video.CropOutput</string>
               </property>
-              <property name="sizeHint" stdset="0">
-               <size>
-                <width>170</width>
-                <height>10</height>
-               </size>
+              <property name="buddy">
+               <cstring>cropOutputEnabled</cstring>
               </property>
-             </spacer>
+             </widget>
+            </item>
+            <item row="4" column="1">
+             <widget class="QCheckBox" name="cropOutputEnabled">
+              <property name="text">
+               <string>Basic.Settings.Video.CropOutput.Enable</string>
+              </property>
+             </widget>
+            </item>
+            <item row="5" column="0">
+             <widget class="QLabel" name="cropAreaLabel">
+              <property name="text">
+               <string>Basic.Settings.Video.CropOutput.Area</string>
+              </property>
+             </widget>
+            </item>
+            <item row="5" column="1">
+             <widget class="QWidget" name="cropAreaWidget" native="true">
+              <layout class="QHBoxLayout" name="cropAreaLayout">
+               <property name="leftMargin">
+                <number>0</number>
+               </property>
+               <property name="topMargin">
+                <number>0</number>
+               </property>
+               <property name="rightMargin">
+                <number>0</number>
+               </property>
+               <property name="bottomMargin">
+                <number>0</number>
+               </property>
+               <item>
+                <widget class="QLabel" name="cropXLabel">
+                 <property name="text">
+                  <string>Basic.Settings.Video.CropOutput.X</string>
+                 </property>
+                 <property name="buddy">
+                  <cstring>cropX</cstring>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="cropX">
+                 <property name="maximum">
+                  <number>16384</number>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QLabel" name="cropYLabel">
+                 <property name="text">
+                  <string>Basic.Settings.Video.CropOutput.Y</string>
+                 </property>
+                 <property name="buddy">
+                  <cstring>cropY</cstring>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="cropY">
+                 <property name="maximum">
+                  <number>16384</number>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QLabel" name="cropWidthLabel">
+                 <property name="text">
+                  <string>Basic.Settings.Video.CropOutput.Width</string>
+                 </property>
+                 <property name="buddy">
+                  <cstring>cropWidth</cstring>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="cropWidth">
+                 <property name="maximum">
+                  <number>16384</number>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QLabel" name="cropHeightLabel">
+                 <property name="text">
+                  <string>Basic.Settings.Video.CropOutput.Height</string>
+                 </property>
+                 <property name="buddy">
+                  <cstring>cropHeight</cstring>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="cropHeight">
+                 <property name="maximum">
+                  <number>16384</number>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </widget>
             </item>
            </layout>
           </widget>

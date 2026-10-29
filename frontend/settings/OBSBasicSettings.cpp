@@ -551,6 +551,12 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->fpsInteger,           SCROLL_CHANGED, VIDEO_CHANGED);
 	HookWidget(ui->fpsNumerator,         SCROLL_CHANGED, VIDEO_CHANGED);
 	HookWidget(ui->fpsDenominator,       SCROLL_CHANGED, VIDEO_CHANGED);
+	HookWidget(ui->cropOutputEnabled,    CHECK_CHANGED,  VIDEO_CHANGED);
+	HookWidget(ui->cropX,                SCROLL_CHANGED, VIDEO_CHANGED);
+	HookWidget(ui->cropY,                SCROLL_CHANGED, VIDEO_CHANGED);
+	HookWidget(ui->cropWidth,            SCROLL_CHANGED, VIDEO_CHANGED);
+	HookWidget(ui->cropHeight,           SCROLL_CHANGED, VIDEO_CHANGED);
+	connect(ui->cropOutputEnabled, &QCheckBox::toggled, ui->cropAreaWidget, &QWidget::setEnabled);
 	HookWidget(ui->colorsGroupBox,       GROUP_CHANGED,  A11Y_CHANGED);
 	HookWidget(ui->colorPreset,          COMBO_CHANGED,  A11Y_CHANGED);
 	HookWidget(ui->renderer,             COMBO_CHANGED,  ADV_RESTART);
@@ -1745,6 +1751,23 @@ void OBSBasicSettings::LoadVideoSettings()
 	LoadResolutionLists();
 	LoadFPSData();
 	LoadDownscaleFilters();
+
+	const bool cropEnabled = config_get_bool(main->Config(), "Video", "CropOutputEnabled");
+	const int outCx = (int)config_get_uint(main->Config(), "Video", "OutputCX");
+	const int outCy = (int)config_get_uint(main->Config(), "Video", "OutputCY");
+	int cropWidth = (int)config_get_int(main->Config(), "Video", "CropWidth");
+	int cropHeight = (int)config_get_int(main->Config(), "Video", "CropHeight");
+	if (cropWidth <= 0)
+		cropWidth = outCx;
+	if (cropHeight <= 0)
+		cropHeight = outCy;
+
+	ui->cropOutputEnabled->setChecked(cropEnabled);
+	ui->cropX->setValue((int)config_get_int(main->Config(), "Video", "CropX"));
+	ui->cropY->setValue((int)config_get_int(main->Config(), "Video", "CropY"));
+	ui->cropWidth->setValue(cropWidth);
+	ui->cropHeight->setValue(cropHeight);
+	ui->cropAreaWidget->setEnabled(cropEnabled);
 
 	loading = false;
 }
@@ -3262,6 +3285,12 @@ void OBSBasicSettings::SaveVideoSettings()
 	SaveSpinBox(ui->fpsNumerator, "Video", "FPSNum");
 	SaveSpinBox(ui->fpsDenominator, "Video", "FPSDen");
 	SaveComboData(ui->downscaleFilter, "Video", "ScaleType");
+
+	config_set_bool(main->Config(), "Video", "CropOutputEnabled", ui->cropOutputEnabled->isChecked());
+	config_set_int(main->Config(), "Video", "CropX", ui->cropX->value());
+	config_set_int(main->Config(), "Video", "CropY", ui->cropY->value());
+	config_set_int(main->Config(), "Video", "CropWidth", ui->cropWidth->value());
+	config_set_int(main->Config(), "Video", "CropHeight", ui->cropHeight->value());
 }
 
 void OBSBasicSettings::SaveAdvancedSettings()

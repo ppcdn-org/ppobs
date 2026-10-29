@@ -102,6 +102,56 @@ inline std::string WithPublishCodec(const std::string &url, const std::string &c
 	return url.substr(0, pathEnd) + "/" + codec + url.substr(pathEnd);
 }
 
+// AppendPublishPathSuffix returns url with suffix appended to the end of its
+// publish pathname (the stream name), before any codec segment and before a
+// SRT URL's trailing query/parameter fields. Used to derive a companion
+// publish's stream name from the main one (e.g. "<name>-h5").
+inline std::string AppendPublishPathSuffix(const std::string &url, const std::string &suffix)
+{
+	if (suffix.empty())
+		return url;
+
+	size_t pathStart, pathEnd;
+	const size_t sid = url.find("streamid=");
+	if (sid != std::string::npos) {
+		pathStart = sid + strlen("streamid=");
+		pathEnd = url.find('&', pathStart);
+		if (pathEnd == std::string::npos)
+			pathEnd = url.size();
+
+		size_t scan = pathStart;
+		const size_t action = url.find(':', pathStart);
+		if (action != std::string::npos && action < pathEnd)
+			scan = action + 1;
+
+		const size_t field = url.find_first_of(",:", scan);
+		if (field != std::string::npos && field < pathEnd)
+			pathEnd = field;
+	} else {
+		pathStart = url.find("://");
+		pathStart = (pathStart == std::string::npos) ? 0 : pathStart + 3;
+		pathStart = url.find('/', pathStart);
+		if (pathStart == std::string::npos)
+			return url;
+
+		pathEnd = url.find_first_of("?#", pathStart);
+		if (pathEnd == std::string::npos)
+			pathEnd = url.size();
+	}
+
+	// Keep an existing /h264 or /hevc codec segment at the end of the
+	// pathname rather than folding the suffix into it.
+	const std::string codec = PublishCodecFromURL(url);
+	if (!codec.empty()) {
+		const std::string segment = "/" + codec;
+		const size_t at = url.rfind(segment);
+		if (at != std::string::npos && at >= pathStart && at < pathEnd && at + segment.size() == pathEnd)
+			pathEnd = at;
+	}
+
+	return url.substr(0, pathEnd) + suffix + url.substr(pathEnd);
+}
+
 // StreamTransportIsSingleCodec reports whether a service's transport can
 // only carry one video codec per connection. MPEG-TS (SRT/RIST/UDP) muxes
 // every video encoder into one program and rejects a mix (see
