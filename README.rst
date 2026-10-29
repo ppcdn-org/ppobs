@@ -13,12 +13,34 @@ OBS Studio <https://obsproject.com>
    :alt: OBS Studio Discord Server
    :target: https://obsproject.com/discord
 
-PPCDN 官方链接
---------------
+PPCDN 项目
+----------
 
-- 官方在线 demo: https://www.pp-cdn.org/
+**PPCDN** 是一个开源社区项目：https://www.pp-cdn.org
 
-- 官方 TG 运营群: https://t.me/+oEpcmaGXdihjMzY1
+PPCDN 为您带来 30%~50% 的带宽 & 成本节约，端到端极致低时延（<500ms）体验：
+
+1. 支持多推流协议（ERTMP/SRT/WHIP）适应不同直播现场网络，并带来极致低时延体验（含播放缓冲时延）：
+   P2P 直连时延：<120ms；WHIP 推流时延：<200ms；ERTMP 推流时延：<200ms；SRT 推流时延：<500ms。
+2. 兼容多种技术带来 30%~50% 的流量 & 成本下降：支持 HEVC 同播、内嵌 P2P 穿透服务、0 网络转码技术。
+3. 支持 ABR 自适应用户端网络，播放更流畅。
+4. 提供 API 获取当前播放帧时间戳，可用于游戏结果与音视频流的同步。
+
+PPCDN 跟腾讯云直播相比的优势：时延缩短 1s；0 转码费用；可读取实时时间戳；不同 quality 流切换无黑屏停顿。
+
+- 官方在线 demo：https://pplayer.pp-cdn.org/
+- ppobs 下载：https://github.com/ppcdn-org/ppobs/releases/tag/v32.1.2rc008
+
+本仓库是 PPCDN 的 OBS Studio 分支（ppobs），在保留 OBS 采集/合成/编码能力的基础上，增加了：
+
+- WHIP、ERTMP、SRT 推流；WHIP 支持 H264 + HEVC 两条独立会话的多轨同播，SRT 支持单连接多层同播；
+- 可选 H5 裁剪流：从主流画面裁剪一个区域，以独立 H264 流推到 ``<streamName>-h5``，适合 H5/小窗播放；
+- P2P 推流与 NAT 探测，SRT/ERTMP 可通过伴生输出加入 P2P；
+- ppcenter 应用凭证、推流节点选择、NTP 时钟校准、绝对时间戳 SEI；
+- 推流降级/丢包控制通道、断线重连、崩溃与异常重连上报；
+- Clarity、Temporal Denoise、Beauty、ROI 等画质增强能力。
+
+请先下载 release 中的 ppobs 并完成推流，再打开 demo 观看。
 
 What is OBS Studio?
 -------------------
