@@ -63,6 +63,17 @@ elseif(_obs_version MATCHES "[0-9]+\\.[0-9]+\\.[0-9]+-beta[0-9]+")
   string(REGEX REPLACE ".*[0-9]+\\.[0-9]+\\.[0-9]+-beta([0-9]+).*$" "\\1" _obs_beta ${_obs_version})
 endif()
 
+# A zero-padded RC/beta number (rc008) would be emitted as the C integer
+# literal 008, which is invalid octal (and defines like OBS_RELEASE_CANDIDATE
+# are compared numerically). Strip the padding before generating
+# obsconfig.h.
+if(_obs_release_candidate)
+  string(REGEX REPLACE "^0+([0-9])" "\\1" _obs_release_candidate "${_obs_release_candidate}")
+endif()
+if(_obs_beta)
+  string(REGEX REPLACE "^0+([0-9])" "\\1" _obs_beta "${_obs_beta}")
+endif()
+
 list(GET _obs_version_canonical 0 OBS_VERSION_MAJOR)
 list(GET _obs_version_canonical 1 OBS_VERSION_MINOR)
 list(GET _obs_version_canonical 2 OBS_VERSION_PATCH)
