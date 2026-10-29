@@ -531,8 +531,9 @@ void OBSBasicSettings::SaveStream1Settings()
 		}
 	} else {
 		obs_data_set_string(settings, "server", QT_TO_UTF8(customEndpoint));
-		obs_data_set_bool(settings, "use_auth", ui->useAuth->isChecked());
-		if (ui->useAuth->isChecked()) {
+		bool use_auth = IsCustomService() && ui->useAuth->isChecked();
+		obs_data_set_bool(settings, "use_auth", use_auth);
+		if (use_auth) {
 			obs_data_set_string(settings, "username", QT_TO_UTF8(ui->authUsername->text()));
 			obs_data_set_string(settings, "password", QT_TO_UTF8(ui->authPw->text()));
 		}
@@ -1239,6 +1240,9 @@ void OBSBasicSettings::ServiceChanged(bool resetFields)
 	std::string service = QT_TO_UTF8(ui->service->currentText());
 	bool custom = IsRTMPCustomFamily();
 	bool whip = IsWHIP();
+	// Only the generic Custom service exposes the "use authentication"
+	// checkbox; SRT/ERTMP/ERTSP (and WHIP) never use it.
+	bool show_auth = IsCustomService();
 
 	ui->disconnectAccount->setVisible(false);
 	ui->bandwidthTestEnable->setVisible(false);
@@ -1253,11 +1257,11 @@ void OBSBasicSettings::ServiceChanged(bool resetFields)
 		UpdateMultitrackVideo();
 	}
 
-	ui->useAuth->setVisible(custom);
-	ui->authUsernameLabel->setVisible(custom);
-	ui->authUsername->setVisible(custom);
-	ui->authPwLabel->setVisible(custom);
-	ui->authPwWidget->setVisible(custom);
+	ui->useAuth->setVisible(show_auth);
+	ui->authUsernameLabel->setVisible(show_auth);
+	ui->authUsername->setVisible(show_auth);
+	ui->authPwLabel->setVisible(show_auth);
+	ui->authPwWidget->setVisible(show_auth);
 
 	if (custom || whip) {
 		ui->destinationLayout->insertRow(1, ui->serverLabel, ui->serverStackedWidget);
@@ -1550,7 +1554,7 @@ void OBSBasicSettings::on_useStreamKey_clicked()
 
 void OBSBasicSettings::on_useAuth_toggled()
 {
-	if (!IsRTMPCustomFamily())
+	if (!IsCustomService())
 		return;
 
 	bool use_auth = ui->useAuth->isChecked();
