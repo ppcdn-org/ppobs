@@ -6,6 +6,7 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
+#include <zlib.h>
 
 #include <algorithm>
 #include <cctype>
@@ -29,6 +30,7 @@ namespace {
 constexpr size_t kMaxSummaryBytes = 512;
 constexpr size_t kMaxStackBytes = 8000;
 constexpr size_t kMaxDetailBytes = 512;
+constexpr size_t kMaxDumpGzBytes = 1024 * 1024;
 constexpr size_t kMaxIdentBytes = 128;
 constexpr size_t kMaxStackFrames = 30;
 constexpr size_t kMaxResponseSize = 8 * 1024;
@@ -280,6 +282,44 @@ std::string TruncateUtf8(const std::string &s, size_t max_bytes)
 	while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80)
 		cut--;
 	return s.substr(0, cut);
+}
+
+std::string GzipToBase64(const std::string &text)
+{
+	if (text.empty())
+		return "";
+
+	z_stream zs{};
+	if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+		return "";
+
+	std::string compressed;
+	compressed.resize(deflateBound(&zs, static_cast<uLong>(text.size())));
+	zs.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(text.data()));
+	zs.avail_in = static_cast<uInt>(text.size());
+	zs.next_out = reinterpret_cast<Bytef *>(compressed.data());
+	zs.avail_out = static_cast<uInt>(compressed.size());
+
+	const int ret = deflate(&zs, Z_FINISH);
+	if (ret != Z_STREAM_END) {
+		deflateEnd(&zs);
+		return "";
+	}
+	compressed.resize(compressed.size() - zs.avail_out);
+	deflateEnd(&zs);
+
+	if (compressed.empty() || compressed.size() > kMaxDumpGzBytes)
+		return "";
+
+	std::string encoded;
+	encoded.resize(4 * ((compressed.size() + 2) / 3) + 1);
+	const int n = EVP_EncodeBlock(reinterpret_cast<unsigned char *>(encoded.data()),
+				      reinterpret_cast<const unsigned char *>(compressed.data()),
+				      static_cast<int>(compressed.size()));
+	if (n <= 0)
+		return "";
+	encoded.resize(static_cast<size_t>(n));
+	return encoded;
 }
 
 std::string FormatRfc3339Utc(int64_t unix_utc)
@@ -622,6 +662,8 @@ std::string BuildCrashReportJson(const CrashReportFields &f)
 		body["exceptionCode"] = f.parsed.exc_code;
 		body["summary"] = TruncateUtf8(f.parsed.summary, kMaxSummaryBytes);
 		body["stack"] = TruncateUtf8(f.parsed.stack, kMaxStackBytes);
+		if (!f.dump_gz_base64.empty())
+			body["dumpGzBase64"] = f.dump_gz_base64;
 		if (!f.last_app_id.empty())
 			body["lastAppId"] = TruncateUtf8(f.last_app_id, kMaxIdentBytes);
 		if (!f.last_stream.empty())
@@ -783,6 +825,10 @@ size_t ProcessCrashLogs(const CrashScanOptions &options, const CrashScanContext 
 		fields.client_version = context.client_version;
 		fields.os = context.fallback_os.empty() ? kFallbackOs : context.fallback_os;
 		fields.parsed = ParseCrashLogText(text);
+		// Archive the complete crash log, not just the summary/stack fields.
+		// The server stores it and puts the download URL in the incident's
+		// detail field. Best-effort: an unsupported host still reports.
+		fields.dump_gz_base64 = GzipToBase64(text);
 		if (last_active && last_started_at != 0 && c.crashed_at >= last_started_at) {
 			fields.last_app_id = last_app_id;
 			fields.last_stream = last_stream;

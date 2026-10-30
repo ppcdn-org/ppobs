@@ -136,6 +136,9 @@ struct CrashReportFields {
 	std::string last_app_id;
 	std::string last_stream;
 	std::string last_protocol;
+	// Base64(gzip(full crash log)); uploaded so ppcenter can archive the
+	// complete file and return a download URL. Empty when compression failed.
+	std::string dump_gz_base64;
 };
 
 // Pure: request body for /v1/ppobs/crashes. Never throws; "" on failure.
@@ -143,6 +146,10 @@ std::string BuildCrashReportJson(const CrashReportFields &fields);
 
 // Truncates to at most max_bytes without splitting a UTF-8 sequence.
 std::string TruncateUtf8(const std::string &s, size_t max_bytes);
+
+// gzip(text) followed by standard base64. Empty on compression failure or
+// when the compressed payload exceeds the server's artifact limit.
+std::string GzipToBase64(const std::string &text);
 
 enum class PostOutcome {
 	Ok,       // HTTP 200 (including duplicate=true): never send again

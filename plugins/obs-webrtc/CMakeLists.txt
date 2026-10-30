@@ -11,6 +11,7 @@ find_package(CURL REQUIRED)
 find_package(Websocketpp 0.8 REQUIRED)
 find_package(Asio 1.12.1 REQUIRED)
 find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
+find_package(ZLIB REQUIRED)
 
 add_library(obs-webrtc MODULE)
 add_library(OBS::webrtc ALIAS obs-webrtc)
@@ -38,6 +39,7 @@ target_link_libraries(
           Asio::Asio
           OpenSSL::SSL
           OpenSSL::Crypto
+          ZLIB::ZLIB
            $<$<PLATFORM_ID:Windows>:iphlpapi>
 )
 
@@ -73,8 +75,8 @@ target_include_directories(obs-webrtc-ppcenter-time-sync-test PRIVATE ${CMAKE_CU
 
 add_executable(obs-webrtc-incident-report-test EXCLUDE_FROM_ALL tests/incident-report-test.cpp incident-report.cpp incident-report.h encoder-report.cpp encoder-report.h)
 target_include_directories(obs-webrtc-incident-report-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(obs-webrtc-incident-report-test PRIVATE OBS::libobs CURL::libcurl OpenSSL::Crypto)
+target_link_libraries(obs-webrtc-incident-report-test PRIVATE OBS::libobs CURL::libcurl OpenSSL::Crypto ZLIB::ZLIB)
 
 add_executable(obs-webrtc-incident-report-cli EXCLUDE_FROM_ALL tests/incident-report-cli.cpp incident-report.cpp incident-report.h encoder-report.cpp encoder-report.h)
 target_include_directories(obs-webrtc-incident-report-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(obs-webrtc-incident-report-cli PRIVATE OBS::libobs CURL::libcurl OpenSSL::Crypto)
+target_link_libraries(obs-webrtc-incident-report-cli PRIVATE OBS::libobs CURL::libcurl OpenSSL::Crypto ZLIB::ZLIB)

@@ -154,6 +154,20 @@ int main()
 	Require(fp1 != CrashFingerprint("dev-2", "Crash 2026-10-22 08-30-00.txt", t), "fingerprint depends on device");
 	Require(FormatRfc3339Utc(0) == "1970-01-01T00:00:00Z", "rfc3339");
 
+	// Full crash-log archive: gzip + base64, carried in the crash report.
+	const std::string dump_b64 = GzipToBase64(kSampleCrash);
+	Require(dump_b64.rfind("H4sI", 0) == 0, "crash log gzip base64");
+	CrashReportFields archive;
+	archive.app_id = "app";
+	archive.app_secret = "secret";
+	archive.device_id = "dev-1";
+	archive.fingerprint = fp1;
+	archive.crashed_at_unix = t;
+	archive.parsed = parsed;
+	archive.dump_gz_base64 = dump_b64;
+	auto archive_json = nlohmann::json::parse(BuildCrashReportJson(archive));
+	Require(archive_json.value("dumpGzBase64", "") == dump_b64, "dump included in crash report");
+
 	// Scan + report-once state machine on a temp dir.
 	namespace fs = std::filesystem;
 	const fs::path dir = fs::temp_directory_path() / "ppobs-incident-test-crashes";
@@ -193,6 +207,8 @@ int main()
 	Require(first.value("fingerprint", "").size() == 32, "fingerprint in body");
 	Require(first.value("deviceId", "") == "dev-1" && first.value("appId", "") == "app", "ids in body");
 	Require(first.value("crashedAt", "").size() == 20, "crashedAt RFC3339");
+	Require(first.contains("dumpGzBase64") && first["dumpGzBase64"].get<std::string>().rfind("H4sI", 0) == 0,
+		"full crash log dump in body");
 
 	// Second start: reported crashes are never re-sent.
 	bodies.clear();
