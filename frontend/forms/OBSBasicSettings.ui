@@ -6932,6 +6932,32 @@
               </layout>
              </widget>
             </item>
+            <item row="6" column="0">
+             <widget class="QLabel" name="cropFpsLabel">
+              <property name="text">
+               <string>Basic.Settings.Video.CropOutput.FPS</string>
+              </property>
+              <property name="buddy">
+               <cstring>cropFps</cstring>
+              </property>
+             </widget>
+            </item>
+            <item row="6" column="1">
+             <widget class="QSpinBox" name="cropFps">
+              <property name="minimum">
+               <number>1</number>
+              </property>
+              <property name="maximum">
+               <number>120</number>
+              </property>
+              <property name="value">
+               <number>15</number>
+              </property>
+              <property name="suffix">
+               <string> fps</string>
+              </property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

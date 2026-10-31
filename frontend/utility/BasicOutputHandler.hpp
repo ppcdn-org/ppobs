@@ -80,8 +80,9 @@ struct BasicOutputHandler {
 	// H264-only single-stream publish of a cropped region of the program.
 	// It goes to the main stream name with "-h5" appended and reuses the
 	// main publish's audio encoder; encoding parameters follow the main
-	// stream except for the bitrate, which is scaled by the crop/main pixel
-	// area ratio. Never carries HEVC or a Simulcast ladder.
+	// stream except for the frame rate and the bitrate, which is scaled by
+	// both the crop/main pixel area ratio and the crop/main frame-rate ratio.
+	// Never carries HEVC or a Simulcast ladder.
 	OBSOutputAutoRelease cropOutput;
 	OBSServiceAutoRelease cropService;
 	OBSEncoderAutoRelease cropVideoEncoder;

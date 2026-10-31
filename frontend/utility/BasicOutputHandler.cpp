@@ -614,16 +614,19 @@ uint64_t BasicOutputHandler::TotalStreamingBytes() const
 }
 
 // Bitrate for the crop publish: the main stream's bitrate scaled by the crop
-// region's share of the main output's pixel area (Settings > Video > General
-// documents it as crop area / main output area * main bitrate).
+// region's share of the main output's pixel area and by the crop stream's
+// frame rate relative to the main output's frame rate.
 static int64_t CropOutputProportionalBitrate(int64_t mainBitrate, uint32_t mainWidth, uint32_t mainHeight,
-					     uint32_t cropWidth, uint32_t cropHeight)
+					     uint32_t cropWidth, uint32_t cropHeight, uint32_t cropFps,
+					     double mainFps)
 {
 	if (mainWidth == 0 || mainHeight == 0)
 		return mainBitrate > 0 ? mainBitrate : 1;
 
-	int64_t bitrate =
-		mainBitrate * (int64_t)cropWidth * cropHeight / ((int64_t)mainWidth * mainHeight);
+	const double areaRatio =
+		(double)cropWidth * (double)cropHeight / ((double)mainWidth * (double)mainHeight);
+	const double fpsRatio = mainFps > 0.0 ? (double)cropFps / mainFps : 1.0;
+	const int64_t bitrate = (int64_t)std::llround((double)mainBitrate * areaRatio * fpsRatio);
 	return bitrate > 0 ? bitrate : 1;
 }
 
@@ -649,10 +652,16 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 	if (outWidth == 0 || outHeight == 0)
 		return;
 
+	const double mainFps = ovi.fps_den ? (double)ovi.fps_num / (double)ovi.fps_den : 0.0;
+
 	int x = (int)config_get_int(main->Config(), "Video", "CropX");
 	int y = (int)config_get_int(main->Config(), "Video", "CropY");
 	int width = (int)config_get_int(main->Config(), "Video", "CropWidth");
 	int height = (int)config_get_int(main->Config(), "Video", "CropHeight");
+	int cropFps = (int)config_get_int(main->Config(), "Video", "CropFPS");
+	if (cropFps <= 0)
+		cropFps = 15;
+	cropFps = std::min(std::max(cropFps, 1), 120);
 
 	// Crop coordinates are in the main *output* (scaled) resolution, the
 	// same space the bitrate ratio is computed in.
@@ -703,6 +712,8 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 	cropOvi.base_height = baseHeight;
 	cropOvi.output_width = (uint32_t)width;
 	cropOvi.output_height = (uint32_t)height;
+	cropOvi.fps_num = (uint32_t)cropFps;
+	cropOvi.fps_den = 1;
 	if (cropOvi.scale_type == OBS_SCALE_DISABLE)
 		cropOvi.scale_type = OBS_SCALE_BICUBIC;
 
@@ -792,8 +803,8 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 		obs_data_set_string(cropSettings, "profile", "high");
 
 	const int64_t mainBitrate = obs_data_get_int(cropSettings, "bitrate");
-	const int64_t cropBitrate =
-		CropOutputProportionalBitrate(mainBitrate, outWidth, outHeight, (uint32_t)width, (uint32_t)height);
+	const int64_t cropBitrate = CropOutputProportionalBitrate(
+		mainBitrate, outWidth, outHeight, (uint32_t)width, (uint32_t)height, (uint32_t)cropFps, mainFps);
 	obs_data_set_int(cropSettings, "bitrate", cropBitrate);
 
 	const int64_t mainMaxBitrate = obs_data_get_int(cropSettings, "max_bitrate");
@@ -851,8 +862,8 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 		return;
 	}
 
-	blog(LOG_INFO, "[crop] publishing %dx%d at %lld kbps to %s", width, height, (long long)cropBitrate,
-	     cropUrl.c_str());
+	blog(LOG_INFO, "[crop] publishing %dx%d at %d fps, %lld kbps to %s", width, height, cropFps,
+	     (long long)cropBitrate, cropUrl.c_str());
 }
 
 void BasicOutputHandler::StopCropOutput(bool force)

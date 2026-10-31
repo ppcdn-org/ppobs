@@ -556,7 +556,11 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->cropY,                SCROLL_CHANGED, VIDEO_CHANGED);
 	HookWidget(ui->cropWidth,            SCROLL_CHANGED, VIDEO_CHANGED);
 	HookWidget(ui->cropHeight,           SCROLL_CHANGED, VIDEO_CHANGED);
-	connect(ui->cropOutputEnabled, &QCheckBox::toggled, ui->cropAreaWidget, &QWidget::setEnabled);
+	HookWidget(ui->cropFps,              SCROLL_CHANGED, VIDEO_CHANGED);
+	connect(ui->cropOutputEnabled, &QCheckBox::toggled, this, [this](bool enabled) {
+		ui->cropAreaWidget->setEnabled(enabled);
+		ui->cropFps->setEnabled(enabled);
+	});
 	HookWidget(ui->colorsGroupBox,       GROUP_CHANGED,  A11Y_CHANGED);
 	HookWidget(ui->colorPreset,          COMBO_CHANGED,  A11Y_CHANGED);
 	HookWidget(ui->renderer,             COMBO_CHANGED,  ADV_RESTART);
@@ -1761,13 +1765,18 @@ void OBSBasicSettings::LoadVideoSettings()
 		cropWidth = outCx;
 	if (cropHeight <= 0)
 		cropHeight = outCy;
+	int cropFps = (int)config_get_int(main->Config(), "Video", "CropFPS");
+	if (cropFps <= 0)
+		cropFps = 15;
 
 	ui->cropOutputEnabled->setChecked(cropEnabled);
 	ui->cropX->setValue((int)config_get_int(main->Config(), "Video", "CropX"));
 	ui->cropY->setValue((int)config_get_int(main->Config(), "Video", "CropY"));
 	ui->cropWidth->setValue(cropWidth);
 	ui->cropHeight->setValue(cropHeight);
+	ui->cropFps->setValue(cropFps);
 	ui->cropAreaWidget->setEnabled(cropEnabled);
+	ui->cropFps->setEnabled(cropEnabled);
 
 	loading = false;
 }
@@ -3291,6 +3300,7 @@ void OBSBasicSettings::SaveVideoSettings()
 	config_set_int(main->Config(), "Video", "CropY", ui->cropY->value());
 	config_set_int(main->Config(), "Video", "CropWidth", ui->cropWidth->value());
 	config_set_int(main->Config(), "Video", "CropHeight", ui->cropHeight->value());
+	config_set_int(main->Config(), "Video", "CropFPS", ui->cropFps->value());
 }
 
 void OBSBasicSettings::SaveAdvancedSettings()
