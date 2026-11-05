@@ -51,11 +51,11 @@
 
 ### 推流限制
 
-WHIP 推流增加硬性限制，适用于所有启动方式和重连路径：
+所有推流（SRT / WHIP / ERTMP）增加统一的硬性限制，适用于所有启动方式和重连路径：
 
 - 横屏最大分辨率：`3840x2160`
 - 竖屏最大分辨率：`2160x3840`
-- 最大 FPS：`60`
+- 最大 FPS：`1080P 及以下 60`，`2K / 4K 30`
 - 最大视频码率：`10000 Kbps`
 - H264、HEVC 及所有 Simulcast 层分别校验
 - 超限时停止输出并记录明确错误
@@ -159,10 +159,10 @@ Custom services no longer display inapplicable independent "Multitrack Video Set
 Retains the unified "Simultaneous Playback Configuration" entry for custom services and WHIP.
 
 # Push Streaming Limitations
-WHIP push streaming has added hard limits, applicable to all startup methods and reconnection paths:
+All push transports (SRT / WHIP / ERTMP) now share the same hard limits, applicable to all startup methods and reconnection paths:
 Maximum landscape resolution: 3840x2160
 Maximum portrait resolution: 2160x3840
-Maximum FPS: 60
+Maximum FPS: 60 at 1080p and below; 30 at 2K / 4K
 Maximum video bitrate: 10000 Kbps
 H264, HEVC, and all Simulcast layers are validated separately.
 Output stops and a clear error is logged when limits are exceeded.

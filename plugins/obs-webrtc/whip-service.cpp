@@ -58,8 +58,9 @@ obs_properties_t *WHIPService::Properties()
 
 void WHIPService::Defaults(obs_data_t *defaults)
 {
-	// Full-reference quality score of the outgoing stream (program feed
-	// = 100), set from Settings > Stream > Advanced Options; default on.
+	// Legacy compatibility key. The frontend now runs full-reference quality
+	// scoring unconditionally for every transport, so this must never disable
+	// the WHIP path in older builds/plugins that still inspect it.
 	obs_data_set_default_bool(defaults, "quality_score", true);
 }
 

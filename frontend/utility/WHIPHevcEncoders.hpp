@@ -14,13 +14,15 @@
 // Builds an independent HEVC encoder ladder (main layer + up to 2 scaled-
 // down layers, i.e. at most 3 layers total - the design's confirmed HEVC
 // Simulcast cap) that mirrors WHIPSimulcastEncoders' H264 ladder: same
-// resolution step-down and proportional-bitrate formulas, just capped
-// lower and always starting from its own dedicated HEVC encoder rather
-// than reusing the main Stream encoder. The HEVC ladder's layer count
-// follows Stream1.WHIPSimulcastTotalLayers the same as H264 does, clamped
-// to WHIPHevcEncoders::kMaxLayers - so unchecking "Follow Main" per layer,
-// resolution steps, and bitrate proportionality all behave identically to
-// the H264 side; only the encoder identity and codec differ.
+// resolution step-down, and each HEVC level defaults to 50% of the H264
+// bitrate at that level (or its own manually edited value when "HEVC auto"
+// is unchecked in Settings > Stream). It is capped lower and always starts
+// from its own dedicated HEVC encoder rather than reusing the main Stream
+// encoder. The HEVC ladder's layer count follows
+// Stream1.WHIPSimulcastTotalLayers the same as H264 does, clamped to
+// WHIPHevcEncoders::kMaxLayers - so unchecking "Follow Main" per layer and
+// resolution steps still behave identically to the H264 side; only the
+// encoder identity, codec, and default bitrate ratio differ.
 
 // Picks a HEVC encoder id to pair with the given H264 encoder id: prefers
 // the same hardware vendor's HEVC encoder when the user's H264 pick is
@@ -104,11 +106,70 @@ static inline std::string ResolveWHIPH264EncoderId(const std::string &encoderId)
 	return "obs_x264";
 }
 
+// PPCDN's HEVC pricing rule: at the same resolution HEVC runs at 50% of
+// the H264 bitrate. Auto bitrates are derived here; a non-zero explicit
+// value saved by Settings > Stream overrides that for the level.
+static inline int WHIPHevcAutoBitrate(int h264Bitrate)
+{
+	return h264Bitrate > 0 ? std::max(1, h264Bitrate / 2) : 0;
+}
+
+// Returns true and fills bitrate when the user has explicitly disabled the
+// auto 50% rule for this level. A missing auto flag means auto (same
+// defaulting convention as WHIPSimulcastLayer::followMain).
+static inline bool WHIPHevcBitrateOverride(config_t *config, const char *autoKey, const char *valueKey,
+					   int &bitrate)
+{
+	if (!config)
+		return false;
+
+	const bool automatic = !config_has_user_value(config, "Stream1", autoKey) ||
+			       config_get_bool(config, "Stream1", autoKey);
+	if (automatic)
+		return false;
+
+	const int value = static_cast<int>(config_get_int(config, "Stream1", valueKey));
+	if (value <= 0)
+		return false;
+
+	bitrate = value;
+	return true;
+}
+
 struct WHIPHevcEncoders {
 public:
 	// HEVC Simulcast is capped at 3 layers total (design doc §11: "严格
-	// 小于 4") - stricter than H264's cap in WHIPSimulcastEncoders.
+	// 小�? 4") - stricter than H264's cap in WHIPSimulcastEncoders.
 	static constexpr int kMaxLayers = 3;
+
+	static constexpr const char *kMainBitrateAutoKey = "WHIPHevcBitrateAuto";
+	static constexpr const char *kMainBitrateKey = "WHIPHevcBitrateKbps";
+
+	static inline std::string LayerBitrateAutoKey(int slot)
+	{
+		return "WHIPSimulcastLayer" + std::to_string(slot) + "HevcBitrateAuto";
+	}
+
+	static inline std::string LayerBitrateKey(int slot)
+	{
+		return "WHIPSimulcastLayer" + std::to_string(slot) + "HevcBitrateKbps";
+	}
+
+	static int MainBitrate(int h264Bitrate, config_t *config)
+	{
+		int bitrate = WHIPHevcAutoBitrate(h264Bitrate);
+		WHIPHevcBitrateOverride(config, kMainBitrateAutoKey, kMainBitrateKey, bitrate);
+		return bitrate;
+	}
+
+	static int LayerBitrate(int h264LayerBitrate, int slot, config_t *config)
+	{
+		int bitrate = WHIPHevcAutoBitrate(h264LayerBitrate);
+		const std::string autoKey = LayerBitrateAutoKey(slot);
+		const std::string valueKey = LayerBitrateKey(slot);
+		WHIPHevcBitrateOverride(config, autoKey.c_str(), valueKey.c_str(), bitrate);
+		return bitrate;
+	}
 
 	// hevcEncoderId must be non-empty and already validated as an
 	// available HEVC encoder (see ResolveWHIPHevcEncoderId) - this
@@ -121,9 +182,9 @@ public:
 	// collectVideoLayers() (whip-output.cpp) would count one layer more
 	// than the user configured and the server would reject the offer.
 	// Mirrors how WHIPSimulcastEncoders reuses the main encoder for H264.
-	void Create(const std::string &hevcEncoderId, obs_data_t *videoSettings, int rescaleFilter,
-		    int requestedTotalLayers, uint32_t outputWidth, uint32_t outputHeight, config_t *config = nullptr,
-		    obs_encoder_t *existingMain = nullptr)
+	void Create(const std::string &hevcEncoderId, obs_data_t *videoSettings, int h264MainBitrate,
+		    int rescaleFilter, int requestedTotalLayers, uint32_t outputWidth, uint32_t outputHeight,
+		    config_t *config = nullptr, obs_encoder_t *existingMain = nullptr)
 	{
 		if (rescaleFilter == OBS_SCALE_DISABLE)
 			rescaleFilter = OBS_SCALE_BICUBIC;
@@ -131,6 +192,16 @@ public:
 		int totalLayers = std::min(requestedTotalLayers, kMaxLayers);
 		if (totalLayers < 1)
 			totalLayers = 1;
+
+		// The HEVC ladders follow the H264 main's bitrate unless the
+		// caller couldn't provide one (e.g. Simple output creates the
+		// encoders before Update() feeds their settings).
+		const int h264Reference = h264MainBitrate > 0
+						  ? h264MainBitrate
+						  : (videoSettings
+							     ? static_cast<int>(obs_data_get_int(videoSettings, "bitrate"))
+							     : 0);
+		const int hevcMainBitrate = MainBitrate(h264Reference, config);
 
 		if (existingMain) {
 			// OBSEncoder (OBSSafeRef) takes its own reference on
@@ -146,6 +217,8 @@ public:
 		} else {
 			OBSDataAutoRelease mainSettings =
 				videoSettings ? obs_data_create_from_json(obs_data_get_json(videoSettings)) : nullptr;
+			if (mainSettings && hevcMainBitrate > 0)
+				obs_data_set_int(mainSettings, "bitrate", hevcMainBitrate);
 			mainEncoder =
 				obs_video_encoder_create(hevcEncoderId.c_str(), "whip_hevc_main", mainSettings, nullptr);
 			if (!mainEncoder) {
@@ -170,16 +243,15 @@ public:
 
 		auto widthStep = outputWidth / totalLayers;
 		auto heightStep = outputHeight / totalLayers;
-		int videoBitrate = videoSettings ? static_cast<int>(obs_data_get_int(videoSettings, "bitrate")) : 0;
 		std::string encoder_name = "whip_hevc_layer_0";
 
 		// Same rid convention as WHIPSimulcastEncoders::Create(): slot
 		// numbering (1, 2, ...) matches the H264 side's per-layer
 		// config keys ("WHIPSimulcastLayer<slot>...") so a HEVC layer
 		// and its equivalently-numbered H264 layer follow the same
-		// user-configured resolution/bitrate ladder shape - see the
-		// Settings UI, which has one set of per-layer rows shared by
-		// both codecs.
+		// user-configured resolution ladder and, by default, take half
+		// of that H264 layer's bitrate. Settings > Stream's per-layer
+		// row also carries the HEVC auto/manual override fields.
 		for (int i = totalLayers - 1; i > 0; i--) {
 			encoder_name.back() = std::to_string(i).at(0);
 
@@ -202,18 +274,26 @@ public:
 			OBSDataAutoRelease layerSettings;
 			if (videoSettings) {
 				layerSettings = obs_data_create_from_json(obs_data_get_json(videoSettings));
-				if (haveCustom && !custom.followMain) {
-					obs_data_set_int(layerSettings, "bitrate", custom.bitrateKbps);
-				} else {
-					obs_data_set_int(layerSettings, "bitrate",
-							  WHIPSimulcastProportionalBitrate(videoBitrate, outputWidth,
-											    outputHeight, width, height));
-				}
+
+				// The H264 layer at this slot is what the HEVC layer
+				// must be measured against: a custom H264 layer
+				// bitrate when Follow Main is off, otherwise the
+				// proportional share of the H264 main. HEVC then
+				// takes half of that unless explicitly overridden.
+				const int h264LayerBitrate =
+					(haveCustom && !custom.followMain)
+						? custom.bitrateKbps
+						: static_cast<int>(WHIPSimulcastProportionalBitrate(
+							  h264Reference, outputWidth, outputHeight, width, height));
+				const int hevcLayerBitrate = LayerBitrate(h264LayerBitrate, slot, config);
+
+				if (hevcLayerBitrate > 0)
+					obs_data_set_int(layerSettings, "bitrate", hevcLayerBitrate);
 
 				const int64_t layerBitrate = obs_data_get_int(layerSettings, "bitrate");
 				const int64_t mainMaxBitrate = obs_data_get_int(layerSettings, "max_bitrate");
-				if (mainMaxBitrate > 0 && videoBitrate > 0) {
-					int64_t layerMax = mainMaxBitrate * layerBitrate / videoBitrate;
+				if (mainMaxBitrate > 0 && h264Reference > 0) {
+					int64_t layerMax = mainMaxBitrate * layerBitrate / h264Reference;
 					if (layerMax < layerBitrate)
 						layerMax = layerBitrate;
 					obs_data_set_int(layerSettings, "max_bitrate", layerMax);
@@ -235,11 +315,23 @@ public:
 		}
 	}
 
-	void Update(obs_data_t *videoSettings, int videoBitrate, config_t *config = nullptr)
+	void Update(obs_data_t *videoSettings, int h264MainBitrate, config_t *config = nullptr)
 	{
 		if (!mainEncoder)
 			return;
-		obs_encoder_update(mainEncoder, videoSettings);
+
+		const int h264Reference = h264MainBitrate > 0
+						  ? h264MainBitrate
+						  : (videoSettings
+							     ? static_cast<int>(obs_data_get_int(videoSettings, "bitrate"))
+							     : 0);
+		const int hevcMainBitrate = MainBitrate(h264Reference, config);
+
+		OBSDataAutoRelease mainSettings =
+			videoSettings ? obs_data_create_from_json(obs_data_get_json(videoSettings)) : nullptr;
+		if (mainSettings && hevcMainBitrate > 0)
+			obs_data_set_int(mainSettings, "bitrate", hevcMainBitrate);
+		obs_encoder_update(mainEncoder, mainSettings);
 		ForceEncoderNoBFrames(mainEncoder);
 
 		uint32_t outputWidth = video_output_get_width(obs_get_video());
@@ -250,15 +342,19 @@ public:
 
 			WHIPSimulcastLayer custom;
 			int slot = static_cast<int>(idx) + 1;
-			if (GetWHIPSimulcastLayerConfig(config, slot, &custom) && !custom.followMain) {
-				obs_data_set_int(layerSettings, "bitrate", custom.bitrateKbps);
-			} else {
-				uint32_t layerWidth = obs_encoder_get_width(hevcLayerEncoders[idx]);
-				uint32_t layerHeight = obs_encoder_get_height(hevcLayerEncoders[idx]);
-				obs_data_set_int(layerSettings, "bitrate",
-						  WHIPSimulcastProportionalBitrate(videoBitrate, outputWidth,
-										    outputHeight, layerWidth, layerHeight));
-			}
+			const bool customBitrate = GetWHIPSimulcastLayerConfig(config, slot, &custom) &&
+						   !custom.followMain;
+			const uint32_t layerWidth = obs_encoder_get_width(hevcLayerEncoders[idx]);
+			const uint32_t layerHeight = obs_encoder_get_height(hevcLayerEncoders[idx]);
+			const int h264LayerBitrate =
+				customBitrate
+					? custom.bitrateKbps
+					: static_cast<int>(WHIPSimulcastProportionalBitrate(
+						  h264Reference, outputWidth, outputHeight, layerWidth, layerHeight));
+			const int hevcLayerBitrate = LayerBitrate(h264LayerBitrate, slot, config);
+
+			if (hevcLayerBitrate > 0)
+				obs_data_set_int(layerSettings, "bitrate", hevcLayerBitrate);
 
 			obs_encoder_update(hevcLayerEncoders[idx], layerSettings);
 			ForceEncoderNoBFrames(hevcLayerEncoders[idx]);

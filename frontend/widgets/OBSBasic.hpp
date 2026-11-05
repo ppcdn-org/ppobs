@@ -1416,36 +1416,24 @@ signals:
 	void StreamingStopping();
 	void StreamingStopped(bool withDelay = false);
 
-	/* -------------------------------------
-	 * MARK: - Temporal denoise enforcement
-	 * -------------------------------------
+	/* ------------------------------------
+	 * MARK: - Global picture enhancement
+	 * ------------------------------------
 	 */
 public:
-	// Enforces the Settings > Stream > Advanced Options "Temporal
-	// Denoise" checkbox ("Stream1"/"TemporalDenoise"): attaches the
-	// temporal_denoise_filter to every camera (dshow_input) source when
-	// enabled, removes the auto-added instance when disabled. Runs on
-	// startup, on stream-settings save, and at stream start.
-	void ApplyTemporalDenoiseSetting();
-
-	// Same enforcement pattern for the "Face Beauty" checkbox
-	// ("Stream1"/"BeautyFilter"): attaches beauty_filter to every
-	// camera (dshow_input) source only - media-file/network playback
-	// sources are excluded and never receive the filter. The filter
-	// itself only acts on frames where it detects a face, so attaching
-	// it blanket-style to cameras is a no-op for faceless content.
-	void ApplyBeautyFilterSetting();
-
-	// Same enforcement pattern for the "Clarity" checkbox
-	// ("Stream1"/"ClarityFilter"): attaches clarity_filter (GPU local
-	// contrast enhancement) to every camera (dshow_input) source.
-	void ApplyClarityFilterSetting();
+	// Enforces Settings > Stream > Advanced Options "Global Picture
+	// Enhancement" ("Stream1"/"GlobalEnhance"). The combined GPU filter
+	// is attached once to every scene, after composition and before every
+	// encoder, so preview/record/H264/HEVC/Simulcast see the same result.
+	void ApplyGlobalEnhanceSetting();
 
 	/* -------------------------------------
 	 * MARK: - OBSBasic_Schedule
 	 * -------------------------------------
 	 */
 private:
+	bool sceneCollectionLoaded = false;
+
 	QPointer<QTimer> scheduleTimer;
 	bool scheduleStreamActive = false;
 

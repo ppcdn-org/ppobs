@@ -68,6 +68,24 @@ static inline bool ResTooLow(uint32_t cx, uint32_t cy)
 	return cx < 32 || cy < 32;
 }
 
+// PPCDN's fixed video-bitrate ladder: the output resolution decides the
+// target bitrate, so users cannot accidentally pair 4K with a 1080p bitrate
+// (or exceed the 10 Mbps publish cap). Returns 0 for resolutions outside the
+// ladder, leaving the user's own value untouched.
+static int PPCDNVideoBitrateForResolution(uint32_t cx, uint32_t cy)
+{
+	const uint32_t shortSide = std::min(cx, cy);
+	if (shortSide >= 2160)
+		return 10000;
+	if (shortSide >= 1440)
+		return 5000;
+	if (shortSide >= 1080)
+		return 3000;
+	if (shortSide >= 720)
+		return 1000;
+	return 0;
+}
+
 /* parses "[width]x[height]", string, i.e. 1024x768 */
 static bool ConvertResText(const char *res, uint32_t &cx, uint32_t &cy)
 {
@@ -412,12 +430,11 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->authUsername,         EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->authPw,               EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->ignoreRecommended,    CHECK_CHANGED,  STREAM1_CHANGED);
-	HookWidget(ui->temporalDenoiseEnable, CHECK_CHANGED, STREAM1_CHANGED);
-	HookWidget(ui->qualityScoreEnable,   CHECK_CHANGED,  STREAM1_CHANGED);
-	HookWidget(ui->beautyFilterEnable,   CHECK_CHANGED,  STREAM1_CHANGED);
-	HookWidget(ui->clarityFilterEnable,  CHECK_CHANGED,  STREAM1_CHANGED);
+	HookWidget(ui->globalEnhanceEnable,  CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->whipSimulcastTotalLayers, SCROLL_CHANGED, STREAM1_CHANGED);
 	HookWidget(ui->whipHevcH264Multitrack, CHECK_CHANGED, STREAM1_CHANGED);
+	HookWidget(ui->whipHevcBitrateAuto,  CHECK_CHANGED,  STREAM1_CHANGED);
+	HookWidget(ui->whipHevcBitrate,      SCROLL_CHANGED, STREAM1_CHANGED);
 	HookWidget(ui->ppcenterUrl,          EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->ppcenterAppId,        EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->ppcenterSecret,       EDIT_CHANGED,   STREAM1_CHANGED);
@@ -715,6 +732,12 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	connect(ui->streamDelaySec, &QSpinBox::valueChanged, this, &OBSBasicSettings::UpdateStreamDelayEstimate);
 	connect(ui->outputMode, &QComboBox::currentIndexChanged, this, &OBSBasicSettings::UpdateStreamDelayEstimate);
 	connect(ui->simpleOutputVBitrate, &QSpinBox::valueChanged, this, &OBSBasicSettings::UpdateStreamDelayEstimate);
+	connect(ui->simpleOutputVBitrate, &QSpinBox::valueChanged, this,
+		[this](int) { RefreshWHIPHevcBitrateDefaults(); });
+	connect(ui->advOutFFVBitrate, &QSpinBox::valueChanged, this,
+		[this](int) { RefreshWHIPHevcBitrateDefaults(); });
+	connect(ui->outputMode, &QComboBox::currentIndexChanged, this,
+		[this](int) { RefreshWHIPHevcBitrateDefaults(); });
 	connect(ui->simpleOutputABitrate, &QComboBox::currentIndexChanged, this,
 		&OBSBasicSettings::UpdateStreamDelayEstimate);
 	connect(ui->advOutTrack1Bitrate, &QComboBox::currentIndexChanged, this,
@@ -1528,6 +1551,11 @@ void OBSBasicSettings::ResetDownscales(uint32_t cx, uint32_t cy, bool ignoreAllS
 	int bestPixelDiff = 0x7FFFFFFF;
 	uint32_t out_cx = outputCX;
 	uint32_t out_cy = outputCY;
+	const bool followBase = !outputResolutionManual;
+	if (followBase) {
+		out_cx = cx;
+		out_cy = cy;
+	}
 
 	advRescale = ui->advOutRescale->lineEdit()->text();
 	advRecRescale = ui->advOutRecRescale->lineEdit()->text();
@@ -1594,6 +1622,7 @@ void OBSBasicSettings::ResetDownscales(uint32_t cx, uint32_t cy, bool ignoreAllS
 		float outputAspect = float(out_cx) / float(out_cy);
 		bool closeAspect = close_float(baseAspect, outputAspect, 0.01f);
 
+		updatingOutputResolution = true;
 		if (closeAspect) {
 			ui->outputResolution->lineEdit()->setText(oldOutputRes);
 			on_outputResolution_editTextChanged(oldOutputRes);
@@ -1601,6 +1630,7 @@ void OBSBasicSettings::ResetDownscales(uint32_t cx, uint32_t cy, bool ignoreAllS
 			ui->outputResolution->lineEdit()->setText(bestScale.c_str());
 			on_outputResolution_editTextChanged(bestScale.c_str());
 		}
+		updatingOutputResolution = false;
 
 		ui->outputResolution->blockSignals(false);
 
@@ -1609,6 +1639,9 @@ void OBSBasicSettings::ResetDownscales(uint32_t cx, uint32_t cy, bool ignoreAllS
 			videoChanged = true;
 		}
 	}
+
+	if (!loading)
+		ApplyLinkedVideoBitrate();
 
 	if (advRescale.isEmpty())
 		advRescale = res.c_str();
@@ -1673,23 +1706,12 @@ void OBSBasicSettings::LoadResolutionLists()
 			ui->baseResolution->addItem(res);
 	};
 
-	for (QScreen *screen : QGuiApplication::screens()) {
-		QSize as = screen->size();
-		uint32_t as_width = as.width();
-		uint32_t as_height = as.height();
-
-		// Calculate physical screen resolution based on the virtual screen resolution
-		// They might differ if scaling is enabled, e.g. for HiDPI screens
-		as_width = round(as_width * screen->devicePixelRatio());
-		as_height = round(as_height * screen->devicePixelRatio());
-
-		addRes(as_width, as_height);
-	}
-
+	addRes(3840, 2160);
+	addRes(2560, 1440);
 	addRes(1920, 1080);
 	addRes(1280, 720);
 
-	string outputResString = ResString(out_cx, out_cy);
+	string outputResString = outputResolutionManual ? ResString(out_cx, out_cy) : ResString(cx, cy);
 
 	ui->baseResolution->lineEdit()->setText(ResString(cx, cy).c_str());
 
@@ -1702,6 +1724,33 @@ void OBSBasicSettings::LoadResolutionLists()
 
 	ui->baseAspect->setText(
 		QTStr("AspectRatio").arg(QString::number(std::get<0>(aspect)), QString::number(std::get<1>(aspect))));
+}
+
+void OBSBasicSettings::ApplyLinkedVideoBitrate(bool force)
+{
+	if ((!force && loading) || updatingOutputResolution)
+		return;
+
+	uint32_t cx, cy;
+	if (!ConvertResText(QT_TO_UTF8(ui->outputResolution->lineEdit()->text()), cx, cy))
+		return;
+
+	const int bitrate = PPCDNVideoBitrateForResolution(cx, cy);
+	if (bitrate <= 0)
+		return;
+
+	if (ui->simpleOutputVBitrate->value() != bitrate)
+		ui->simpleOutputVBitrate->setValue(bitrate);
+	if (ui->advOutFFVBitrate->value() != bitrate)
+		ui->advOutFFVBitrate->setValue(bitrate);
+
+	if (streamEncoderProps) {
+		obs_data_t *settings = streamEncoderProps->GetSettings();
+		if (settings && obs_data_get_int(settings, "bitrate") != bitrate) {
+			obs_data_set_int(settings, "bitrate", bitrate);
+			streamEncoderProps->UpdateSettings();
+		}
+	}
 }
 
 static inline void LoadFPSCommon(OBSBasic *main, Ui::OBSBasicSettings *ui)
@@ -1752,6 +1801,17 @@ void OBSBasicSettings::LoadVideoSettings()
 		ui->videoMsg->setText(QTStr("Basic.Settings.Video.CurrentlyActive"));
 	}
 
+	{
+		const uint32_t baseCx = config_get_uint(main->Config(), "Video", "BaseCX");
+		const uint32_t baseCy = config_get_uint(main->Config(), "Video", "BaseCY");
+		const uint32_t outCx = config_get_uint(main->Config(), "Video", "OutputCX");
+		const uint32_t outCy = config_get_uint(main->Config(), "Video", "OutputCY");
+		// A pre-existing config with a deliberately different output
+		// resolution predates the follow flag - keep treating it as a
+		// manual choice instead of silently snapping it back to the base.
+		outputResolutionManual = config_get_bool(main->Config(), "Video", "OutputResManual") ||
+					 (outCx && outCy && (outCx != baseCx || outCy != baseCy));
+	}
 	LoadResolutionLists();
 	LoadFPSData();
 	LoadDownscaleFilters();
@@ -1777,6 +1837,10 @@ void OBSBasicSettings::LoadVideoSettings()
 	ui->cropFps->setValue(cropFps);
 	ui->cropAreaWidget->setEnabled(cropEnabled);
 	ui->cropFps->setEnabled(cropEnabled);
+
+	// Apply the resolution-to-bitrate mapping without marking the dialog as
+	// changed just from opening it.
+	ApplyLinkedVideoBitrate(true);
 
 	loading = false;
 }
@@ -2026,6 +2090,8 @@ void OBSBasicSettings::LoadAdvOutputStreamingEncoderProperties()
 
 	connect(streamEncoderProps, &OBSPropertiesView::Changed, this, &OBSBasicSettings::UpdateStreamDelayEstimate);
 	connect(streamEncoderProps, &OBSPropertiesView::Changed, this, &OBSBasicSettings::AdvReplayBufferChanged);
+	connect(streamEncoderProps, &OBSPropertiesView::Changed, this,
+		[this]() { RefreshWHIPHevcBitrateDefaults(); });
 
 	curAdvStreamEncoder = type;
 
@@ -2318,6 +2384,11 @@ void OBSBasicSettings::LoadOutputSettings()
 		ui->advOutputAudioTracksTab->setEnabled(false);
 		ui->advNetworkGroupBox->setEnabled(false);
 	}
+
+	// The Stream page loads before the Advanced encoder properties exist;
+	// re-run the linked HEVC defaults now that WHIPMainStreamBitrate() can
+	// see the real H264 bitrate.
+	RefreshWHIPHevcBitrateDefaults();
 
 	loading = false;
 }
@@ -3281,10 +3352,12 @@ void OBSBasicSettings::SaveVideoSettings()
 		config_set_uint(main->Config(), "Video", "BaseCY", cy);
 	}
 
-	if (WidgetChanged(ui->outputResolution) && ConvertResText(QT_TO_UTF8(outputResolution), cx, cy)) {
+	if ((WidgetChanged(ui->outputResolution) || !outputResolutionManual) &&
+	    ConvertResText(QT_TO_UTF8(outputResolution), cx, cy)) {
 		config_set_uint(main->Config(), "Video", "OutputCX", cx);
 		config_set_uint(main->Config(), "Video", "OutputCY", cy);
 	}
+	config_set_bool(main->Config(), "Video", "OutputResManual", outputResolutionManual);
 
 	if (WidgetChanged(ui->fpsType))
 		config_set_uint(main->Config(), "Video", "FPSType", fpsType);
@@ -4127,6 +4200,10 @@ void OBSBasicSettings::on_advOutEncoder_currentIndexChanged()
 			isConfiguredEncoder ? "streamEncoder.json" : nullptr, true);
 		streamEncoderProps->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
 		ui->advOutEncoderLayout->addWidget(streamEncoderProps);
+
+		connect(streamEncoderProps, &OBSPropertiesView::Changed, this,
+			[this]() { RefreshWHIPHevcBitrateDefaults(); });
+		RefreshWHIPHevcBitrateDefaults();
 	}
 
 	ui->advOutUseRescale->setVisible(true);
@@ -4317,6 +4394,17 @@ void OBSBasicSettings::on_outputResolution_editTextChanged(const QString &text)
 	if (!loading) {
 		RecalcOutputResPixels(QT_TO_UTF8(text));
 		LoadDownscaleFilters();
+
+		if (!updatingOutputResolution) {
+			uint32_t outCx, outCy, baseCx, baseCy;
+			if (ConvertResText(QT_TO_UTF8(text), outCx, outCy)) {
+				outputResolutionManual = false;
+				if (ConvertResText(QT_TO_UTF8(ui->baseResolution->lineEdit()->text()), baseCx,
+						   baseCy))
+					outputResolutionManual = outCx != baseCx || outCy != baseCy;
+				ApplyLinkedVideoBitrate();
+			}
+		}
 	}
 }
 

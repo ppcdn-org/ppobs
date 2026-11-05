@@ -72,6 +72,50 @@ static inline int64_t WHIPSimulcastProportionalBitrate(int mainBitrate, uint32_t
 	return bitrate > 0 ? bitrate : 1;
 }
 
+// PPCDN's fixed 4K/2K Simulcast ladders. slot is 1..totalLayers-1, where 1 is
+// the highest scaled-down layer and totalLayers-1 is the lowest. 4K:
+//   2 layers: 4K, 1440p
+//   3 layers: 4K, 1440p, 1080p
+//   4 layers: 4K, 1440p, 1080p, 720p
+// 2K (1440p):
+//   2 layers: 1440p, 1080p
+//   3 layers: 1440p, 1080p, 720p
+//   4 layers: 1440p, 1080p, 720p, 360p
+// Returns false for a base resolution/layer count outside this table, so the
+// caller can keep the older even-step-down fallback.
+struct PPCDNSimulcastLayerSize {
+	uint32_t width;
+	uint32_t height;
+};
+
+static inline bool GetPPCDNSimulcastLayerSize(uint32_t outputWidth, uint32_t outputHeight, int slot,
+					      int totalLayers, uint32_t &width, uint32_t &height)
+{
+	static const PPCDNSimulcastLayerSize fourK[4] = {
+		{3840, 2160}, {2560, 1440}, {1920, 1080}, {1280, 720}};
+	static const PPCDNSimulcastLayerSize twoK[4] = {
+		{2560, 1440}, {1920, 1080}, {1280, 720}, {640, 360}};
+
+	if (slot <= 0 || slot >= totalLayers || totalLayers < 2 || totalLayers > 4)
+		return false;
+
+	const uint32_t shortSide = std::min(outputWidth, outputHeight);
+	const PPCDNSimulcastLayerSize *ladder = nullptr;
+	if (shortSide >= 2160)
+		ladder = fourK;
+	else if (shortSide >= 1440)
+		ladder = twoK;
+	else
+		return false;
+
+	PPCDNSimulcastLayerSize size = ladder[slot];
+	if (outputHeight > outputWidth)
+		std::swap(size.width, size.height);
+	width = size.width;
+	height = size.height;
+	return true;
+}
+
 static inline bool GetWHIPSimulcastLayerConfig(config_t *config, int layerNum, WHIPSimulcastLayer *layer)
 {
 	std::string prefix = "WHIPSimulcastLayer" + std::to_string(layerNum);
@@ -154,7 +198,8 @@ public:
 				usingCustomLayer[i] = true;
 				width = custom.width;
 				height = custom.height;
-			} else {
+			} else if (!GetPPCDNSimulcastLayerSize(outputWidth, outputHeight, slot,
+							       whipSimulcastTotalLayers, width, height)) {
 				width = widthStep * i;
 				width -= width % 2;
 				height = heightStep * i;

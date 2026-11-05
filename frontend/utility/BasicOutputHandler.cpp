@@ -11,6 +11,8 @@
 #include <utility/VCamConfig.hpp>
 #include <widgets/OBSBasic.hpp>
 
+#include <push-stream-limits.hpp>
+
 #include <qt-wrappers.hpp>
 
 #include <QThreadPool>
@@ -613,6 +615,15 @@ uint64_t BasicOutputHandler::TotalStreamingBytes() const
 	return total;
 }
 
+bool BasicOutputHandler::CheckStreamLimits(std::string &error) const
+{
+	if (!ppobs_push_limits::CheckOutput(StreamingOutput(), error))
+		return false;
+	if (hevcStreamOutput && !ppobs_push_limits::CheckOutput(hevcStreamOutput, error))
+		return false;
+	return true;
+}
+
 // Bitrate for the crop publish: the main stream's bitrate scaled by the crop
 // region's share of the main output's pixel area and by the crop stream's
 // frame rate relative to the main output's frame rate.
@@ -827,6 +838,13 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 	// 10-bit HEVC/AV1 (the copied settings must not force P010/I010 on it).
 	obs_encoder_set_preferred_video_format(cropVideoEncoder, VIDEO_FORMAT_NV12);
 	ForceEncoderNoBFrames(cropVideoEncoder);
+
+	std::string limitError;
+	if (!ppobs_push_limits::CheckEncoder(cropVideoEncoder, limitError)) {
+		blog(LOG_WARNING, "[crop] not publishing: %s", limitError.c_str());
+		StopCropOutput(true);
+		return;
+	}
 
 	const char *type = GetStreamOutputType(cropService);
 	if (!type) {

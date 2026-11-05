@@ -2164,25 +2164,62 @@
                      </property>
                     </widget>
                    </item>
-                   <item row="1" column="1">
-                    <layout class="QHBoxLayout" name="horizontalLayout_35" stretch="0,0">
-                     <item>
-                      <widget class="QSpinBox" name="whipSimulcastTotalLayers">
-                       <property name="minimum">
-                        <number>1</number>
-                       </property>
-                       <property name="maximum">
-                        <number>5</number>
-                       </property>
-                       <property name="value">
-                        <number>1</number>
-                       </property>
-                      </widget>
-                     </item>
-                    </layout>
-                   </item>
-                  </layout>
-                 </item>
+                    <item row="1" column="1">
+                     <layout class="QHBoxLayout" name="horizontalLayout_35" stretch="0,0">
+                      <item>
+                       <widget class="QSpinBox" name="whipSimulcastTotalLayers">
+                        <property name="minimum">
+                         <number>1</number>
+                        </property>
+                        <property name="maximum">
+                         <number>5</number>
+                        </property>
+                        <property name="value">
+                         <number>1</number>
+                        </property>
+                       </widget>
+                      </item>
+                     </layout>
+                    </item>
+                    <item row="2" column="0">
+                     <widget class="QLabel" name="whipHevcBitrateLabel">
+                      <property name="text">
+                       <string>Basic.Settings.Stream.WHIPHevcBitrate</string>
+                      </property>
+                      <property name="buddy">
+                       <cstring>whipHevcBitrate</cstring>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="2" column="1">
+                     <layout class="QHBoxLayout" name="horizontalLayout_whipHevcBitrate" stretch="0,0">
+                      <item>
+                       <widget class="QCheckBox" name="whipHevcBitrateAuto">
+                        <property name="text">
+                         <string>Basic.Settings.Stream.WHIPHevcBitrateAuto</string>
+                        </property>
+                       </widget>
+                      </item>
+                      <item>
+                       <widget class="QSpinBox" name="whipHevcBitrate">
+                        <property name="minimum">
+                         <number>1</number>
+                        </property>
+                        <property name="maximum">
+                         <number>1000000</number>
+                        </property>
+                        <property name="singleStep">
+                         <number>50</number>
+                        </property>
+                        <property name="suffix">
+                         <string> Kbps</string>
+                        </property>
+                       </widget>
+                      </item>
+                     </layout>
+                    </item>
+                   </layout>
+                  </item>
                  <item>
                   <!-- Per-layer resolution/bitrate rows are built at
                        runtime by OBSBasicSettings::RebuildWHIPSimulcastLayerRows()
@@ -7039,39 +7076,9 @@
              </widget>
             </item>
             <item row="4" column="1">
-             <widget class="QCheckBox" name="temporalDenoiseEnable">
+             <widget class="QCheckBox" name="globalEnhanceEnable">
               <property name="text">
-               <string>Basic.Settings.Stream.TemporalDenoise</string>
-              </property>
-              <property name="checked">
-               <bool>true</bool>
-              </property>
-             </widget>
-            </item>
-            <item row="5" column="1">
-             <widget class="QCheckBox" name="qualityScoreEnable">
-              <property name="text">
-               <string>Basic.Settings.Stream.QualityScore</string>
-              </property>
-              <property name="checked">
-               <bool>true</bool>
-              </property>
-             </widget>
-            </item>
-            <item row="6" column="1">
-             <widget class="QCheckBox" name="beautyFilterEnable">
-              <property name="text">
-               <string>Basic.Settings.Stream.BeautyFilter</string>
-              </property>
-              <property name="checked">
-               <bool>false</bool>
-              </property>
-             </widget>
-            </item>
-            <item row="7" column="1">
-             <widget class="QCheckBox" name="clarityFilterEnable">
-              <property name="text">
-               <string>Basic.Settings.Stream.ClarityFilter</string>
+               <string>Basic.Settings.Stream.GlobalEnhance</string>
               </property>
               <property name="checked">
                <bool>true</bool>

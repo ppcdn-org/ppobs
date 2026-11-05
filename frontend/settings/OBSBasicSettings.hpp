@@ -73,6 +73,8 @@ private:
 	bool scheduleChanged = false;
 	int pageIndex = 0;
 	bool loading = true;
+	bool outputResolutionManual = false;
+	bool updatingOutputResolution = false;
 	bool forceAuthReload = false;
 	bool forceUpdateCheck = false;
 	int sampleRateIndex = 0;
@@ -284,6 +286,10 @@ private:
 	 * behavior of freezing whatever resolution was on screen the first
 	 * time the row was saved - see RebuildWHIPSimulcastLayerRows and
 	 * WHIPSimulcastLayer::followMain in WHIPSimulcastEncoders.hpp.
+	 *
+	 * hevcAuto (default checked) keeps the HEVC layer at 50% of this
+	 * slot's H264 bitrate whenever that bitrate changes; unchecking it
+	 * lets the user edit hevcBitrate manually.
 	 */
 	struct WHIPSimulcastLayerRow {
 		QWidget *rowWidget;
@@ -291,6 +297,8 @@ private:
 		QSpinBox *width;
 		QSpinBox *height;
 		QSpinBox *bitrate;
+		QCheckBox *hevcAuto;
+		QSpinBox *hevcBitrate;
 	};
 	std::vector<WHIPSimulcastLayerRow> whipSimulcastLayerRows;
 	void RebuildWHIPSimulcastLayerRows();
@@ -298,6 +306,10 @@ private:
 	void RefreshWHIPSimulcastLayerDefault(size_t layerIdx);
 	void RefreshWHIPSimulcastFollowingLayers();
 	void GetWHIPSimulcastMainResolution(uint32_t &width, uint32_t &height);
+	int WHIPMainStreamBitrate() const;
+	void LoadWHIPHevcBitrateControls();
+	void UpdateWHIPHevcBitrateControls();
+	void RefreshWHIPHevcBitrateDefaults();
 
 	void ServiceChanged(bool resetFields = false);
 	void UpdateP2PAvailability();
@@ -378,6 +390,7 @@ private:
 	void LoadDownscaleFilters();
 	void LoadResolutionLists();
 	void LoadFPSData();
+	void ApplyLinkedVideoBitrate(bool force = false);
 
 	/* a11y */
 	void UpdateA11yColors();

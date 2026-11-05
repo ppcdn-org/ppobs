@@ -108,7 +108,7 @@ void SimpleOutput::LoadStreamingPreset_Lossy(const char *encoderId)
 			const bool useExistingMain =
 				mainIsHevc && !StreamTransportIsSingleCodec(main->GetService());
 
-			whipHevcEncoders->Create(hevcEncoderId, nullptr,
+			whipHevcEncoders->Create(hevcEncoderId, nullptr, 0,
 						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 						 video_output_get_width(obs_get_video()),
@@ -436,7 +436,8 @@ void SimpleOutput::Update()
 		whipSimulcastEncoders->Update(videoSettings, videoBitrate, main->Config());
 	}
 	if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
-		whipHevcEncoders->Update(videoSettings, videoBitrate, main->Config());
+		whipHevcEncoders->Update(videoSettings, (int)obs_data_get_int(videoSettings, "bitrate"),
+					 main->Config());
 	}
 }
 
@@ -876,6 +877,14 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 	// video settings change.
 	obs_queue_task(
 		OBS_TASK_GRAPHICS, [](void *) {}, nullptr, true);
+
+	// Same hard limits as WHIP for every transport (SRT/ERTMP included).
+	std::string limitError;
+	if (!CheckStreamLimits(limitError)) {
+		lastError = limitError;
+		blog(LOG_ERROR, "%s", limitError.c_str());
+		return false;
+	}
 
 	if (obs_output_start(streamOutput)) {
 		if (multitrackVideo && multitrackVideoActive)

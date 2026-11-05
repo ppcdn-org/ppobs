@@ -61,9 +61,7 @@ void OBSBasic::StartStreaming()
 	// Re-enforce here as well as on startup/settings-save, so scene
 	// collections or cameras added since then are covered before the
 	// encoders see any frames.
-	ApplyTemporalDenoiseSetting();
-	ApplyBeautyFilterSetting();
-	ApplyClarityFilterSetting();
+	ApplyGlobalEnhanceSetting();
 
 	if (auth && auth->broadcastFlow()) {
 		if (!broadcastActive && !broadcastReady) {
@@ -269,28 +267,12 @@ void OBSBasic::StreamingStart()
 	OBSOutputAutoRelease output = obs_frontend_get_streaming_output();
 	ui->statusbar->StreamStarted(output);
 
-	// Quality score overlay in the preview. Protocol-independent: score
-	// whichever output is publishing (SRT/RTMP/WHIP) - the scorer taps the
-	// output's own encoded packets and the program feed, so it is not tied
-	// to any transport. Enabled unless the user turned it off: the service
-	// setting wins when set, else the Settings > Stream checkbox (default
-	// on). The format string is (re)cached here, on the UI thread, before
-	// the scorer thread can possibly reach the graphics-thread reader.
-	{
-		bool enabled = true;
-		obs_service_t *service_obj = GetService();
-		OBSDataAutoRelease service_settings = service_obj ? obs_service_get_settings(service_obj) : nullptr;
-		if (service_settings && obs_data_has_user_value(service_settings, "quality_score"))
-			enabled = obs_data_get_bool(service_settings, "quality_score");
-		else if (config_has_user_value(Config(), "Stream1", "QualityScore"))
-			enabled = config_get_bool(Config(), "Stream1", "QualityScore");
-
-		if (enabled) {
-			qualityScoreFormat = QTStr("Basic.Main.QualityScore");
-			qualityScorer.SetSink(OnQualityScore, this);
-			qualityScorer.Start(output);
-		}
-	}
+	// Protocol-independent and mandatory: score whichever output is
+	// publishing (SRT/RTMP/WHIP). The format string is cached on the UI
+	// thread before the scorer's decode thread can publish a sample.
+	qualityScoreFormat = QTStr("Basic.Main.QualityScore");
+	qualityScorer.SetSink(OnQualityScore, this);
+	qualityScorer.Start(output);
 
 	if (sysTrayStream) {
 		sysTrayStream->setText(QTStr("Basic.Main.StopStreaming"));

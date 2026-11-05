@@ -95,6 +95,12 @@ struct BasicOutputHandler {
 	void StartCropOutput(obs_service_t *service, obs_encoder_t *videoEncoder, obs_encoder_t *audioEncoder);
 	void StopCropOutput(bool force = false);
 
+	// Applies the platform publish limits (plugins/common/push-stream-limits.hpp)
+	// to every streaming output (main + HEVC companion). Called before
+	// obs_output_start for all transports, so SRT/ERTMP enforce the same
+	// resolution/FPS/bitrate caps as WHIP.
+	bool CheckStreamLimits(std::string &error) const;
+
 	// P2P companion output (ppcenter_p2p_output): started alongside a non-WHIP
 	// (e.g. SRT) primary publish so that publish can still join the P2P mesh -
 	// a WHIP publish runs P2P inside its own whip_output and needs none of

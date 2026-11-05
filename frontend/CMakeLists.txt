@@ -52,6 +52,10 @@ target_link_libraries(
     OBS::quality-score
 )
 
+# Shared with the WHIP plugin so every ppobs transport enforces the same
+# publish limits (see plugins/common/push-stream-limits.hpp).
+target_include_directories(obs-studio PRIVATE "${CMAKE_SOURCE_DIR}/plugins/common")
+
 include(cmake/ui-components.cmake)
 include(cmake/ui-dialogs.cmake)
 include(cmake/ui-docks.cmake)

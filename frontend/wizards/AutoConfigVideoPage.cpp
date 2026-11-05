@@ -75,6 +75,8 @@ AutoConfigVideoPage::AutoConfigVideoPage(QWidget *parent) : QWizardPage(parent),
 		ui->canvasRes->addItem(str, encRes);
 	};
 
+	addRes(3840, 2160);
+	addRes(2560, 1440);
 	addRes(1920, 1080);
 	addRes(1280, 720);
 

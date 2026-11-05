@@ -29,6 +29,8 @@ static const QUuid &CustomServerUUID()
 	return uuid;
 }
 
+static int WHIPHevcLinkedBitrate(int h264Bitrate);
+
 // The WHIP "Server" field the user fills in already spells out the stream
 // name as a path segment (e.g. "http://host:8889/live/table-view/whip" ->
 // stream "table-view", the segment right before the trailing "/whip") - so
@@ -190,6 +192,15 @@ void OBSBasicSettings::InitStreamPage()
 	// RebuildWHIPSimulcastLayerRows.
 	connect(ui->whipSimulcastTotalLayers, &QSpinBox::valueChanged, this,
 		&OBSBasicSettings::RebuildWHIPSimulcastLayerRows);
+	connect(ui->whipHevcH264Multitrack, &QCheckBox::toggled, this, [this](bool) {
+		UpdateWHIPHevcBitrateControls();
+		RefreshWHIPHevcBitrateDefaults();
+	});
+	connect(ui->whipHevcBitrateAuto, &QCheckBox::toggled, this, [this](bool checked) {
+		UpdateWHIPHevcBitrateControls();
+		if (checked)
+			ui->whipHevcBitrate->setValue(WHIPHevcLinkedBitrate(WHIPMainStreamBitrate()));
+	});
 }
 
 void OBSBasicSettings::LoadStream1Settings()
@@ -424,13 +435,11 @@ void OBSBasicSettings::LoadStream1Settings()
 	ui->streamPage->setEnabled(!streamActive);
 
 	ui->ignoreRecommended->setChecked(ignoreRecommended);
-	ui->temporalDenoiseEnable->setChecked(config_get_bool(main->Config(), "Stream1", "TemporalDenoise"));
-	ui->qualityScoreEnable->setChecked(config_get_bool(main->Config(), "Stream1", "QualityScore"));
-	ui->beautyFilterEnable->setChecked(config_get_bool(main->Config(), "Stream1", "BeautyFilter"));
-	ui->clarityFilterEnable->setChecked(config_get_bool(main->Config(), "Stream1", "ClarityFilter"));
+	ui->globalEnhanceEnable->setChecked(config_get_bool(main->Config(), "Stream1", "GlobalEnhance"));
 	ui->whipSimulcastTotalLayers->setValue(whipSimulcastTotalLayers);
 	ui->whipHevcH264Multitrack->setChecked(whipHevcH264Multitrack);
 	RebuildWHIPSimulcastLayerRows();
+	LoadWHIPHevcBitrateControls();
 
 	loading = false;
 
@@ -564,9 +573,9 @@ void OBSBasicSettings::SaveStream1Settings()
 		obs_data_set_string(settings, "service", "WHIP");
 		obs_data_set_string(settings, "bearer_token", QT_TO_UTF8(ui->key->text()));
 
-		// Mirrored into the service settings so the WHIP output can read
-		// it at stream start without reaching into frontend config.
-		obs_data_set_bool(settings, "quality_score", ui->qualityScoreEnable->isChecked());
+		// Quality scoring is mandatory for every transport. Keep the legacy
+		// service field true so older plugin code cannot disable it.
+		obs_data_set_bool(settings, "quality_score", true);
 	} else {
 		obs_data_set_string(settings, "key", QT_TO_UTF8(ui->key->text()));
 	}
@@ -598,13 +607,8 @@ void OBSBasicSettings::SaveStream1Settings()
 	}
 
 	SaveCheckBox(ui->ignoreRecommended, "Stream1", "IgnoreRecommended");
-	SaveCheckBox(ui->temporalDenoiseEnable, "Stream1", "TemporalDenoise");
-	SaveCheckBox(ui->qualityScoreEnable, "Stream1", "QualityScore");
-	SaveCheckBox(ui->beautyFilterEnable, "Stream1", "BeautyFilter");
-	SaveCheckBox(ui->clarityFilterEnable, "Stream1", "ClarityFilter");
-	main->ApplyTemporalDenoiseSetting();
-	main->ApplyBeautyFilterSetting();
-	main->ApplyClarityFilterSetting();
+	SaveCheckBox(ui->globalEnhanceEnable, "Stream1", "GlobalEnhance");
+	main->ApplyGlobalEnhanceSetting();
 
 	auto oldWHIPSimulcastTotalLayers = config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers");
 	SaveSpinBox(ui->whipSimulcastTotalLayers, "Stream1", "WHIPSimulcastTotalLayers");
@@ -615,6 +619,26 @@ void OBSBasicSettings::SaveStream1Settings()
 	// whether to publish a second HEVC WHIP session alongside H264.
 	auto oldWHIPHevcH264Multitrack = config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
 	SaveCheckBox(ui->whipHevcH264Multitrack, "Stream1", "WHIPHevcH264Multitrack");
+
+	// Main HEVC bitrate: auto means "50% of the H264 main", so only a
+	// manual value is persisted and only a manual/auto toggle counts as
+	// a user change (the auto value itself follows the H264 bitrate).
+	const bool hevcMainAuto = ui->whipHevcBitrateAuto->isChecked();
+	const bool oldHevcMainAuto =
+		!config_has_user_value(main->Config(), "Stream1", "WHIPHevcBitrateAuto") ||
+		config_get_bool(main->Config(), "Stream1", "WHIPHevcBitrateAuto");
+	const int oldHevcMainBitrate = (int)config_get_int(main->Config(), "Stream1", "WHIPHevcBitrateKbps");
+	const bool hevcMainBitrateChanged =
+		oldHevcMainAuto != hevcMainAuto ||
+		(!hevcMainAuto && oldHevcMainBitrate != ui->whipHevcBitrate->value());
+
+	config_set_bool(main->Config(), "Stream1", "WHIPHevcBitrateAuto", hevcMainAuto);
+	if (hevcMainAuto) {
+		config_remove_value(main->Config(), "Stream1", "WHIPHevcBitrateKbps");
+	} else {
+		config_set_int(main->Config(), "Stream1", "WHIPHevcBitrateKbps",
+			       ui->whipHevcBitrate->value());
+	}
 
 	// Per-layer resolution/bitrate (see RebuildWHIPSimulcastLayerRows and
 	// WHIPSimulcastEncoders.hpp, which reads these same keys back at
@@ -637,10 +661,19 @@ void OBSBasicSettings::SaveStream1Settings()
 		auto oldWidth = config_get_int(main->Config(), "Stream1", (prefix + "Width").c_str());
 		auto oldHeight = config_get_int(main->Config(), "Stream1", (prefix + "Height").c_str());
 		auto oldBitrate = config_get_int(main->Config(), "Stream1", (prefix + "BitrateKbps").c_str());
+		const bool hevcAuto = row.hevcAuto->isChecked();
+		const bool oldHevcAuto =
+			!config_has_user_value(main->Config(), "Stream1",
+					       (prefix + "HevcBitrateAuto").c_str()) ||
+			config_get_bool(main->Config(), "Stream1", (prefix + "HevcBitrateAuto").c_str());
+		const int oldHevcBitrate =
+			(int)config_get_int(main->Config(), "Stream1", (prefix + "HevcBitrateKbps").c_str());
 
 		if (oldFollowMain != followMain ||
 		    (!followMain && (oldWidth != row.width->value() || oldHeight != row.height->value() ||
-				     oldBitrate != row.bitrate->value())))
+				     oldBitrate != row.bitrate->value())) ||
+		    oldHevcAuto != hevcAuto ||
+		    (!hevcAuto && oldHevcBitrate != row.hevcBitrate->value()))
 			whipLayerSettingsChanged = true;
 
 		config_set_bool(main->Config(), "Stream1", (prefix + "FollowMain").c_str(), followMain);
@@ -663,6 +696,17 @@ void OBSBasicSettings::SaveStream1Settings()
 			config_set_int(main->Config(), "Stream1", (prefix + "Height").c_str(), row.height->value());
 			config_set_int(main->Config(), "Stream1", (prefix + "BitrateKbps").c_str(),
 					row.bitrate->value());
+		}
+
+		// Same auto/manual split for the HEVC bitrate: an auto value is
+		// recomputed from this row's H264 bitrate at runtime, so only
+		// manual values are written.
+		config_set_bool(main->Config(), "Stream1", (prefix + "HevcBitrateAuto").c_str(), hevcAuto);
+		if (hevcAuto) {
+			config_remove_value(main->Config(), "Stream1", (prefix + "HevcBitrateKbps").c_str());
+		} else {
+			config_set_int(main->Config(), "Stream1", (prefix + "HevcBitrateKbps").c_str(),
+				       row.hevcBitrate->value());
 		}
 	}
 
@@ -696,10 +740,30 @@ void OBSBasicSettings::SaveStream1Settings()
 
 	if (oldMultitrackVideoSetting != ui->enableMultitrackVideo->isChecked() ||
 	    oldWHIPSimulcastTotalLayers != ui->whipSimulcastTotalLayers->value() || whipLayerSettingsChanged ||
-	    oldWHIPHevcH264Multitrack != ui->whipHevcH264Multitrack->isChecked())
+	    oldWHIPHevcH264Multitrack != ui->whipHevcH264Multitrack->isChecked() ||
+	    hevcMainBitrateChanged)
 		main->ResetOutputs();
 
 	SwapMultiTrack(QT_TO_UTF8(protocol));
+}
+
+static int WHIPHevcLinkedBitrate(int h264Bitrate)
+{
+	return h264Bitrate > 0 ? std::max(1, h264Bitrate / 2) : 1;
+}
+
+// The main H264 bitrate the Simulcast/HEVC bitrate defaults are derived
+// from. Simple output stores it in its own spinbox; Advanced output keeps
+// it in the active stream encoder's properties.
+int OBSBasicSettings::WHIPMainStreamBitrate() const
+{
+	bool simpleOutputMode = (ui->outputMode->currentIndex() == 0);
+	int mainBitrate = simpleOutputMode
+				  ? ui->simpleOutputVBitrate->value()
+				  : (streamEncoderProps
+					     ? (int)obs_data_get_int(streamEncoderProps->GetSettings(), "bitrate")
+					     : 0);
+	return mainBitrate > 0 ? mainBitrate : 2500;
 }
 
 // RebuildWHIPSimulcastLayerRows tears down and recreates one settings row
@@ -732,38 +796,29 @@ void OBSBasicSettings::RebuildWHIPSimulcastLayerRows()
 	// WHIPSimulcastEncoders.hpp) - used only to prefill a row the first
 	// time it's created (no saved config value yet), so a user who
 	// never touches these fields gets the same ladder the encoders
-	// themselves would fall back to. Resolution steps down evenly across
-	// layers; bitrate is proportional to each layer's resulting
-	// pixel-area ratio against the main output (see
+	// themselves would fall back to. 4K/2K outputs use PPCDN's fixed
+	// resolution ladder (see GetPPCDNSimulcastLayerSize); other bases keep
+	// the older even step-down. Bitrate is proportional to each layer's
+	// resulting pixel-area ratio against the main output (see
 	// WHIPSimulcastProportionalBitrate()).
 	uint32_t outputWidth, outputHeight;
 	GetWHIPSimulcastMainResolution(outputWidth, outputHeight);
 
 	// mainBitrate must reflect whichever output mode is actually active -
-	// simpleOutputVBitrate only holds a real value when Simple mode is
-	// selected; in Advanced mode the video bitrate lives in the stream
-	// encoder's own properties (streamEncoderProps), keyed the same
-	// "bitrate" way every built-in video encoder exposes it. Reading the
-	// wrong one silently prefilled layers off of whatever
-	// simpleOutputVBitrate happened to contain (its own default, or a
-	// value from a mode the user isn't even using) instead of the
-	// bitrate they actually configured.
-	bool simpleOutputMode = (ui->outputMode->currentIndex() == 0);
-	int mainBitrate = simpleOutputMode ? ui->simpleOutputVBitrate->value()
-					    : (streamEncoderProps
-						       ? (int)obs_data_get_int(streamEncoderProps->GetSettings(),
-										"bitrate")
-						       : 0);
-	if (mainBitrate <= 0)
-		mainBitrate = 2500; // sane fallback if settings haven't loaded yet
+	// see WHIPMainStreamBitrate().
+	int mainBitrate = WHIPMainStreamBitrate();
 
 	for (int layer = 1; layer < totalLayers; layer++) {
 		std::string prefix = "WHIPSimulcastLayer" + std::to_string(layer);
 
-		uint32_t defaultWidth = (outputWidth / totalLayers) * (totalLayers - layer);
-		defaultWidth -= defaultWidth % 2;
-		uint32_t defaultHeight = (outputHeight / totalLayers) * (totalLayers - layer);
-		defaultHeight -= defaultHeight % 2;
+		uint32_t defaultWidth, defaultHeight;
+		if (!GetPPCDNSimulcastLayerSize(outputWidth, outputHeight, layer, totalLayers, defaultWidth,
+						defaultHeight)) {
+			defaultWidth = (outputWidth / totalLayers) * (totalLayers - layer);
+			defaultWidth -= defaultWidth % 2;
+			defaultHeight = (outputHeight / totalLayers) * (totalLayers - layer);
+			defaultHeight -= defaultHeight % 2;
+		}
 		int defaultBitrate = (int)WHIPSimulcastProportionalBitrate(mainBitrate, outputWidth, outputHeight,
 									    defaultWidth, defaultHeight);
 
@@ -829,16 +884,56 @@ void OBSBasicSettings::RebuildWHIPSimulcastLayerRows()
 		bitrate->setEnabled(!followMain);
 		rowLayout->addWidget(bitrate);
 
+		bool hevcAuto = !config_has_user_value(main->Config(), "Stream1",
+						      (prefix + "HevcBitrateAuto").c_str()) ||
+				config_get_bool(main->Config(), "Stream1", (prefix + "HevcBitrateAuto").c_str());
+		auto *hevcAutoCheck = new QCheckBox(QTStr("Basic.Settings.Stream.WHIPSimulcastLayer.HevcAuto"),
+						    rowWidget);
+		hevcAutoCheck->setChecked(hevcAuto);
+		hevcAutoCheck->setEnabled(ui->whipHevcH264Multitrack->isChecked());
+		rowLayout->addWidget(hevcAutoCheck);
+
+		auto *hevcBitrate = new QSpinBox(rowWidget);
+		hevcBitrate->setRange(1, 1000000);
+		hevcBitrate->setSingleStep(50);
+		hevcBitrate->setSuffix(" Kbps");
+		const bool haveSavedHevcBitrate =
+			config_has_user_value(main->Config(), "Stream1", (prefix + "HevcBitrateKbps").c_str());
+		hevcBitrate->setValue(!hevcAuto && haveSavedHevcBitrate
+					      ? config_get_int(main->Config(), "Stream1",
+							       (prefix + "HevcBitrateKbps").c_str())
+					      : WHIPHevcLinkedBitrate(bitrate->value()));
+		hevcBitrate->setEnabled(hevcAutoCheck->isEnabled() && !hevcAuto);
+		rowLayout->addWidget(hevcBitrate);
+
 		size_t layerIdx = whipSimulcastLayerRows.size();
 		connect(followMainCheck, &QCheckBox::toggled, this,
 			[this, layerIdx](bool checked) { WHIPSimulcastLayerFollowMainToggled(layerIdx, checked); });
+		connect(hevcAutoCheck, &QCheckBox::toggled, this, [this, layerIdx](bool checked) {
+			if (layerIdx >= whipSimulcastLayerRows.size())
+				return;
+			auto &row = whipSimulcastLayerRows[layerIdx];
+			row.hevcBitrate->setEnabled(!checked && ui->whipHevcH264Multitrack->isChecked());
+			if (checked)
+				row.hevcBitrate->setValue(WHIPHevcLinkedBitrate(row.bitrate->value()));
+		});
+		connect(bitrate, &QSpinBox::valueChanged, this, [this, layerIdx](int value) {
+			if (layerIdx >= whipSimulcastLayerRows.size())
+				return;
+			auto &row = whipSimulcastLayerRows[layerIdx];
+			if (row.hevcAuto->isChecked())
+				row.hevcBitrate->setValue(WHIPHevcLinkedBitrate(value));
+		});
 		HookWidget(followMainCheck, &QCheckBox::toggled, &OBSBasicSettings::Stream1Changed);
 		HookWidget(width, &QSpinBox::valueChanged, &OBSBasicSettings::Stream1Changed);
 		HookWidget(height, &QSpinBox::valueChanged, &OBSBasicSettings::Stream1Changed);
 		HookWidget(bitrate, &QSpinBox::valueChanged, &OBSBasicSettings::Stream1Changed);
+		HookWidget(hevcAutoCheck, &QCheckBox::toggled, &OBSBasicSettings::Stream1Changed);
+		HookWidget(hevcBitrate, &QSpinBox::valueChanged, &OBSBasicSettings::Stream1Changed);
 
 		ui->whipSimulcastLayersContainerLayout->addWidget(rowWidget);
-		whipSimulcastLayerRows.push_back({rowWidget, followMainCheck, width, height, bitrate});
+		whipSimulcastLayerRows.push_back(
+			{rowWidget, followMainCheck, width, height, bitrate, hevcAutoCheck, hevcBitrate});
 	}
 }
 
@@ -862,26 +957,25 @@ void OBSBasicSettings::RefreshWHIPSimulcastLayerDefault(size_t layerIdx)
 	uint32_t outputWidth, outputHeight;
 	GetWHIPSimulcastMainResolution(outputWidth, outputHeight);
 
-	uint32_t defaultWidth = (outputWidth / totalLayers) * multiplier;
-	defaultWidth -= defaultWidth % 2;
-	uint32_t defaultHeight = (outputHeight / totalLayers) * multiplier;
-	defaultHeight -= defaultHeight % 2;
+	uint32_t defaultWidth, defaultHeight;
+	if (!GetPPCDNSimulcastLayerSize(outputWidth, outputHeight, layer, totalLayers, defaultWidth,
+					defaultHeight)) {
+		defaultWidth = (outputWidth / totalLayers) * multiplier;
+		defaultWidth -= defaultWidth % 2;
+		defaultHeight = (outputHeight / totalLayers) * multiplier;
+		defaultHeight -= defaultHeight % 2;
+	}
 
 	// Same mode-aware mainBitrate source as RebuildWHIPSimulcastLayerRows()
-	// - see its comment for why simpleOutputVBitrate alone isn't enough.
-	bool simpleOutputMode = (ui->outputMode->currentIndex() == 0);
-	int mainBitrate = simpleOutputMode
-				   ? ui->simpleOutputVBitrate->value()
-				   : (streamEncoderProps
-					      ? (int)obs_data_get_int(streamEncoderProps->GetSettings(), "bitrate")
-					      : 0);
-	if (mainBitrate <= 0)
-		mainBitrate = 2500;
+	// - see WHIPMainStreamBitrate().
+	int mainBitrate = WHIPMainStreamBitrate();
 
 	row.width->setValue(defaultWidth);
 	row.height->setValue(defaultHeight);
 	row.bitrate->setValue((int)WHIPSimulcastProportionalBitrate(mainBitrate, outputWidth, outputHeight,
 								      defaultWidth, defaultHeight));
+	if (row.hevcAuto->isChecked())
+		row.hevcBitrate->setValue(WHIPHevcLinkedBitrate(row.bitrate->value()));
 }
 
 // Refreshes every row still following the main output in place - unlike
@@ -921,6 +1015,50 @@ void OBSBasicSettings::WHIPSimulcastLayerFollowMainToggled(size_t layerIdx, bool
 
 	if (checked)
 		RefreshWHIPSimulcastLayerDefault(layerIdx);
+}
+
+// Loads the main HEVC bitrate controls once when the Stream page opens.
+// Missing auto/value keys mean auto (50% of H264), matching
+// WHIPHevcBitrateOverride()'s read-side default.
+void OBSBasicSettings::LoadWHIPHevcBitrateControls()
+{
+	const bool automatic = !config_has_user_value(main->Config(), "Stream1", "WHIPHevcBitrateAuto") ||
+			       config_get_bool(main->Config(), "Stream1", "WHIPHevcBitrateAuto");
+	ui->whipHevcBitrateAuto->setChecked(automatic);
+
+	const bool haveSaved = config_has_user_value(main->Config(), "Stream1", "WHIPHevcBitrateKbps");
+	const int saved = haveSaved ? (int)config_get_int(main->Config(), "Stream1", "WHIPHevcBitrateKbps") : 0;
+	ui->whipHevcBitrate->setValue(!automatic && saved > 0 ? saved
+							      : WHIPHevcLinkedBitrate(WHIPMainStreamBitrate()));
+	UpdateWHIPHevcBitrateControls();
+}
+
+// Mirrors the H264 main / per-layer fields into every HEVC field still in
+// auto mode. Manual (auto unchecked) HEVC values are deliberately left
+// alone so a user override survives later H264 bitrate edits.
+void OBSBasicSettings::RefreshWHIPHevcBitrateDefaults()
+{
+	if (ui->whipHevcBitrateAuto->isChecked())
+		ui->whipHevcBitrate->setValue(WHIPHevcLinkedBitrate(WHIPMainStreamBitrate()));
+
+	for (auto &row : whipSimulcastLayerRows) {
+		if (row.hevcAuto->isChecked())
+			row.hevcBitrate->setValue(WHIPHevcLinkedBitrate(row.bitrate->value()));
+	}
+}
+
+// The HEVC fields only make sense when multitrack is on; within that, the
+// bitrate spinbox is editable only after unchecking its auto checkbox.
+void OBSBasicSettings::UpdateWHIPHevcBitrateControls()
+{
+	const bool multitrack = ui->whipHevcH264Multitrack->isChecked();
+	ui->whipHevcBitrateAuto->setEnabled(multitrack);
+	ui->whipHevcBitrate->setEnabled(multitrack && !ui->whipHevcBitrateAuto->isChecked());
+
+	for (auto &row : whipSimulcastLayerRows) {
+		row.hevcAuto->setEnabled(multitrack);
+		row.hevcBitrate->setEnabled(multitrack && !row.hevcAuto->isChecked());
+	}
 }
 
 void OBSBasicSettings::UpdateMoreInfoLink()

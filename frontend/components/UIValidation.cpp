@@ -6,6 +6,8 @@
 #include <QMessageBox>
 #include <QPushButton>
 
+#include <algorithm>
+
 #include "moc_UIValidation.cpp"
 
 static bool HevcMultitrackEncoderAvailable();
@@ -233,8 +235,11 @@ static bool WHIPResolutionFpsWithinLimits(QString &outOfRangeText)
 		return false;
 	}
 
-	if (fps > 60.01) {
-		outOfRangeText = QTStr("Basic.Settings.Stream.WHIPFpsTooHigh").arg(QString::number(fps, 'g', 4));
+	// 2K (2560x1440) and 4K are capped at 30 FPS; 1080p and below stay at 60.
+	const double maxFps = std::min(cx, cy) > 1080 ? 30.0 : 60.0;
+	if (fps > maxFps + 0.01) {
+		outOfRangeText = QTStr("Basic.Settings.Stream.WHIPFpsTooHigh")
+					 .arg(QString::number(fps, 'g', 4), QString::number(maxFps, 'g', 4));
 		return false;
 	}
 

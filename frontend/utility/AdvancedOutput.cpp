@@ -280,7 +280,24 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 					hevcBaseSettings = hevcSettings.Get();
 			}
 
-			whipHevcEncoders->Create(hevcEncoderId, hevcBaseSettings,
+			// HEVC auto bitrates are derived from the H264 main. When
+			// the main itself is HEVC, use the saved H264 base config
+			// (the ladder still publishes an independent H264 track)
+			// and fall back to the HEVC main only if it is absent.
+			int h264MainBitrate = 0;
+			if (mainIsHevc) {
+				std::string h264EncoderId = ResolveWHIPH264EncoderId(streamEncoder);
+				OBSData h264Settings =
+					GetEncoderDataFromJsonFile("streamEncoder", h264EncoderId.c_str());
+				if (h264Settings)
+					h264MainBitrate = (int)obs_data_get_int(h264Settings, "bitrate");
+				if (h264MainBitrate <= 0 && streamEncSettings)
+					h264MainBitrate = (int)obs_data_get_int(streamEncSettings, "bitrate");
+			} else if (streamEncSettings) {
+				h264MainBitrate = (int)obs_data_get_int(streamEncSettings, "bitrate");
+			}
+
+			whipHevcEncoders->Create(hevcEncoderId, hevcBaseSettings, h264MainBitrate,
 						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
 						 video_output_get_width(obs_get_video()),
@@ -448,7 +465,20 @@ void AdvancedOutput::UpdateStreamSettings()
 			if (hevcSettings)
 				hevcUpdate = hevcSettings.Get();
 		}
-		whipHevcEncoders->Update(hevcUpdate, obs_data_get_int(hevcUpdate, "bitrate"), main->Config());
+
+		int h264MainBitrate = 0;
+		if (mainIsHevc) {
+			std::string h264EncoderId = ResolveWHIPH264EncoderId(streamEncoder);
+			OBSData h264Settings = GetEncoderDataFromJsonFile("streamEncoder", h264EncoderId.c_str());
+			if (h264Settings)
+				h264MainBitrate = (int)obs_data_get_int(h264Settings, "bitrate");
+			if (h264MainBitrate <= 0 && settings)
+				h264MainBitrate = (int)obs_data_get_int(settings, "bitrate");
+		} else if (settings) {
+			h264MainBitrate = (int)obs_data_get_int(settings, "bitrate");
+		}
+
+		whipHevcEncoders->Update(hevcUpdate, h264MainBitrate, main->Config());
 	}
 }
 
@@ -1060,6 +1090,14 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	// starts from a settled GPU/graphics state instead of racing it.
 	obs_queue_task(
 		OBS_TASK_GRAPHICS, [](void *) {}, nullptr, true);
+
+	// Same hard limits as WHIP for every transport (SRT/ERTMP included).
+	std::string limitError;
+	if (!CheckStreamLimits(limitError)) {
+		lastError = limitError;
+		blog(LOG_ERROR, "%s", limitError.c_str());
+		return false;
+	}
 
 	// Strong-consistency start (design §4.1): the HEVC publish goes up
 	// first, so a failure there costs nothing visible. If the H264 half

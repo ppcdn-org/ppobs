@@ -10,6 +10,7 @@
 #include "encoder-report.h"
 #include "incident-reporter.h"
 #include "uplink-qos-policy.h"
+#include "push-stream-limits.hpp"
 
 #include <obs.hpp>
 #include <algorithm>
@@ -452,7 +453,7 @@ static std::vector<obs_encoder_t *> collectVideoLayers(obs_output_t *output, con
 //      or 2160x3840 for portrait - a single hard ceiling that also covers
 //      the 2560x1440 tier the requirement calls out, since anything at or
 //      under 1440p is by definition under this 4K ceiling too.
-//   2. FPS <= 60
+//   2. FPS <= 60, but <= 30 for 2K (2560x1440) and 4K
 //   3. video bitrate <= 10000 Kbps (10 Mbps)
 //
 // Enforced here - inside WHIPOutput::Setup(), after every video layer
@@ -464,47 +465,11 @@ static std::vector<obs_encoder_t *> collectVideoLayers(obs_output_t *output, con
 // Simulcast/HEVC layers), since a lower Simulcast layer inheriting a
 // too-high per-layer override would otherwise slip through.
 namespace {
-constexpr uint32_t kMaxLandscapeWidth = 3840;
-constexpr uint32_t kMaxLandscapeHeight = 2160;
-constexpr uint32_t kMaxPortraitWidth = 2160;
-constexpr uint32_t kMaxPortraitHeight = 3840;
-constexpr double kMaxFps = 60.0;
-constexpr int64_t kMaxVideoBitrateKbps = 10000;
-
 bool checkStreamLimits(const std::vector<obs_encoder_t *> &layers, std::string &error)
 {
 	for (auto *encoder : layers) {
-		if (!encoder)
-			continue;
-
-		const uint32_t width = obs_encoder_get_width(encoder);
-		const uint32_t height = obs_encoder_get_height(encoder);
-		const bool landscape = width >= height;
-		const uint32_t maxWidth = landscape ? kMaxLandscapeWidth : kMaxPortraitWidth;
-		const uint32_t maxHeight = landscape ? kMaxLandscapeHeight : kMaxPortraitHeight;
-		if (width > maxWidth || height > maxHeight) {
-			error = "resolution " + std::to_string(width) + "x" + std::to_string(height) +
-				" exceeds the " + std::to_string(maxWidth) + "x" + std::to_string(maxHeight) +
-				" limit for " + (landscape ? "landscape" : "portrait") + " streams";
+		if (!ppobs_push_limits::CheckEncoder(encoder, error))
 			return false;
-		}
-
-		if (video_t *video = obs_encoder_video(encoder)) {
-			const double fps = video_output_get_frame_rate(video);
-			if (fps > kMaxFps + 0.01) {
-				error = "frame rate " + std::to_string(fps) + " exceeds the " +
-					std::to_string((int)kMaxFps) + " FPS limit";
-				return false;
-			}
-		}
-
-		OBSDataAutoRelease settings = obs_encoder_get_settings(encoder);
-		const int64_t bitrate = obs_data_get_int(settings, "bitrate");
-		if (bitrate > kMaxVideoBitrateKbps) {
-			error = "video bitrate " + std::to_string(bitrate) + " Kbps exceeds the " +
-				std::to_string(kMaxVideoBitrateKbps) + " Kbps limit";
-			return false;
-		}
 	}
 	return true;
 }
