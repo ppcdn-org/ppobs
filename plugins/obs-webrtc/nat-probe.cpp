@@ -137,10 +137,16 @@ std::string DeriveStunHost(const std::string &ppcenterUrl)
 	auto schemeEnd = ppcenterUrl.find("://");
 	const std::string rest = schemeEnd == std::string::npos ? ppcenterUrl : ppcenterUrl.substr(schemeEnd + 3);
 	const auto hostEnd = rest.find_first_of(":/");
-	return hostEnd == std::string::npos ? rest : rest.substr(0, hostEnd);
+	const std::string host = hostEnd == std::string::npos ? rest : rest.substr(0, hostEnd);
+
+	// api.pp-cdn.org is proxied by Cloudflare, which does not forward UDP
+	// STUN. The dedicated DNS-only hostname points directly at ppcenter.
+	if (host == "api.pp-cdn.org")
+		return "stun.pp-cdn.org";
+	return host;
 }
 
-GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
+GatheredCandidate GatherCandidateWithStun(const std::string &stunUrl, int timeoutMs)
 {
 	try {
 
@@ -184,9 +190,8 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 	// 22/80/443 allowed silently blackholed every probe for hours on
 	// 2026-09-22 while the process itself looked healthy in `ss -ulnp`.
 	// See docs/test/ppcdn-debug-log.md's 2026-09-22 entry for the full trail.
-	const std::string stunHost = DeriveStunHost(ppcenterUrl);
-	if (!stunHost.empty())
-		cfg.iceServers.emplace_back("stun:" + stunHost + ":3478");
+	if (!stunUrl.empty())
+		cfg.iceServers.emplace_back(stunUrl);
 	// Diagnostic logging, kept at Debug so a normal publish's log stays
 	// readable - raise these to Info to re-investigate the 2026-09-22
 	// STUN-reachability issue. See docs/test/ppcdn-debug-log.md's entry.
@@ -271,7 +276,7 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 	{
 		std::unique_lock<std::mutex> lock(state->mutex);
 		const bool predicateMet = state->cv.wait_for(
-			lock, std::chrono::milliseconds(ICE_GATHER_TIMEOUT_MS),
+			lock, std::chrono::milliseconds(timeoutMs),
 			[&] { return state->done || (state->best.found && state->best.isSrflx && state->best.isIPv4); });
 		probe_log(LOG_DEBUG,
 			  "[diag] wait finished: predicateMet=%d done=%d best.found=%d best.isSrflx=%d best.isIPv4=%d",
@@ -287,6 +292,25 @@ GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
 		probe_log(LOG_DEBUG, "probe PeerConnection failed: %s", e.what());
 		return GatheredCandidate{};
 	}
+}
+
+GatheredCandidate GatherBestLocalCandidate(const std::string &ppcenterUrl)
+{
+	const std::string stunHost = DeriveStunHost(ppcenterUrl);
+	if (!stunHost.empty()) {
+		const std::string primary = "stun:" + stunHost + ":3478";
+		auto candidate = GatherCandidateWithStun(primary, 1500);
+		if (candidate.found)
+			return candidate;
+		probe_log(LOG_WARNING, "no candidate from %s; trying public STUN fallback", primary.c_str());
+	}
+
+	auto candidate = GatherCandidateWithStun("stun:stun.l.google.com:19302", ICE_GATHER_TIMEOUT_MS);
+	if (!candidate.found)
+		probe_log(LOG_WARNING, "public STUN fallback also returned no usable candidate");
+	else
+		probe_log(LOG_INFO, "publisher NAT probe is using the public STUN fallback");
+	return candidate;
 }
 
 } // namespace
