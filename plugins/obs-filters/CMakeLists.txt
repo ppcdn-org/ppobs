@@ -37,6 +37,9 @@ target_sources(
     sharpness-filter.c
     temporal-denoise-filter.c
     beauty-filter.c
+    big-head-filter.c
+    face-track.c
+    face-track.h
     background-mask.c
     background-mask.h
     background-segmentation-filter.c
@@ -106,6 +109,11 @@ if(ENABLE_TEST_INPUT)
   add_executable(background-fade-test background-fade-test.c)
   add_test(NAME background-fade COMMAND background-fade-test)
   set_target_properties(background-fade-test PROPERTIES FOLDER tests)
+
+  add_executable(face-track-test face-track.c face-track-test.c)
+  target_link_libraries(face-track-test PRIVATE OBS::libobs)
+  add_test(NAME face-track COMMAND face-track-test)
+  set_target_properties(face-track-test PROPERTIES FOLDER tests)
 
   add_executable(matting-models-test matting-models.c matting-models-test.c)
   target_link_libraries(matting-models-test PRIVATE OBS::libobs)

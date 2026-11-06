@@ -1,0 +1,67 @@
+/*
+ * Keeps the source inside a feathered circle and makes everything outside it
+ * transparent, so the scene below the source shows through.  The circle centre
+ * and radius are supplied per frame by the big-head filter; they are already in
+ * display UV space, so this pass does no tracking itself.
+ *
+ * The circle is drawn in aspect-corrected space: UV x is normalised by width
+ * and y by height, so a distance that uses raw UV would be an ellipse on a
+ * 16:9 source.  Multiplying the x delta by the source aspect makes the radius
+ * mean the same thing horizontally and vertically.
+ */
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float2 circle_center = {0.5, 0.35};
+uniform float circle_radius = 0.25;
+uniform float aspect = 1.0;
+uniform float feather = 0.02;
+uniform float show_mask = 0.0;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertDataIn {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+struct VertDataOut {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertDataOut VSDefault(VertDataIn v_in)
+{
+	VertDataOut vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float4 PSCircle(VertDataOut v_in) : TARGET
+{
+	float4 rgba = image.Sample(textureSampler, v_in.uv);
+
+	float2 delta = (v_in.uv - circle_center) * float2(aspect, 1.0);
+	float dist = length(delta);
+	float edge = 1.0 - smoothstep(circle_radius - max(feather, 0.0005),
+				      circle_radius + max(feather, 0.0005), dist);
+
+	float4 masked = float4(rgba.rgb, rgba.a * edge);
+	float4 debug = float4(edge, edge, edge, 1.0);
+	return lerp(masked, debug, show_mask);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSCircle(v_in);
+	}
+}
