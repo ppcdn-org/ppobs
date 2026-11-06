@@ -78,8 +78,9 @@ bool WHIPOutput::Start()
 void WHIPOutput::Stop(bool signal)
 {
 #ifdef WHIP_DEGRADE_ACTIVE
-	// Not for a P2P-only companion - see the matching guard in StartThread().
-	if (!p2p_only)
+	// Not for a P2P-only companion or the crop output - see the matching
+	// guard in StartThread().
+	if (!p2p_only && degradeEnabled)
 		WsDegradeClient::Instance().UnregisterOutput();
 #endif
 
@@ -361,6 +362,8 @@ bool WHIPOutput::Init()
 		watchdog_stall_sec = watchdog_interval_sec;
 
 	enable_pacing = obs_data_get_bool(output_settings, "whip_enable_pacing");
+	degradeEnabled = !obs_data_has_user_value(output_settings, "ppcdn_degrade_enabled") ||
+			 obs_data_get_bool(output_settings, "ppcdn_degrade_enabled");
 	p2pEnabled = !obs_data_has_user_value(output_settings, "ppcdn_p2p_enabled") ||
 		     obs_data_get_bool(output_settings, "ppcdn_p2p_enabled");
 	p2pLocalMaxSessions = (int)obs_data_get_int(output_settings, "ppcdn_p2p_max_sessions");
@@ -1099,7 +1102,7 @@ void WHIPOutput::StartThread(uint64_t generation)
 	// represent the actual ladder anyway. Still skipped for an RTMP
 	// companion (no RTMP-side degrade client exists yet) rather than
 	// re-enabling the old single-encoder behavior just for that case.
-	if (!p2p_only) {
+	if (!p2p_only && degradeEnabled) {
 		WsDegradeClient::Instance().RegisterOutput(output, degrade_url_h264, degrade_token_h264,
 							   degrade_url_hevc, degrade_token_hevc);
 	}

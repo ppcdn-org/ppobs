@@ -791,6 +791,18 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 		cropUrl = WithPublishCodec(cropUrl, "h264");
 	obs_data_set_string(settings, "server", cropUrl.c_str());
 
+	// WHIPOutput asks ppcenter for the final per-codec URL using the bare
+	// ppcenter_stream setting. Give the crop publish its own stream name so
+	// it cannot resolve to and replace the main H264 publisher.
+	const char *mainStream = obs_data_get_string(settings, "ppcenter_stream");
+	if (mainStream && *mainStream) {
+		std::string cropStream = mainStream;
+		if (cropStream.size() < 3 || cropStream.compare(cropStream.size() - 3, 3, "-h5") != 0)
+			cropStream += "-h5";
+		obs_data_set_string(settings, "ppcenter_stream", cropStream.c_str());
+		blog(LOG_INFO, "[crop] requesting ppcenter stream: %s", cropStream.c_str());
+	}
+
 	cropService =
 		obs_service_create(obs_service_get_id(primary), "crop_stream_service", settings, nullptr);
 	if (!cropService) {
@@ -853,7 +865,15 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 		return;
 	}
 
-	cropOutput = obs_output_create(type, "crop_stream", nullptr, nullptr);
+	// Crop is single-layer and must not replace the main output in the
+	// process-wide degrade client.
+	OBSDataAutoRelease cropOutputSettings = obs_data_create();
+	obs_data_set_bool(cropOutputSettings, "ppcdn_degrade_enabled", false);
+	// The H5 crop is an auxiliary Edge-only stream. A second publisher NAT
+	// probe/signaling client races the main output's probe and can leave the
+	// main publisher connected without a valid probe (missing_publisher_probe).
+	obs_data_set_bool(cropOutputSettings, "ppcdn_p2p_enabled", false);
+	cropOutput = obs_output_create(type, "crop_stream", cropOutputSettings, nullptr);
 	if (!cropOutput) {
 		blog(LOG_WARNING, "[crop] failed to create the crop output");
 		StopCropOutput(true);

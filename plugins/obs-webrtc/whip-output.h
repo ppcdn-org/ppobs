@@ -146,6 +146,11 @@ private:
 	// Settings > Advanced > P2P. Forwarded by the frontend as the output
 	// setting "ppcdn_p2p_enabled"; defaults to true when absent.
 	bool p2pEnabled = true;
+	// The crop publish is a second WHIP output, while the degrade client is
+	// process-wide and owns one output slot. Disable degrade registration on
+	// crop so its single-layer target cannot force the main simulcast output
+	// to stop/restart when the main path reports its full layer count.
+	bool degradeEnabled = true;
 	// The single video encoder whose packets feed the P2P peers. P2P
 	// announces one H264 m-line per peer (P2PSignalClient::CreatePeerVideo),
 	// so Data() must forward exactly one layer: layers[0], i.e. rid "0" /
