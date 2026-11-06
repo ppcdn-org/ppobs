@@ -38,8 +38,10 @@ target_sources(
     temporal-denoise-filter.c
     beauty-filter.c
     big-head-filter.c
-    face-track.c
-    face-track.h
+    face-detect.c
+    face-detect.h
+    face-ort.c
+    face-ort.h
     background-mask.c
     background-mask.h
     background-segmentation-filter.c
@@ -110,10 +112,10 @@ if(ENABLE_TEST_INPUT)
   add_test(NAME background-fade COMMAND background-fade-test)
   set_target_properties(background-fade-test PROPERTIES FOLDER tests)
 
-  add_executable(face-track-test face-track.c face-track-test.c)
-  target_link_libraries(face-track-test PRIVATE OBS::libobs)
-  add_test(NAME face-track COMMAND face-track-test)
-  set_target_properties(face-track-test PROPERTIES FOLDER tests)
+  add_executable(face-detect-test face-detect.c face-detect-test.c)
+  target_link_libraries(face-detect-test PRIVATE OBS::libobs)
+  add_test(NAME face-detect COMMAND face-detect-test)
+  set_target_properties(face-detect-test PROPERTIES FOLDER tests)
 
   add_executable(matting-models-test matting-models.c matting-models-test.c)
   target_link_libraries(matting-models-test PRIVATE OBS::libobs)
@@ -124,6 +126,15 @@ if(ENABLE_TEST_INPUT)
   # when the runtime or the models are absent, so they are safe to register
   # unconditionally.
   if(TARGET OBS::onnxruntime)
+    add_executable(face-ort-e2e-test face-detect.c face-ort.c face-ort-e2e-test.c)
+    target_compile_definitions(
+      face-ort-e2e-test
+      PRIVATE FACE_SWAP_HAS_ORT=1 "FACE_MODEL_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/data/face-models\""
+    )
+    target_link_libraries(face-ort-e2e-test PRIVATE OBS::libobs OBS::onnxruntime)
+    add_test(NAME face-ort-e2e COMMAND face-ort-e2e-test)
+    set_target_properties(face-ort-e2e-test PROPERTIES FOLDER tests)
+
     add_executable(matting-e2e-test matting-ort.c matting-models.c matting-e2e-test.c)
     target_compile_definitions(matting-e2e-test PRIVATE FACE_SWAP_HAS_ORT=1)
     target_link_libraries(matting-e2e-test PRIVATE OBS::libobs OBS::onnxruntime)
@@ -141,7 +152,7 @@ if(ENABLE_TEST_INPUT)
     # Windows ships its own older onnxruntime.dll there, so these two would
     # find an API version they cannot use and skip themselves as "ONNX Runtime
     # unavailable" - reporting success while exercising nothing.
-    foreach(_ort_test matting-e2e-test matting-bench)
+    foreach(_ort_test face-ort-e2e-test matting-e2e-test matting-bench)
       add_custom_command(
         TARGET ${_ort_test}
         POST_BUILD
