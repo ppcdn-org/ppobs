@@ -30,9 +30,13 @@
 #define S_AUTO_TRACK "auto_track"
 #define S_DETECT_FPS "detect_fps"
 #define S_RADIUS_SCALE "radius_scale"
+#define S_FIXED_SIZE "fixed_size"
+#define S_FIXED_RADIUS "fixed_radius"
 #define S_OFFSET_X "offset_x"
 #define S_OFFSET_Y "offset_y"
 #define S_FEATHER "feather"
+#define S_BORDER_THICKNESS "border_thickness"
+#define S_BORDER_COLOR "border_color"
 #define S_MANUAL_CENTER_X "manual_center_x"
 #define S_MANUAL_CENTER_Y "manual_center_y"
 #define S_MANUAL_RADIUS "manual_radius"
@@ -44,9 +48,13 @@
 #define TEXT_AUTO_TRACK obs_module_text("BigHeadFilter.AutoTrack")
 #define TEXT_DETECT_FPS obs_module_text("BigHeadFilter.DetectFps")
 #define TEXT_RADIUS_SCALE obs_module_text("BigHeadFilter.RadiusScale")
+#define TEXT_FIXED_SIZE obs_module_text("BigHeadFilter.FixedSize")
+#define TEXT_FIXED_RADIUS obs_module_text("BigHeadFilter.FixedRadius")
 #define TEXT_OFFSET_X obs_module_text("BigHeadFilter.OffsetX")
 #define TEXT_OFFSET_Y obs_module_text("BigHeadFilter.OffsetY")
 #define TEXT_FEATHER obs_module_text("BigHeadFilter.Feather")
+#define TEXT_BORDER_THICKNESS obs_module_text("BigHeadFilter.BorderThickness")
+#define TEXT_BORDER_COLOR obs_module_text("BigHeadFilter.BorderColor")
 #define TEXT_MANUAL_CENTER_X obs_module_text("BigHeadFilter.ManualCenterX")
 #define TEXT_MANUAL_CENTER_Y obs_module_text("BigHeadFilter.ManualCenterY")
 #define TEXT_MANUAL_RADIUS obs_module_text("BigHeadFilter.ManualRadius")
@@ -118,9 +126,13 @@ struct big_head_data {
 	bool auto_track;
 	int detect_fps;
 	double radius_scale;
+	bool fixed_size;
+	double fixed_radius;
 	double offset_x;
 	double offset_y;
 	double feather;
+	int border_thickness;
+	struct vec4 border_color;
 	double manual_center_x;
 	double manual_center_y;
 	double manual_radius;
@@ -280,9 +292,13 @@ static void big_head_update(void *data, obs_data_t *settings)
 	filter->auto_track = obs_data_get_bool(settings, S_AUTO_TRACK);
 	filter->detect_fps = (int)obs_data_get_int(settings, S_DETECT_FPS);
 	filter->radius_scale = obs_data_get_double(settings, S_RADIUS_SCALE);
+	filter->fixed_size = obs_data_get_bool(settings, S_FIXED_SIZE);
+	filter->fixed_radius = obs_data_get_double(settings, S_FIXED_RADIUS);
 	filter->offset_x = obs_data_get_double(settings, S_OFFSET_X);
 	filter->offset_y = obs_data_get_double(settings, S_OFFSET_Y);
 	filter->feather = obs_data_get_double(settings, S_FEATHER);
+	filter->border_thickness = (int)obs_data_get_int(settings, S_BORDER_THICKNESS);
+	vec4_from_rgba_srgb(&filter->border_color, (uint32_t)obs_data_get_int(settings, S_BORDER_COLOR));
 	filter->manual_center_x = obs_data_get_double(settings, S_MANUAL_CENTER_X);
 	filter->manual_center_y = obs_data_get_double(settings, S_MANUAL_CENTER_Y);
 	filter->manual_radius = obs_data_get_double(settings, S_MANUAL_RADIUS);
@@ -808,9 +824,13 @@ static void big_head_render(void *data, gs_effect_t *effect)
 	bool auto_track;
 	int detect_fps;
 	double radius_scale;
+	bool fixed_size;
+	double fixed_radius;
 	double offset_x;
 	double offset_y;
 	double feather;
+	int border_thickness;
+	struct vec4 border_color;
 	double manual_center_x;
 	double manual_center_y;
 	double manual_radius;
@@ -820,9 +840,13 @@ static void big_head_render(void *data, gs_effect_t *effect)
 	auto_track = filter->auto_track;
 	detect_fps = filter->detect_fps;
 	radius_scale = filter->radius_scale;
+	fixed_size = filter->fixed_size;
+	fixed_radius = filter->fixed_radius;
 	offset_x = filter->offset_x;
 	offset_y = filter->offset_y;
 	feather = filter->feather;
+	border_thickness = filter->border_thickness;
+	border_color = filter->border_color;
 	manual_center_x = filter->manual_center_x;
 	manual_center_y = filter->manual_center_y;
 	manual_radius = filter->manual_radius;
@@ -865,6 +889,9 @@ static void big_head_render(void *data, gs_effect_t *effect)
 
 		if (head_circle_from_face(&filter->current.face, source_width, source_height, (float)radius_scale,
 					  (float)offset_x, (float)offset_y, &target_center, &target_radius)) {
+			if (fixed_size)
+				target_radius = (float)fixed_radius;
+
 			if (!filter->smooth_valid) {
 				filter->smooth_center = target_center;
 				filter->smooth_radius = target_radius;
@@ -886,6 +913,11 @@ static void big_head_render(void *data, gs_effect_t *effect)
 				}
 			}
 
+			/* A fixed radius snaps exactly to the selected size while the
+			 * centre keeps the normal tracking smoothing. */
+			if (fixed_size)
+				filter->smooth_radius = target_radius;
+
 			center = filter->smooth_center;
 			radius = filter->smooth_radius;
 			use_target = true;
@@ -896,7 +928,7 @@ static void big_head_render(void *data, gs_effect_t *effect)
 		filter->smooth_valid = false;
 		center.x = (float)manual_center_x;
 		center.y = (float)manual_center_y;
-		radius = (float)manual_radius;
+		radius = fixed_size ? (float)fixed_radius : (float)manual_radius;
 	}
 
 	if (radius < 0.01f)
@@ -911,6 +943,10 @@ static void big_head_render(void *data, gs_effect_t *effect)
 	gs_effect_set_float(gs_effect_get_param_by_name(filter->effect, "circle_radius"), radius);
 	gs_effect_set_float(gs_effect_get_param_by_name(filter->effect, "aspect"), aspect);
 	gs_effect_set_float(gs_effect_get_param_by_name(filter->effect, "feather"), (float)feather);
+	gs_effect_set_float(gs_effect_get_param_by_name(filter->effect, "border_width"),
+			    (float)border_thickness / source_height);
+	gs_effect_set_float(gs_effect_get_param_by_name(filter->effect, "border_aa"), 1.0f / source_height);
+	gs_effect_set_vec4(gs_effect_get_param_by_name(filter->effect, "border_color"), &border_color);
 	gs_effect_set_float(gs_effect_get_param_by_name(filter->effect, "show_mask"), show_mask ? 1.0f : 0.0f);
 
 	obs_source_process_filter_end(filter->context, filter->effect, 0, 0);
@@ -989,9 +1025,13 @@ static obs_properties_t *big_head_properties(void *data)
 
 	obs_properties_add_float_slider(props, S_SIMILARITY, TEXT_SIMILARITY, 0.10, 0.90, 0.01);
 	obs_properties_add_float_slider(props, S_RADIUS_SCALE, TEXT_RADIUS_SCALE, 0.4, 1.6, 0.01);
+	obs_properties_add_bool(props, S_FIXED_SIZE, TEXT_FIXED_SIZE);
+	obs_properties_add_float_slider(props, S_FIXED_RADIUS, TEXT_FIXED_RADIUS, 0.02, 0.75, 0.01);
 	obs_properties_add_float_slider(props, S_OFFSET_X, TEXT_OFFSET_X, -0.5, 0.5, 0.01);
 	obs_properties_add_float_slider(props, S_OFFSET_Y, TEXT_OFFSET_Y, -0.5, 0.5, 0.01);
 	obs_properties_add_float_slider(props, S_FEATHER, TEXT_FEATHER, 0.0, 0.2, 0.005);
+	obs_properties_add_int_slider(props, S_BORDER_THICKNESS, TEXT_BORDER_THICKNESS, 0, 64, 1);
+	obs_properties_add_color_alpha(props, S_BORDER_COLOR, TEXT_BORDER_COLOR);
 
 	obs_properties_add_text(props, "reference_info", TEXT_REFERENCE_INFO, OBS_TEXT_INFO);
 
@@ -1020,9 +1060,13 @@ static void big_head_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, S_DETECT_FPS, 15);
 	obs_data_set_default_double(settings, S_SIMILARITY, 0.36);
 	obs_data_set_default_double(settings, S_RADIUS_SCALE, 1.0);
+	obs_data_set_default_bool(settings, S_FIXED_SIZE, false);
+	obs_data_set_default_double(settings, S_FIXED_RADIUS, 0.25);
 	obs_data_set_default_double(settings, S_OFFSET_X, 0.0);
 	obs_data_set_default_double(settings, S_OFFSET_Y, 0.0);
 	obs_data_set_default_double(settings, S_FEATHER, 0.02);
+	obs_data_set_default_int(settings, S_BORDER_THICKNESS, 4);
+	obs_data_set_default_int(settings, S_BORDER_COLOR, 0xFFFFFFFF);
 	obs_data_set_default_double(settings, S_MANUAL_CENTER_X, 0.5);
 	obs_data_set_default_double(settings, S_MANUAL_CENTER_Y, 0.35);
 	obs_data_set_default_double(settings, S_MANUAL_RADIUS, 0.25);
