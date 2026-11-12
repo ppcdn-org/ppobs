@@ -17,6 +17,10 @@ P2PSignalMessage ParseP2PSignalMessage(const std::string &json)
 	const char *reason = obs_data_get_string(msg, "reason");
 	if (sdp) parsed.sdp = sdp;
 	if (reason) parsed.reason = reason;
+	if (obs_data_has_user_value(msg, "layer")) {
+		parsed.layer = (int)obs_data_get_int(msg, "layer");
+		parsed.hasLayer = true;
+	}
 
 	obs_data_t *candidateObj = obs_data_get_obj(msg, "candidate");
 	if (candidateObj) {

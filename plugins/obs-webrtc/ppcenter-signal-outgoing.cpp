@@ -54,3 +54,40 @@ std::string BuildP2PCloseJSON(const std::string &sessionId, const std::string &r
 	obs_data_release(msg);
 	return json;
 }
+
+std::string BuildP2PLayersJSON(const std::string &sessionId, const std::vector<P2PLayerInfo> &layers)
+{
+	obs_data_t *msg = obs_data_create();
+	obs_data_array_t *arr = obs_data_array_create();
+	obs_data_set_int(msg, "v", 1);
+	obs_data_set_string(msg, "type", "layers");
+	obs_data_set_string(msg, "sessionId", sessionId.c_str());
+	for (const auto &layer : layers) {
+		obs_data_t *item = obs_data_create();
+		obs_data_set_int(item, "id", layer.id);
+		obs_data_set_string(item, "type", "video");
+		obs_data_set_int(item, "width", layer.width);
+		obs_data_set_int(item, "height", layer.height);
+		obs_data_set_int(item, "bitrate", layer.bitrate);
+		obs_data_set_string(item, "label", layer.label.c_str());
+		obs_data_array_push_back(arr, item);
+		obs_data_release(item);
+	}
+	obs_data_set_array(msg, "layers", arr);
+	obs_data_array_release(arr);
+	std::string json = obs_data_get_json(msg);
+	obs_data_release(msg);
+	return json;
+}
+
+std::string BuildP2PLayerSwitchedJSON(const std::string &sessionId, int layer)
+{
+	obs_data_t *msg = obs_data_create();
+	obs_data_set_int(msg, "v", 1);
+	obs_data_set_string(msg, "type", "layer_switched");
+	obs_data_set_string(msg, "sessionId", sessionId.c_str());
+	obs_data_set_int(msg, "layer", layer);
+	std::string json = obs_data_get_json(msg);
+	obs_data_release(msg);
+	return json;
+}

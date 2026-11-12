@@ -278,82 +278,88 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 		else if (hevcSession && hevcSession->OwnsVideoEncoder(packet->encoder))
 			hevcSession->SendVideo(packet);
 
-		// P2P carries exactly one video layer (PLY-009; CreatePeerVideo
-		// announces a single H264 m-line), so only that layer's encoder
-		// may feed it. Forwarding every layer here interleaved three
-		// resolutions' NAL units into one SSRC/sequence-number stream,
-		// which no decoder can make sense of.
-		if (p2pSignal) {
-			if (packet->encoder == p2pVideoEncoder) {
-				const auto annexB = h264PacketToAnnexB((const uint8_t *)packet->data, packet->size);
-				const uint8_t *videoData = annexB.empty() ? (const uint8_t *)packet->data : annexB.data();
-				const size_t videoSize = annexB.empty() ? packet->size : annexB.size();
-				const auto parameterSets = extractH264ParameterSets(videoData, videoSize);
-				if (!parameterSets.annexB.empty())
-					p2pH264ParameterSets = parameterSets.annexB;
-				// The RTMP/ERTMP primary encoder's first packet has its
-				// SPS/PPS stripped into obs_encoder_get_extra_data()
-				// (libobs' obs_extract_avc_headers), and repeat_headers is
-				// false for non-WHIP services, so no packet ever carries
-				// them. A P2P viewer joining mid-stream then gets RTP but
-				// no decodable frame. Pull them from the encoder's own
-				// extra data once it is available (after the first packet).
-				if (p2pH264ParameterSets.empty() && packet->keyframe) {
-					uint8_t *extraData = nullptr;
-					size_t extraSize = 0;
-					if (obs_encoder_get_extra_data(p2pVideoEncoder, &extraData, &extraSize) &&
-					    extraData && extraSize) {
-						auto fromExtra = extractH264ParameterSetsAny(extraData, extraSize);
-						if (!fromExtra.empty()) {
-							p2pH264ParameterSets = std::move(fromExtra);
-							blog(LOG_INFO,
-							     "[obs-webrtc] [p2p] cached SPS/PPS from encoder extra data (%zu bytes)",
-							     p2pH264ParameterSets.size());
+		// P2P announces one H264 m-line per peer, but each peer may select
+		// any of the Simulcast layers independently. Only the selected
+		// layer's encoder may feed a peer: mixing layers into one
+		// SSRC/sequence-number stream produces an undecodable bitstream.
+		if (p2pSignal &&
+		    std::find(p2pVideoEncoders.begin(), p2pVideoEncoders.end(), packet->encoder) !=
+			    p2pVideoEncoders.end()) {
+			const auto annexB = h264PacketToAnnexB((const uint8_t *)packet->data, packet->size);
+			const uint8_t *videoData = annexB.empty() ? (const uint8_t *)packet->data : annexB.data();
+			const size_t videoSize = annexB.empty() ? packet->size : annexB.size();
+			const auto parameterSets = extractH264ParameterSets(videoData, videoSize);
+
+			p2pSignal->ForEachPeer([&](P2PPeer &peer) {
+				if (!peer.videoTrack || !peer.videoTrack->isOpen())
+					return;
+				const int layer = peer.layerIndex.load();
+				if (layer < 0 || layer >= (int)p2pVideoEncoders.size())
+					return;
+				obs_encoder_t *selected = p2pVideoEncoders[layer];
+				if (packet->encoder != selected)
+					return;
+
+				// Start this peer's feed (or the newly selected layer) on a
+				// keyframe - see P2PPeer::videoStarted.
+				const bool firstForLayer = !peer.videoStarted.load();
+				if (firstForLayer && !packet->keyframe)
+					return;
+
+				// Keep the selected layer's SPS/PPS ready. The RTMP/ERTMP
+				// encoder's first packet has them stripped into
+				// obs_encoder_get_extra_data(), and repeat_headers is false
+				// for non-WHIP services, so a keyframe may carry none. Pull
+				// them from the encoder's own extra data when needed.
+				if (packet->keyframe) {
+					if (!parameterSets.annexB.empty()) {
+						peer.videoParameterSets = parameterSets.annexB;
+					} else if (firstForLayer || peer.videoParameterSets.empty()) {
+						uint8_t *extraData = nullptr;
+						size_t extraSize = 0;
+						if (obs_encoder_get_extra_data(selected, &extraData, &extraSize) &&
+						    extraData && extraSize) {
+							auto fromExtra = extractH264ParameterSetsAny(extraData, extraSize);
+							if (!fromExtra.empty()) {
+								peer.videoParameterSets = std::move(fromExtra);
+								blog(LOG_INFO,
+								     "[obs-webrtc] [p2p] cached SPS/PPS for layer %d from encoder extra data (%zu bytes)",
+								     layer, peer.videoParameterSets.size());
+							}
 						}
 					}
 				}
-				p2pSignal->ForEachPeer([&](P2PPeer &peer) {
-					if (!peer.videoTrack || !peer.videoTrack->isOpen())
-						return;
-					// Start this peer's feed on a keyframe - see P2PPeer::videoStarted.
-					if (!peer.videoStarted && !packet->keyframe)
-						return;
-					int64_t dur = peer.videoStarted ? packet->dts_usec - peer.lastVideoTimestamp : 0;
-					peer.lastVideoTimestamp = packet->dts_usec;
-					peer.videoStarted = true;
-					std::vector<rtc::byte> sample;
-					// A forced NVENC IDR does not repeat SPS/PPS. The peer joins
-					// mid-stream, so without the cached parameter sets Chrome sees
-					// plenty of H264 RTP but cannot bind/initialize a decoder
-					// (codec=null, framesDecoded=0).
-					if (packet->keyframe && parameterSets.annexB.empty() &&
-					    !p2pH264ParameterSets.empty()) {
-						sample.reserve(p2pH264ParameterSets.size() + videoSize);
-						const auto *begin = reinterpret_cast<const rtc::byte *>(p2pH264ParameterSets.data());
-						sample.insert(sample.end(), begin, begin + p2pH264ParameterSets.size());
-					}
-					sample.insert(sample.end(), (rtc::byte *)videoData,
-						      (rtc::byte *)videoData + videoSize);
-					auto rtp = peer.videoSrReporter->rtpConfig;
-					rtp->sequenceNumber = peer.videoSequenceNumber;
-					rtp->ssrc = peer.videoSsrc;
-					// P2P carries one video layer and the generated answer does not
-					// advertise an RID RTP header extension. Setting rid here while
-					// ridId remains zero makes the media packetization disagree with
-					// the SDP (Chrome connects and receives the track but never
-					// assembles a decodable frame). WHIP simulcast sets both rid and
-					// ridId after negotiating the extmap; single-layer P2P needs
-					// neither.
-					rtp->rid.reset();
-					rtp->timestamp = advanceRtpTimestamp(rtp, peer.videoRtpTimestamp, dur);
-					try {
-						peer.videoTrack->send(sample);
-					} catch (...) {
-					}
-					peer.videoSequenceNumber = rtp->sequenceNumber;
-					peer.videoRtpTimestamp = rtp->timestamp;
-				});
-			}
+
+				int64_t dur = peer.videoStarted.load() ? packet->dts_usec - peer.lastVideoTimestamp : 0;
+				peer.lastVideoTimestamp = packet->dts_usec;
+				peer.videoStarted.store(true);
+
+				std::vector<rtc::byte> sample;
+				if (packet->keyframe && parameterSets.annexB.empty() &&
+				    !peer.videoParameterSets.empty()) {
+					sample.reserve(peer.videoParameterSets.size() + videoSize);
+					const auto *begin = reinterpret_cast<const rtc::byte *>(peer.videoParameterSets.data());
+					sample.insert(sample.end(), begin, begin + peer.videoParameterSets.size());
+				}
+				sample.insert(sample.end(), (rtc::byte *)videoData,
+					      (rtc::byte *)videoData + videoSize);
+				auto rtp = peer.videoSrReporter->rtpConfig;
+				rtp->sequenceNumber = peer.videoSequenceNumber;
+				rtp->ssrc = peer.videoSsrc;
+				// The generated answer does not advertise an RID RTP header
+				// extension. Setting rid while ridId remains zero makes the
+				// media packetization disagree with the SDP (Chrome connects
+				// and receives the track but never assembles a decodable
+				// frame). Single-layer P2P needs neither.
+				rtp->rid.reset();
+				rtp->timestamp = advanceRtpTimestamp(rtp, peer.videoRtpTimestamp, dur);
+				try {
+					peer.videoTrack->send(sample);
+				} catch (...) {
+				}
+				peer.videoSequenceNumber = rtp->sequenceNumber;
+				peer.videoRtpTimestamp = rtp->timestamp;
+			});
 		}
 	}
 }
@@ -806,10 +812,10 @@ bool WHIPOutput::Setup(uint64_t generation)
 
 	// Resolved before the p2p_only early return below: a P2P-only output
 	// never reaches the WHIP layer setup, but its Data() still has to know
-	// which single layer may feed the peers (see p2pVideoEncoder).
+	// which layers may feed the peers.
 	{
-		const auto p2pLayers = collectVideoLayers(output, "h264");
-		p2pVideoEncoder = p2pLayers.empty() ? nullptr : p2pLayers.front();
+		p2pVideoEncoders = collectVideoLayers(output, "h264");
+		p2pVideoEncoder = p2pVideoEncoders.empty() ? nullptr : p2pVideoEncoders.front();
 		if (!p2pVideoEncoder && !p2pSignalUrl.empty())
 			do_log(LOG_WARNING, "no H264 layer attached - P2P peers will get audio only");
 	}
@@ -877,7 +883,8 @@ bool WHIPOutput::Setup(uint64_t generation)
 		if (keep >= 1 && keep < (int)h264Layers.size())
 			h264Layers.erase(h264Layers.begin(), h264Layers.end() - keep);
 	}
-	p2pVideoEncoder = h264Layers.empty() ? nullptr : h264Layers.front();
+	p2pVideoEncoders = h264Layers;
+	p2pVideoEncoder = p2pVideoEncoders.empty() ? nullptr : p2pVideoEncoders.front();
 #endif
 
 	// H264 always publishes on its codec-tagged track (".../h264/whip"),
@@ -1184,20 +1191,79 @@ bool WHIPOutput::StartP2PSignal()
 	// only starts on a keyframe (see P2PPeer::videoStarted), and a viewer that
 	// sees no frame within its grace window falls back to edge. Force one at
 	// connect time instead of waiting for the encoder's scheduled GOP.
-	p2pSignal->SetOnPeerConnected([this]() {
+	p2pSignal->SetOnPeerConnected([this](const std::string &sessionId) {
 		if (p2pVideoEncoder)
 			obs_encoder_request_keyframe(p2pVideoEncoder);
+		SendP2PLayers(sessionId);
 	});
 	// A P2P viewer's own PLI/FIR (join, loss beyond the NACK window, decoder
-	// reset) must reach the encoder just like an edge viewer's PLI does via
-	// the WHIP path's RtcpLossTracker. Otherwise it waits up to a full GOP.
-	p2pSignal->SetOnKeyFrameRequest([this]() {
-		if (p2pVideoEncoder)
-			obs_encoder_request_keyframe(p2pVideoEncoder);
+	// reset) must reach the selected layer's encoder just like an edge
+	// viewer's PLI does via the WHIP path's RtcpLossTracker.
+	p2pSignal->SetOnKeyFrameRequest([this](const std::string &sessionId) {
+		obs_encoder_t *encoder = p2pVideoEncoder;
+		if (p2pSignal) {
+			p2pSignal->ForEachPeer([&](P2PPeer &peer) {
+				if (peer.sessionId != sessionId)
+					return;
+				const int layer = peer.layerIndex.load();
+				if (layer >= 0 && layer < (int)p2pVideoEncoders.size())
+					encoder = p2pVideoEncoders[layer];
+			});
+		}
+		if (encoder)
+			obs_encoder_request_keyframe(encoder);
+	});
+	// The viewer's quality menu sends select_layer through the signaling
+	// channel; switch this peer to that Simulcast layer.
+	p2pSignal->SetOnSelectLayer([this](const std::string &sessionId, int layer) {
+		SelectP2PLayer(sessionId, layer);
 	});
 	p2pSignal->Start();
 	qosPolicy = std::make_unique<UplinkQosPolicy>(UplinkQosConfig{});
 	return true;
+}
+
+void WHIPOutput::SendP2PLayers(const std::string &sessionId)
+{
+	if (!p2pSignal)
+		return;
+
+	std::vector<P2PLayerInfo> layers;
+	layers.reserve(p2pVideoEncoders.size());
+	for (size_t i = 0; i < p2pVideoEncoders.size(); i++) {
+		obs_encoder_t *encoder = p2pVideoEncoders[i];
+		if (!encoder)
+			continue;
+
+		P2PLayerInfo info;
+		info.id = (int)i;
+		info.width = (int)obs_encoder_get_width(encoder);
+		info.height = (int)obs_encoder_get_height(encoder);
+		OBSDataAutoRelease settings = obs_encoder_get_settings(encoder);
+		int bitrateKbps = settings ? (int)obs_data_get_int(settings, "bitrate") : 0;
+		info.bitrate = bitrateKbps > 0 ? bitrateKbps * 1000 : 1;
+		info.label = info.height > 0 ? std::to_string(info.height) + "p" : "Layer " + std::to_string(i);
+		layers.push_back(std::move(info));
+	}
+
+	p2pSignal->SendLayers(sessionId, layers);
+}
+
+void WHIPOutput::SelectP2PLayer(const std::string &sessionId, int layer)
+{
+	if (!p2pSignal || layer < 0 || layer >= (int)p2pVideoEncoders.size())
+		return;
+	if (!p2pSignal->SetPeerLayer(sessionId, layer, (int)p2pVideoEncoders.size()))
+		return;
+
+	obs_encoder_t *encoder = p2pVideoEncoders[layer];
+	if (encoder)
+		obs_encoder_request_keyframe(encoder);
+	p2pSignal->SendLayerSwitched(sessionId, layer);
+
+	const int width = encoder ? (int)obs_encoder_get_width(encoder) : 0;
+	const int height = encoder ? (int)obs_encoder_get_height(encoder) : 0;
+	do_log(LOG_INFO, "P2P peer %s selected layer %d (%dx%d)", sessionId.c_str(), layer, width, height);
 }
 
 void WHIPOutput::CheckUplinkQos()

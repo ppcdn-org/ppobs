@@ -9,6 +9,8 @@ struct P2PSignalMessage {
 	std::string candidate;
 	std::string sdpMid;
 	std::string reason;
+	int layer = 0;
+	bool hasLayer = false;
 	bool valid = false;
 };
 

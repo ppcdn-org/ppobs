@@ -76,6 +76,8 @@ private:
 	// output. See WHIPCodecSession::Callbacks::onPermanentFailure.
 	void OnSessionPermanentFailure(const std::string &codecLabel, const std::string &reason);
 	bool StartP2PSignal();
+	void SelectP2PLayer(const std::string &sessionId, int layer);
+	void SendP2PLayers(const std::string &sessionId);
 	void CheckUplinkQos();
 	// Keeps ppcenter's publisher-side NAT observation from going stale over
 	// a long stream - see CheckNatProbeRefresh()'s own comment.
@@ -151,20 +153,15 @@ private:
 	// crop so its single-layer target cannot force the main simulcast output
 	// to stop/restart when the main path reports its full layer count.
 	bool degradeEnabled = true;
-	// The single video encoder whose packets feed the P2P peers. P2P
-	// announces one H264 m-line per peer (P2PSignalClient::CreatePeerVideo),
-	// so Data() must forward exactly one layer: layers[0], i.e. rid "0" /
-	// highest quality, the same layer the WHIP path labels rid "0". Null
-	// when no H264 layer is attached, in which case P2P carries no video at
-	// all rather than an undecodable mix of layers.
+	// H264 Simulcast layers available to P2P, highest quality first. P2P
+	// announces one H264 m-line per peer, and each peer picks one of these
+	// layers; Data() forwards only the selected layer's encoder packets.
+	// Empty when no H264 layer is attached, in which case P2P carries no
+	// video at all rather than an undecodable mix of layers.
+	std::vector<obs_encoder_t *> p2pVideoEncoders;
+	// Highest-quality layer, the default for a newly connected peer and the
+	// keyframe target when no per-peer layer is known.
 	obs_encoder_t *p2pVideoEncoder = nullptr;
-	// A forced IDR (requested when a P2P viewer connects) usually does not
-	// repeat SPS/PPS, and non-WHIP services leave repeat_headers off, so no
-	// packet may carry them at all: libobs strips the first packet's
-	// SPS/PPS into obs_encoder_get_extra_data(). Cache the Annex-B
-	// parameter-set NALs from either source and prepend them to a peer's
-	// keyframe so a mid-stream browser can initialize its decoder.
-	std::vector<uint8_t> p2pH264ParameterSets;
 
 	// The resolved per-codec WHIP endpoints Setup() got from ppcenter,
 	// reused by StartThread() to derive each codec's degrade control
