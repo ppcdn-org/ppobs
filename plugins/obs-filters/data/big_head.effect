@@ -20,6 +20,7 @@ uniform float feather = 0.02;
 uniform float border_width = 0.0;
 uniform float border_aa = 0.001;
 uniform float4 border_color = {1.0, 1.0, 1.0, 1.0};
+uniform float output_strength = 1.0;
 uniform float show_mask = 0.0;
 
 sampler_state textureSampler {
@@ -69,7 +70,9 @@ float4 PSCircle(VertDataOut v_in) : TARGET
 			 rgba.rgb * source_alpha * (1.0 - border_alpha)) / max(alpha, 0.000001);
 	float4 masked = float4(colour, alpha);
 	float4 debug = float4(edge, edge, edge, 1.0);
-	return lerp(masked, debug, show_mask);
+	float4 result = lerp(masked, debug, show_mask);
+	result.a *= output_strength;
+	return result;
 }
 
 technique Draw

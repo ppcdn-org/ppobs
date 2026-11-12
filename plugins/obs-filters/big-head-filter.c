@@ -149,6 +149,7 @@ struct big_head_data {
 	/* Graphics-thread copy of the published target. */
 	struct big_head_target current;
 	uint64_t uploaded_serial;
+	bool target_present;
 	struct vec2 smooth_center;
 	float smooth_radius;
 	bool smooth_valid;
@@ -857,9 +858,7 @@ static void big_head_render(void *data, gs_effect_t *effect)
 
 	if (pthread_mutex_trylock(&filter->mutex) == 0) {
 		if (filter->published.serial != filter->uploaded_serial) {
-			/* Keep the last valid target while the worker reports
-			 * "no face"; its timestamp drives the timeout that
-			 * eventually falls back to the manual circle. */
+			filter->target_present = filter->published.valid;
 			if (filter->published.valid)
 				filter->current = filter->published;
 			filter->uploaded_serial = filter->published.serial;
@@ -881,9 +880,10 @@ static void big_head_render(void *data, gs_effect_t *effect)
 	struct vec2 center;
 	float radius;
 	bool use_target = false;
+	bool output_visible = !auto_track;
 
-	if (auto_track && filter->current.valid && filter->current.timestamp && now >= filter->current.timestamp &&
-	    now - filter->current.timestamp <= BIG_HEAD_TARGET_TIMEOUT_NS) {
+	if (auto_track && filter->target_present && filter->current.valid && filter->current.timestamp &&
+	    now >= filter->current.timestamp && now - filter->current.timestamp <= BIG_HEAD_TARGET_TIMEOUT_NS) {
 		struct vec2 target_center;
 		float target_radius;
 
@@ -921,6 +921,7 @@ static void big_head_render(void *data, gs_effect_t *effect)
 			center = filter->smooth_center;
 			radius = filter->smooth_radius;
 			use_target = true;
+			output_visible = true;
 		}
 	}
 
@@ -947,6 +948,8 @@ static void big_head_render(void *data, gs_effect_t *effect)
 			    (float)border_thickness / source_height);
 	gs_effect_set_float(gs_effect_get_param_by_name(filter->effect, "border_aa"), 1.0f / source_height);
 	gs_effect_set_vec4(gs_effect_get_param_by_name(filter->effect, "border_color"), &border_color);
+	gs_effect_set_float(gs_effect_get_param_by_name(filter->effect, "output_strength"),
+			    output_visible ? 1.0f : 0.0f);
 	gs_effect_set_float(gs_effect_get_param_by_name(filter->effect, "show_mask"), show_mask ? 1.0f : 0.0f);
 
 	obs_source_process_filter_end(filter->context, filter->effect, 0, 0);
