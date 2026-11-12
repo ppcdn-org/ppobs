@@ -255,6 +255,24 @@ static void OBSCompanionStopStreaming(void *data, calldata_t *params)
 		obs_output_stop(output->streamOutput);
 }
 
+// OBSCropStopStreaming fires when the optional crop publish stops on its own
+// (most commonly an SRT/RTMP connection failure). Clean it up on the main
+// thread; otherwise the failed output stays attached and StopCropOutput can
+// force-stop a half-started output, hanging the user's Stop action.
+static void OBSCropStopStreaming(void *data, calldata_t *params)
+{
+	BasicOutputHandler *output = static_cast<BasicOutputHandler *>(data);
+	if (output->cropStopping)
+		return;
+
+	const char *last_error = calldata_string(params, "last_error");
+	blog(LOG_WARNING, "[crop] crop publish stopped (%s); cleaning up",
+	     (last_error && *last_error) ? last_error : "no error given");
+
+	QMetaObject::invokeMethod(
+		output->main, [output]() { output->StopCropOutput(true); }, Qt::QueuedConnection);
+}
+
 // BuildCodecServiceSettings copies a service's settings and points the
 // publish URL at that codec's own path, which is the only thing that differs
 // between the two connections of a multitrack publish.
@@ -811,6 +829,29 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 		return;
 	}
 
+	// The crop stream is a separate PPCenter stream ("<name>-h5"), so it
+	// needs its own SRT publish token bound to that exact path. Copying the
+	// primary service's token makes the Origin reject the connection with
+	// "publish token authentication failure".
+	std::string endpointError;
+	if (!ResolvePPCDNPublishEndpoint(cropService, endpointError)) {
+		blog(LOG_WARNING, "[crop] failed to resolve the PPCenter publish endpoint: %s",
+		     endpointError.empty() ? "unknown error" : endpointError.c_str());
+		StopCropOutput(true);
+		return;
+	}
+
+	// Crop is always H264 and its URL ends in /h264, so it must use the
+	// h264-specific token rather than the codec-less one.
+	OBSDataAutoRelease cropResolved = obs_service_get_settings(cropService);
+	if (cropResolved) {
+		const char *h264Token = obs_data_get_string(cropResolved, "ppcdn_publish_token_h264");
+		if (h264Token && *h264Token) {
+			obs_data_set_string(cropResolved, "ppcdn_publish_token", h264Token);
+			obs_service_update(cropService, cropResolved);
+		}
+	}
+
 	const char *mainEncoderId = obs_encoder_get_id(videoEncoder);
 	const std::string h264EncoderId = ResolveWHIPH264EncoderId(mainEncoderId ? mainEncoderId : "");
 	OBSDataAutoRelease mainSettings = obs_encoder_get_settings(videoEncoder);
@@ -892,6 +933,8 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 		maxRetries = 0;
 	obs_output_set_reconnect_settings(cropOutput, maxRetries, retryDelay);
 
+	cropStopStreaming.Connect(obs_output_get_signal_handler(cropOutput), "stop", OBSCropStopStreaming, this);
+
 	if (!obs_output_start(cropOutput)) {
 		const char *error = obs_output_get_last_error(cropOutput);
 		blog(LOG_WARNING, "[crop] failed to start the crop publish (%s); main publish continues",
@@ -911,6 +954,9 @@ void BasicOutputHandler::StopCropOutput(bool force)
 	if (!cropOutput && !cropCanvas && !cropVideoEncoder && !cropService)
 		return;
 
+	cropStopping = true;
+	cropStopStreaming.Disconnect();
+
 	// Always force-stop: the output is about to be released, and its stop
 	// path must have finished before the video/encoder it references goes
 	// away (same reasoning as StopP2PCompanion).
@@ -924,6 +970,8 @@ void BasicOutputHandler::StopCropOutput(bool force)
 		obs_canvas_set_channel(cropCanvas, 0, nullptr);
 	cropCanvas = nullptr;
 	cropScene = nullptr;
+
+	cropStopping = false;
 }
 
 BasicOutputHandler::~BasicOutputHandler()

@@ -366,11 +366,19 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	if (!streamAudioEnc)
 		throw "Failed to create streaming audio encoder "
 		      "(advanced output)";
+	const char *streamAudioCodec = obs_encoder_get_codec(streamAudioEnc);
 	obs_encoder_release(streamAudioEnc);
 
-	if (config_get_bool(main->Config(), "Output", "DualAudioAACOpus") &&
-	    strcmp(streamAudioEncoder, "opus") == 0 &&
-	    config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes") == 0) {
+	/* The streaming audio encoder is usually "ffmpeg_opus", not "opus", so
+	 * match on the codec instead of the encoder id. Dual audio replaces the
+	 * multi-track audio layout, so only enable it when the user selected a
+	 * single streaming audio mix (the default). */
+	const int multiTrackAudioMixes = config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes");
+	const bool singleStreamAudioMix =
+		multiTrackAudioMixes != 0 && (multiTrackAudioMixes & (multiTrackAudioMixes - 1)) == 0;
+
+	if (config_get_bool(main->Config(), "Output", "DualAudioAACOpus") && streamAudioCodec &&
+	    strcmp(streamAudioCodec, "opus") == 0 && singleStreamAudioMix) {
 		const char *aac_id = GetSimpleAACEncoderForBitrate(128);
 		if (aac_id) {
 			streamAudioAACEnc = obs_audio_encoder_create(aac_id, "adv_stream_audio_aac", nullptr,

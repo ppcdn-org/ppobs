@@ -279,8 +279,9 @@ SimpleOutput::SimpleOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	if (!success)
 		throw "Failed to create audio streaming encoder (simple output)";
 
-	if (config_get_bool(main->Config(), "Output", "DualAudioAACOpus") &&
-	    strcmp(audio_encoder, "opus") == 0) {
+	const char *streamAudioCodec = obs_encoder_get_codec(audioStreaming);
+	if (config_get_bool(main->Config(), "Output", "DualAudioAACOpus") && streamAudioCodec &&
+	    strcmp(streamAudioCodec, "opus") == 0) {
 		if (!CreateSimpleAACEncoder(audioStreamingAAC, 128, "simple_aac_dual", 0)) {
 			blog(LOG_WARNING, "Dual audio is enabled but no AAC encoder is available; "
 					  "falling back to Opus only");

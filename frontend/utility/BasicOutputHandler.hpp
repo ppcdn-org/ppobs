@@ -88,6 +88,8 @@ struct BasicOutputHandler {
 	OBSEncoderAutoRelease cropVideoEncoder;
 	OBSCanvasAutoRelease cropCanvas;
 	OBSSceneAutoRelease cropScene;
+	OBSSignal cropStopStreaming;
+	bool cropStopping = false;
 
 	// Creates and starts the crop publish, if enabled in Settings > Video.
 	// Best-effort: a crop failure is logged but never blocks or stops the
