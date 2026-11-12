@@ -129,6 +129,8 @@ std::string BuildEncoderReportJson(const std::string &app_id, const std::string 
 
 		if (!config.audio_codec.empty())
 			encoder["audioCodec"] = config.audio_codec;
+		if (!config.audio_codecs.empty())
+			encoder["audioCodecs"] = config.audio_codecs;
 		if (config.audio_bitrate_kbps > 0)
 			encoder["audioBitrateKbps"] = config.audio_bitrate_kbps;
 		if (config.audio_sample_rate > 0)

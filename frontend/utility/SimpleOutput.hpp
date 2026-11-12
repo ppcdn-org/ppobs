@@ -4,6 +4,9 @@
 
 struct SimpleOutput : BasicOutputHandler {
 	OBSEncoder audioStreaming;
+	// Created only when Output.DualAudioAACOpus is on; publishes the same
+	// audio mix as audioStreaming but encoded as AAC.
+	OBSEncoder audioStreamingAAC;
 	OBSEncoder videoStreaming;
 	OBSEncoder audioRecording;
 	OBSEncoder audioArchive;

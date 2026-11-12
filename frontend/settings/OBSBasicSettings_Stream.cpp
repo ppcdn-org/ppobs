@@ -217,6 +217,20 @@ void OBSBasicSettings::LoadStream1Settings()
 
 	loading = true;
 
+	/* Created programmatically so the .ui file and generated ui_ header do
+	 * not need to be regenerated just for this checkbox. It lives in the
+	 * WHIP/ppcenter group box, next to the HEVC/H264 multitrack option. */
+	if (!dualAudioAACOpusCheckbox) {
+		dualAudioAACOpusCheckbox = new QCheckBox(QTStr("Basic.Settings.Stream.DualAudioAACOpus"),
+							 ui->whipSimulcastGroupBox);
+		dualAudioAACOpusCheckbox->setToolTip(
+			QTStr("Basic.Settings.Stream.DualAudioAACOpusTooltip"));
+		if (auto *layout = qobject_cast<QBoxLayout *>(ui->whipSimulcastGroupBox->layout()))
+			layout->addWidget(dualAudioAACOpusCheckbox);
+		HookWidget(dualAudioAACOpusCheckbox.data(), &QCheckBox::toggled,
+			   &OBSBasicSettings::Stream1Changed);
+	}
+
 	OBSDataAutoRelease settings = obs_service_get_settings(service_obj);
 
 	const char *service = obs_data_get_string(settings, "service");
@@ -438,6 +452,9 @@ void OBSBasicSettings::LoadStream1Settings()
 	ui->globalEnhanceEnable->setChecked(config_get_bool(main->Config(), "Stream1", "GlobalEnhance"));
 	ui->whipSimulcastTotalLayers->setValue(whipSimulcastTotalLayers);
 	ui->whipHevcH264Multitrack->setChecked(whipHevcH264Multitrack);
+	if (dualAudioAACOpusCheckbox)
+		dualAudioAACOpusCheckbox->setChecked(
+			config_get_bool(main->Config(), "Output", "DualAudioAACOpus"));
 	RebuildWHIPSimulcastLayerRows();
 	LoadWHIPHevcBitrateControls();
 
@@ -619,6 +636,9 @@ void OBSBasicSettings::SaveStream1Settings()
 	// whether to publish a second HEVC WHIP session alongside H264.
 	auto oldWHIPHevcH264Multitrack = config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
 	SaveCheckBox(ui->whipHevcH264Multitrack, "Stream1", "WHIPHevcH264Multitrack");
+
+	if (dualAudioAACOpusCheckbox)
+		SaveCheckBox(dualAudioAACOpusCheckbox, "Output", "DualAudioAACOpus");
 
 	// Main HEVC bitrate: auto means "50% of the H264 main", so only a
 	// manual value is persisted and only a manual/auto toggle counts as

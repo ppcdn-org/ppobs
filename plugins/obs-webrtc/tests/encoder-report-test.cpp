@@ -41,6 +41,7 @@ int main()
 	config.simulcast_layers.push_back(ObsEncoderLayer{"f", 1920, 1080, 30, 6000});
 	config.simulcast_layers.push_back(ObsEncoderLayer{"h", 1280, 720, 30, 3000});
 	config.audio_codec = "opus";
+	config.audio_codecs = {"opus", "aac"};
 	config.audio_bitrate_kbps = 128;
 	config.audio_sample_rate = 48000;
 	config.audio_channels = 2;
@@ -68,6 +69,8 @@ int main()
 	Require(encoder["simulcastLayers"][0].value("rid", "") == "f", "layer rid should be included");
 	Require(encoder["simulcastLayers"][1].value("bitrateKbps", 0) == 3000, "layer bitrate should be included");
 	Require(encoder.value("audioCodec", "") == "opus", "audio codec should be included");
+	Require(encoder["audioCodecs"] == nlohmann::json::array({"opus", "aac"}),
+		"audio codec set should be included");
 	Require(encoder.value("audioSampleRate", 0) == 48000, "audio sample rate should be included");
 
 	// A minimal config must omit empty/zero fields rather than sending them.

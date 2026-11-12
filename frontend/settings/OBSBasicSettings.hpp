@@ -22,6 +22,7 @@
 
 #include <utility/FFmpegShared.hpp>
 
+#include <QCheckBox>
 #include <QPointer>
 #include <QTimeEdit>
 
@@ -99,6 +100,7 @@ private:
 
 	QPointer<QLabel> advOutRecWarning;
 	QPointer<QLabel> simpleOutRecWarning;
+	QPointer<QCheckBox> dualAudioAACOpusCheckbox;
 
 	QString curPreset;
 	QString curQSVPreset;

@@ -4,6 +4,9 @@
 
 struct AdvancedOutput : BasicOutputHandler {
 	OBSEncoder streamAudioEnc;
+	// Created only when Output.DualAudioAACOpus is on; publishes the same
+	// streaming mix as streamAudioEnc but encoded as AAC.
+	OBSEncoder streamAudioAACEnc;
 	OBSEncoder streamArchiveEnc;
 	OBSEncoder streamTrack[MAX_AUDIO_MIXES];
 	OBSEncoder recordTrack[MAX_AUDIO_MIXES];

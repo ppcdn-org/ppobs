@@ -38,6 +38,23 @@ bool multitrackEnabled(obs_output_t *output)
 	return enabled;
 }
 
+// dualAudioEnabled reports whether the output has an AAC audio encoder in
+// addition to the primary Opus one. The frontend creates both encoders when
+// the dual-audio publish option is on; WHIPOutput only needs to mirror that
+// state into the SDP.
+bool dualAudioEnabled(obs_output_t *output)
+{
+	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
+		obs_encoder_t *encoder = obs_output_get_audio_encoder(output, i);
+		if (!encoder)
+			continue;
+		const char *codec = obs_encoder_get_codec(encoder);
+		if (codec && strcmp(codec, "aac") == 0)
+			return true;
+	}
+	return false;
+}
+
 } // namespace
 
 WHIPOutput::WHIPOutput(obs_data_t *, obs_output_t *output_, bool p2pOnly) : output(output_), p2p_only(p2pOnly)
@@ -218,15 +235,20 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 	CheckNatProbeRefresh();
 
 	if (packet->type == OBS_ENCODER_AUDIO) {
-		// Shared Opus output: both codec sessions send the same
-		// encoded audio packet on their own independent RTP state -
-		// see the design doc's §4.1 "音频不复制编码结果".
+		// Shared audio output: both codec sessions send the same encoded
+		// packet on their own independent RTP state. SendAudio() routes
+		// Opus and AAC to their own tracks.
 		if (h264Session)
 			h264Session->SendAudio(packet);
 		if (hevcSession)
 			hevcSession->SendAudio(packet);
 
-		if (p2pSignal) {
+		// P2P only ever carries Opus (CreatePeerAudio announces one Opus
+		// m-line); feeding an AAC packet into that track would corrupt it.
+		const char *audio_codec = packet->encoder ? obs_encoder_get_codec(packet->encoder) : nullptr;
+		const bool audio_is_aac = audio_codec && strcmp(audio_codec, "aac") == 0;
+
+		if (p2pSignal && !audio_is_aac) {
 			p2pSignal->ForEachPeer([&](P2PPeer &peer) {
 				if (!peer.audioTrack || !peer.audioTrack->isOpen())
 					return;
@@ -581,14 +603,23 @@ ObsEncoderConfig buildEncoderConfig(obs_output_t *output, const std::vector<obs_
 			config.simulcast_layers.push_back(encoderToLayer(h264_layers[i], i));
 	}
 
-	if (obs_encoder_t *audio = obs_output_get_audio_encoder(output, 0)) {
+	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
+		obs_encoder_t *audio = obs_output_get_audio_encoder(output, i);
+		if (!audio)
+			break;
+
 		const char *codec = obs_encoder_get_codec(audio);
-		config.audio_codec = codec ? codec : "";
-		obs_data_t *settings = obs_encoder_get_settings(audio);
-		config.audio_bitrate_kbps = encoderBitrateKbps(settings);
-		if (settings)
-			obs_data_release(settings);
-		config.audio_sample_rate = (int)obs_encoder_get_sample_rate(audio);
+		if (codec)
+			config.audio_codecs.push_back(codec);
+
+		if (i == 0) {
+			config.audio_codec = codec ? codec : "";
+			obs_data_t *settings = obs_encoder_get_settings(audio);
+			config.audio_bitrate_kbps = encoderBitrateKbps(settings);
+			if (settings)
+				obs_data_release(settings);
+			config.audio_sample_rate = (int)obs_encoder_get_sample_rate(audio);
+		}
 	}
 	return config;
 }
@@ -931,6 +962,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 	h264Cfg.endpoint_url = h264Url;
 	h264Cfg.bearer_token = h264Token;
 	h264Cfg.has_audio = true;
+	h264Cfg.has_aac = dualAudioEnabled(output);
 	h264Cfg.enable_pacing = enable_pacing;
 	h264Cfg.disconnect_grace_sec = disconnect_grace_sec;
 	h264Cfg.reconnect_backoff_sec = reconnect_backoff_sec;
@@ -1343,7 +1375,7 @@ void register_whip_output()
 {
 	const uint32_t base_flags = OBS_OUTPUT_ENCODED | OBS_OUTPUT_SERVICE | OBS_OUTPUT_MULTI_TRACK_AV;
 
-	const char *audio_codecs = "opus";
+	const char *audio_codecs = "opus;aac";
 #ifdef ENABLE_HEVC
 	const char *video_codecs = "h264;hevc;av1";
 #else

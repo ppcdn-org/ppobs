@@ -10,6 +10,27 @@
 
 using namespace std;
 
+// SetStreamingAudioEncoders installs the single-audio Opus track or the
+// dual-audio Opus+AAC pair. Enhanced RTMP's legacy audio framing only fits
+// AAC in slot 0; WHIP and MPEG-TS keep Opus first.
+static void SetStreamingAudioEncoders(obs_output_t *output, OBSEncoder &opus, OBSEncoder &aac,
+				      const char *outputType)
+{
+	if (!aac) {
+		obs_output_set_audio_encoder(output, opus, 0);
+		return;
+	}
+
+	const bool aacFirst = outputType && strcmp(outputType, "rtmp_output") == 0;
+	if (aacFirst) {
+		obs_output_set_audio_encoder(output, aac, 0);
+		obs_output_set_audio_encoder(output, opus, 1);
+	} else {
+		obs_output_set_audio_encoder(output, opus, 0);
+		obs_output_set_audio_encoder(output, aac, 1);
+	}
+}
+
 static bool CreateSimpleAACEncoder(OBSEncoder &res, int bitrate, const char *name, size_t idx)
 {
 	const char *id_ = GetSimpleAACEncoderForBitrate(bitrate);
@@ -258,6 +279,15 @@ SimpleOutput::SimpleOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	if (!success)
 		throw "Failed to create audio streaming encoder (simple output)";
 
+	if (config_get_bool(main->Config(), "Output", "DualAudioAACOpus") &&
+	    strcmp(audio_encoder, "opus") == 0) {
+		if (!CreateSimpleAACEncoder(audioStreamingAAC, 128, "simple_aac_dual", 0)) {
+			blog(LOG_WARNING, "Dual audio is enabled but no AAC encoder is available; "
+					  "falling back to Opus only");
+			audioStreamingAAC = nullptr;
+		}
+	}
+
 	if (strcmp(audio_encoder, "opus") == 0)
 		success = CreateSimpleOpusEncoder(audioArchive, GetAudioBitrate(), SIMPLE_ARCHIVE_NAME, 1);
 	else
@@ -430,6 +460,8 @@ void SimpleOutput::Update()
 	obs_encoder_update(videoStreaming, videoSettings);
 	EnforceNoBFrames(videoStreaming);
 	obs_encoder_update(audioStreaming, audioSettings);
+	if (audioStreamingAAC)
+		obs_encoder_update(audioStreamingAAC, audioSettings);
 	obs_encoder_update(audioArchive, audioSettings);
 
 	if (whipSimulcastEncoders != nullptr) {
@@ -640,6 +672,8 @@ inline void SimpleOutput::SetupOutputs()
 	if (whipHevcEncoders != nullptr)
 		whipHevcEncoders->SetVideo();
 	obs_encoder_set_audio(audioStreaming, obs_get_audio());
+	if (audioStreamingAAC)
+		obs_encoder_set_audio(audioStreamingAAC, obs_get_audio());
 	obs_encoder_set_audio(audioArchive, obs_get_audio());
 	int tracks = config_get_int(main->Config(), "SimpleOutput", "RecTracks");
 	const char *recFormat = config_get_string(main->Config(), "SimpleOutput", "RecFormat2");
@@ -734,7 +768,8 @@ std::shared_future<void> SimpleOutput::SetupStreaming(obs_service_t *service, Se
 			if (whipHevcEncoders != nullptr && whipHevcEncoders->HasMainEncoder()) {
 				if (hevcStreamOutput) {
 					whipHevcEncoders->SetStreamOutput(hevcStreamOutput, 0);
-					obs_output_set_audio_encoder(hevcStreamOutput, audioStreaming, 0);
+					SetStreamingAudioEncoders(hevcStreamOutput, audioStreaming,
+								  audioStreamingAAC, type.c_str());
 				} else {
 					// See AdvancedOutput.cpp's identical comment: this has to be
 					// how many slots H264's ladder actually filled, not
@@ -763,7 +798,8 @@ std::shared_future<void> SimpleOutput::SetupStreaming(obs_service_t *service, Se
 				else
 					blog(LOG_ERROR, "WHIP: no encoder slot left for the H264 base track");
 			}
-			obs_output_set_audio_encoder(streamOutput, audioStreaming, 0);
+			SetStreamingAudioEncoders(streamOutput, audioStreaming, audioStreamingAAC,
+						  type.c_str());
 			obs_output_set_service(streamOutput, PrimaryPublishService(service));
 			return true;
 		};
@@ -792,6 +828,11 @@ bool SimpleOutput::IsVodTrackEnabled(obs_service_t *service)
 
 void SimpleOutput::SetupVodTrack(obs_service_t *service)
 {
+	/* Slot 1 is the AAC track of a dual-audio publish; a VOD/archive track
+	 * would overwrite it. Dual audio and VOD track are mutually exclusive. */
+	if (audioStreamingAAC)
+		return;
+
 	if (IsVodTrackEnabled(service))
 		obs_output_set_audio_encoder(streamOutput, audioArchive, 1);
 	else

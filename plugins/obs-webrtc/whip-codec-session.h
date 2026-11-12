@@ -89,6 +89,10 @@ public:
 		std::string endpoint_url;
 		std::string bearer_token;
 		bool has_audio = true;
+		// has_aac adds a second audio m-line carrying AAC (dual-audio
+		// publish). Opus remains the first audio track for WHEP playback;
+		// mmx forwards both over WHIP.
+		bool has_aac = false;
 		bool enable_pacing = false;
 		int disconnect_grace_sec = 5;
 		int reconnect_backoff_sec = 3;
@@ -177,6 +181,7 @@ private:
 	bool ReconnectOnce(const char *disconnectReason);
 
 	void ConfigureAudioTrack(const std::string &media_stream_id, const std::string &cname);
+	void ConfigureAACTrack(const std::string &media_stream_id, const std::string &cname);
 	void ConfigureVideoTrack(const std::string &media_stream_id, const std::string &cname);
 	bool DoConnect(uint64_t generation, std::string &resourceURL);
 	void TeardownGeneration(uint64_t generation, const std::string &resourceURL, const char *reason, bool wasConnected);
@@ -220,8 +225,10 @@ private:
 	uint32_t base_ssrc;
 	std::shared_ptr<rtc::PeerConnection> peer_connection;
 	std::shared_ptr<rtc::Track> audio_track;
+	std::shared_ptr<rtc::Track> aac_track;
 	std::shared_ptr<rtc::Track> video_track;
 	std::shared_ptr<rtc::RtcpSrReporter> audio_sr_reporter;
+	std::shared_ptr<rtc::RtcpSrReporter> aac_sr_reporter;
 	std::shared_ptr<rtc::RtcpSrReporter> video_sr_reporter;
 	std::shared_ptr<RtcpLossTracker> video_loss_tracker;
 	struct publish_loss_monitor loss_monitor;
@@ -233,6 +240,7 @@ private:
 	std::atomic<int> connect_time_ms{0};
 	int64_t start_time_ns = 0;
 	int64_t last_audio_timestamp = 0;
+	int64_t last_aac_timestamp = 0;
 
 	std::atomic<int> reconnect_attempt{0};
 	// Set by DoConnect() when the server rejected the offer outright

@@ -213,7 +213,9 @@ static bool create_audio_stream(struct ffmpeg_output *stream, struct ffmpeg_data
 	AVCodecContext *context;
 	AVStream *avstream;
 	struct obs_audio_info aoi;
-	const char *name = data->config.audio_encoder;
+	const char *name = data->config.audio_encoders[idx];
+	if (!name || !*name)
+		name = data->config.audio_encoder;
 	int channels;
 
 	const AVCodecDescriptor *codec = avcodec_descriptor_get_by_name(name);
@@ -227,7 +229,7 @@ static bool create_audio_stream(struct ffmpeg_output *stream, struct ffmpeg_data
 		return false;
 	}
 
-	if (!new_stream(data, &avstream, data->config.audio_encoder))
+	if (!new_stream(data, &avstream, name))
 		return false;
 
 	context = avcodec_alloc_context3(NULL);
@@ -243,7 +245,8 @@ static bool create_audio_stream(struct ffmpeg_output *stream, struct ffmpeg_data
 		context->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_4POINT1;
 
 	context->sample_fmt = AV_SAMPLE_FMT_S16;
-	context->frame_size = data->config.frame_size;
+	context->frame_size = data->config.frame_sizes[idx] > 0 ? data->config.frame_sizes[idx]
+								  : data->config.frame_size;
 
 	avstream->time_base = context->time_base;
 
@@ -1239,12 +1242,24 @@ static bool setup_audio_settings(struct ffmpeg_output *stream, struct ffmpeg_cfg
 
 	config->audio_mix_count = num_tracks;
 
-	/* b) set audio codec & id from audio encoder */
-	config->audio_encoder = obs_encoder_get_codec(aencoders[0]);
-	if (strcmp(config->audio_encoder, "aac") == 0)
-		config->audio_encoder_id = AV_CODEC_ID_AAC;
-	else if (strcmp(config->audio_encoder, "opus") == 0)
-		config->audio_encoder_id = AV_CODEC_ID_OPUS;
+	/* b) set audio codec & id per output slot. Dual-audio MPEG-TS puts
+	 * Opus in slot 0 and AAC in slot 1; encoder_packet.track_idx matches
+	 * that slot (libobs' get_encoder_index), so each elementary stream
+	 * needs its own codec. */
+	for (int idx = 0; idx < num_tracks; idx++) {
+		const char *name = obs_encoder_get_codec(aencoders[idx]);
+		config->audio_encoders[idx] = name;
+
+		if (name && strcmp(name, "aac") == 0)
+			config->audio_encoder_ids[idx] = AV_CODEC_ID_AAC;
+		else if (name && strcmp(name, "opus") == 0)
+			config->audio_encoder_ids[idx] = AV_CODEC_ID_OPUS;
+
+		if (idx == 0) {
+			config->audio_encoder = name;
+			config->audio_encoder_id = config->audio_encoder_ids[idx];
+		}
+	}
 
 	/* c) get audio bitrate from the audio encoder. */
 	for (int idx = 0; idx < num_tracks; idx++) {
@@ -1253,8 +1268,11 @@ static bool setup_audio_settings(struct ffmpeg_output *stream, struct ffmpeg_cfg
 		obs_data_release(settings);
 	}
 
-	/* d) set audio frame size  */
-	config->frame_size = (int)obs_encoder_get_frame_size(aencoders[0]);
+	/* d) set audio frame size per slot (AAC 1024 vs Opus 960 at 48 kHz). */
+	for (int idx = 0; idx < num_tracks; idx++) {
+		config->frame_sizes[idx] = (int)obs_encoder_get_frame_size(aencoders[idx]);
+	}
+	config->frame_size = config->frame_sizes[0];
 	return true;
 }
 

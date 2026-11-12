@@ -11,6 +11,27 @@
 
 using namespace std;
 
+// SetStreamingAudioEncoders installs the single-audio Opus track or the
+// dual-audio Opus+AAC pair. Enhanced RTMP's legacy audio framing only fits
+// AAC in slot 0; WHIP and MPEG-TS keep Opus first.
+static void SetStreamingAudioEncoders(obs_output_t *output, OBSEncoder &opus, OBSEncoder &aac,
+				      const char *outputType)
+{
+	if (!aac) {
+		obs_output_set_audio_encoder(output, opus, 0);
+		return;
+	}
+
+	const bool aacFirst = outputType && strcmp(outputType, "rtmp_output") == 0;
+	if (aacFirst) {
+		obs_output_set_audio_encoder(output, aac, 0);
+		obs_output_set_audio_encoder(output, opus, 1);
+	} else {
+		obs_output_set_audio_encoder(output, opus, 0);
+		obs_output_set_audio_encoder(output, aac, 1);
+	}
+}
+
 static OBSData GetDataFromJsonFile(const char *jsonFile)
 {
 	const OBSBasic *basic = OBSBasic::Get();
@@ -346,6 +367,21 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		throw "Failed to create streaming audio encoder "
 		      "(advanced output)";
 	obs_encoder_release(streamAudioEnc);
+
+	if (config_get_bool(main->Config(), "Output", "DualAudioAACOpus") &&
+	    strcmp(streamAudioEncoder, "opus") == 0 &&
+	    config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes") == 0) {
+		const char *aac_id = GetSimpleAACEncoderForBitrate(128);
+		if (aac_id) {
+			streamAudioAACEnc = obs_audio_encoder_create(aac_id, "adv_stream_audio_aac", nullptr,
+								    streamTrackIndex, nullptr);
+			if (streamAudioAACEnc)
+				obs_encoder_release(streamAudioAACEnc);
+		}
+		if (!streamAudioAACEnc)
+			blog(LOG_WARNING, "Dual audio is enabled but no AAC encoder is available; "
+					  "falling back to Opus only");
+	}
 
 	id = "";
 	int vodTrack = config_get_int(main->Config(), "AdvOut", "VodTrackIndex") - 1;
@@ -752,6 +788,8 @@ inline void AdvancedOutput::UpdateAudioSettings()
 
 			if (track == streamTrackIndex)
 				obs_encoder_update(streamAudioEnc, settings[i]);
+			if (streamAudioAACEnc && track == streamTrackIndex)
+				obs_encoder_update(streamAudioAACEnc, settings[i]);
 			if (track == vodTrackIndex)
 				obs_encoder_update(streamArchiveEnc, settings[i]);
 		} else {
@@ -776,6 +814,8 @@ void AdvancedOutput::SetupOutputs()
 		obs_encoder_set_audio(recordTrack[i], obs_get_audio());
 	}
 	obs_encoder_set_audio(streamAudioEnc, obs_get_audio());
+	if (streamAudioAACEnc)
+		obs_encoder_set_audio(streamAudioAACEnc, obs_get_audio());
 	obs_encoder_set_audio(streamArchiveEnc, obs_get_audio());
 
 	SetupStreaming();
@@ -819,6 +859,10 @@ inline std::optional<size_t> AdvancedOutput::VodTrackMixerIdx(obs_service_t *ser
 
 inline void AdvancedOutput::SetupVodTrack(obs_service_t *service)
 {
+	/* Slot 1 is the AAC track of a dual-audio publish. */
+	if (streamAudioAACEnc)
+		return;
+
 	if (VodTrackMixerIdx(service).has_value())
 		obs_output_set_audio_encoder(streamOutput, streamArchiveEnc, 1);
 	else
@@ -916,7 +960,8 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 				// its own output/connection, starting at slot 0
 				// since it shares nothing with the H264 one.
 				whipHevcEncoders->SetStreamOutput(hevcStreamOutput, 0);
-				obs_output_set_audio_encoder(hevcStreamOutput, streamAudioEnc, 0);
+				SetStreamingAudioEncoders(hevcStreamOutput, streamAudioEnc,
+							  streamAudioAACEnc, type.c_str());
 			} else {
 				// HEVC's ladder starts right after H264's own slots (main +
 				// its Simulcast layers) - see collectVideoLayers() in
@@ -964,10 +1009,8 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 			else
 				blog(LOG_ERROR, "WHIP: no encoder slot left for the H264 base track");
 		}
-		obs_output_set_audio_encoder(streamOutput, streamAudioEnc, 0);
-
-		if (!is_multitrack_output) {
-			obs_output_set_audio_encoder(streamOutput, streamAudioEnc, 0);
+		if (!is_multitrack_output || streamAudioAACEnc) {
+			SetStreamingAudioEncoders(streamOutput, streamAudioEnc, streamAudioAACEnc, type.c_str());
 		} else {
 			int idx = 0;
 			for (int i = 0; i < MAX_AUDIO_MIXES; i++) {

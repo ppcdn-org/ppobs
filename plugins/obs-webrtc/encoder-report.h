@@ -34,6 +34,9 @@ struct ObsEncoderConfig {
 	bool multitrack = false;
 	std::vector<ObsEncoderLayer> simulcast_layers;
 	std::string audio_codec;
+	// All audio codecs in output slot order (e.g. {"opus","aac"} for a
+	// dual-audio WHIP/SRT publish, {"aac","opus"} for Enhanced RTMP).
+	std::vector<std::string> audio_codecs;
 	int audio_bitrate_kbps = 0;
 	int audio_sample_rate = 0;
 	int audio_channels = 0;
