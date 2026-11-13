@@ -642,6 +642,24 @@ bool BasicOutputHandler::CheckStreamLimits(std::string &error) const
 	return true;
 }
 
+void BasicOutputHandler::GetStreamingOutputSize(uint32_t &width, uint32_t &height) const
+{
+	width = 0;
+	height = 0;
+	if (main) {
+		width = (uint32_t)config_get_uint(main->Config(), "Video", "OutputCX");
+		height = (uint32_t)config_get_uint(main->Config(), "Video", "OutputCY");
+		if (width < 32 || height < 32) {
+			width = (uint32_t)config_get_uint(main->Config(), "Video", "BaseCX");
+			height = (uint32_t)config_get_uint(main->Config(), "Video", "BaseCY");
+		}
+	}
+	if (width < 32 || height < 32) {
+		width = video_output_get_width(obs_get_video());
+		height = video_output_get_height(obs_get_video());
+	}
+}
+
 // Bitrate for the crop publish: the main stream's bitrate scaled by the crop
 // region's share of the main output's pixel area and by the crop stream's
 // frame rate relative to the main output's frame rate.

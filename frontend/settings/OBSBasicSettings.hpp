@@ -100,7 +100,6 @@ private:
 
 	QPointer<QLabel> advOutRecWarning;
 	QPointer<QLabel> simpleOutRecWarning;
-	QPointer<QCheckBox> dualAudioAACOpusCheckbox;
 
 	QString curPreset;
 	QString curQSVPreset;

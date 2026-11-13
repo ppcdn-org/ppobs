@@ -111,6 +111,14 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	const char *recType = config_get_string(main->Config(), "AdvOut", "RecType");
 	const char *streamEncoder = config_get_string(main->Config(), "AdvOut", "Encoder");
 	const char *streamAudioEncoder = config_get_string(main->Config(), "AdvOut", "AudioEncoder");
+	// Streaming audio is fixed to the dual Opus+AAC combination; the settings
+	// picker has a single entry. Ignore a legacy AAC-only/other saved value so
+	// the transport always gets the Opus track it requires.
+	{
+		const char *codec = obs_get_encoder_codec(streamAudioEncoder);
+		if (!codec || strcmp(codec, "opus") != 0)
+			streamAudioEncoder = "ffmpeg_opus";
+	}
 	const char *recordEncoder = config_get_string(main->Config(), "AdvOut", "RecEncoder");
 	const char *recAudioEncoder = config_get_string(main->Config(), "AdvOut", "RecAudioEncoder");
 	const char *recFormat = config_get_string(main->Config(), "AdvOut", "RecFormat2");
@@ -238,6 +246,10 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		}
 	}
 
+	uint32_t streamingWidth = 0;
+	uint32_t streamingHeight = 0;
+	GetStreamingOutputSize(streamingWidth, streamingHeight);
+
 	if (whipSimulcastEncoders != nullptr) {
 		// The Simulcast ladder normally follows whatever codec the user
 		// picked as the stream encoder. With HEVC/H264 multitrack on,
@@ -259,8 +271,7 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		whipSimulcastEncoders->Create(simulcastEncoder.c_str(), simulcastSettings,
 					      config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 					      config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
-					      video_output_get_width(obs_get_video()),
-					      video_output_get_height(obs_get_video()), main->Config());
+					      streamingWidth, streamingHeight, main->Config());
 	}
 	if (whipHevcEncoders != nullptr) {
 		std::string hevcEncoderId = ResolveWHIPHevcEncoderId(streamEncoder);
@@ -321,8 +332,7 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 			whipHevcEncoders->Create(hevcEncoderId, hevcBaseSettings, h264MainBitrate,
 						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
-						 video_output_get_width(obs_get_video()),
-						 video_output_get_height(obs_get_video()), main->Config(),
+						 streamingWidth, streamingHeight, main->Config(),
 						 useExistingMain ? videoStreaming : nullptr);
 		}
 	}
@@ -369,16 +379,16 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	const char *streamAudioCodec = obs_encoder_get_codec(streamAudioEnc);
 	obs_encoder_release(streamAudioEnc);
 
-	/* The streaming audio encoder is usually "ffmpeg_opus", not "opus", so
-	 * match on the codec instead of the encoder id. Dual audio replaces the
-	 * multi-track audio layout, so only enable it when the user selected a
-	 * single streaming audio mix (the default). */
+	/* Streaming audio is always the ppobs dual-audio combination: Opus is the
+	 * primary track and AAC is published alongside it. The settings UI exposes
+	 * a single "ffmpeg opus + aac" entry, so the old DualAudioAACOpus toggle
+	 * is gone. Dual audio still replaces the multi-track audio layout and is
+	 * only valid for a single streaming audio mix. */
 	const int multiTrackAudioMixes = config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes");
 	const bool singleStreamAudioMix =
 		multiTrackAudioMixes != 0 && (multiTrackAudioMixes & (multiTrackAudioMixes - 1)) == 0;
 
-	if (config_get_bool(main->Config(), "Output", "DualAudioAACOpus") && streamAudioCodec &&
-	    strcmp(streamAudioCodec, "opus") == 0 && singleStreamAudioMix) {
+	if (streamAudioCodec && strcmp(streamAudioCodec, "opus") == 0 && singleStreamAudioMix) {
 		const char *aac_id = GetSimpleAACEncoderForBitrate(128);
 		if (aac_id) {
 			streamAudioAACEnc = obs_audio_encoder_create(aac_id, "adv_stream_audio_aac", nullptr,
@@ -1150,7 +1160,7 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 		return false;
 	}
 
-	// Strong-consistency start (design §4.1): the HEVC publish goes up
+	// Strong-consistency start (design 禮4.1): the HEVC publish goes up
 	// first, so a failure there costs nothing visible. If the H264 half
 	// then fails, the HEVC half is torn back down rather than left
 	// publishing a stream no H264 player can use.

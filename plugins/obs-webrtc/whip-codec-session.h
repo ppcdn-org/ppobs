@@ -188,7 +188,7 @@ private:
 	void SendDeleteResource(const std::string &resourceURL, uint64_t generation, const char *reason);
 	void ParseLinkHeader(std::string linkHeader, std::vector<rtc::IceServer> &iceServers);
 	void Send(const void *data, uintptr_t size, uint64_t duration, std::shared_ptr<rtc::Track> track,
-		  std::shared_ptr<rtc::RtcpSrReporter> rtcp_sr_reporter);
+		  std::shared_ptr<rtc::RtcpSrReporter> rtcp_sr_reporter, bool add_aac_au_header = false);
 	bool IsActiveGeneration(uint64_t generation) const;
 	// Sleeps (interruptibly, waking early on Stop()) for this attempt's
 	// linear backoff. Returns false if Stop() interrupted the wait.

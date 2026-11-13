@@ -99,6 +99,10 @@ void SimpleOutput::LoadStreamingPreset_Lossy(const char *encoderId)
 		throw "Failed to create video streaming encoder (simple output)";
 	obs_encoder_release(videoStreaming);
 
+	uint32_t streamingWidth = 0;
+	uint32_t streamingHeight = 0;
+	GetStreamingOutputSize(streamingWidth, streamingHeight);
+
 	if (whipSimulcastEncoders != nullptr) {
 		// See AdvancedOutput::CreateStreamingEncoders: with multitrack
 		// on, this ladder must stay H264 so the HEVC ladder built below
@@ -110,8 +114,7 @@ void SimpleOutput::LoadStreamingPreset_Lossy(const char *encoderId)
 		whipSimulcastEncoders->Create(simulcastEncoder.c_str(), nullptr,
 					      config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 					      config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
-					      video_output_get_width(obs_get_video()),
-					      video_output_get_height(obs_get_video()), main->Config());
+					      streamingWidth, streamingHeight, main->Config());
 	}
 	if (whipHevcEncoders != nullptr) {
 		std::string hevcEncoderId = ResolveWHIPHevcEncoderId(encoderId);
@@ -132,8 +135,7 @@ void SimpleOutput::LoadStreamingPreset_Lossy(const char *encoderId)
 			whipHevcEncoders->Create(hevcEncoderId, nullptr, 0,
 						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
-						 video_output_get_width(obs_get_video()),
-						 video_output_get_height(obs_get_video()), main->Config(),
+						 streamingWidth, streamingHeight, main->Config(),
 						 useExistingMain ? videoStreaming : nullptr);
 		}
 	}
@@ -280,8 +282,10 @@ SimpleOutput::SimpleOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		throw "Failed to create audio streaming encoder (simple output)";
 
 	const char *streamAudioCodec = obs_encoder_get_codec(audioStreaming);
-	if (config_get_bool(main->Config(), "Output", "DualAudioAACOpus") && streamAudioCodec &&
-	    strcmp(streamAudioCodec, "opus") == 0) {
+	// Streaming audio is always the dual Opus+AAC combination (the settings UI
+	// has a single "ffmpeg opus + aac" option), so attach AAC whenever Opus is
+	// the primary codec.
+	if (streamAudioCodec && strcmp(streamAudioCodec, "opus") == 0) {
 		if (!CreateSimpleAACEncoder(audioStreamingAAC, 128, "simple_aac_dual", 0)) {
 			blog(LOG_WARNING, "Dual audio is enabled but no AAC encoder is available; "
 					  "falling back to Opus only");

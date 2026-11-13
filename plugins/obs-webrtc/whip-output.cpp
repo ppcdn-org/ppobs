@@ -461,7 +461,7 @@ static std::vector<obs_encoder_t *> collectVideoLayers(obs_output_t *output, con
 	for (uint32_t idx = 0; idx < MAX_OUTPUT_VIDEO_ENCODERS; idx++) {
 		auto encoder = obs_output_get_video_encoder2(output, idx);
 		if (!encoder)
-			break;
+			continue;
 		const char *codec = obs_encoder_get_codec(encoder);
 		if (codec && strcmp(codec, wantCodec) == 0)
 			layers.push_back(encoder);
@@ -612,7 +612,7 @@ ObsEncoderConfig buildEncoderConfig(obs_output_t *output, const std::vector<obs_
 	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
 		obs_encoder_t *audio = obs_output_get_audio_encoder(output, i);
 		if (!audio)
-			break;
+			continue;
 
 		const char *codec = obs_encoder_get_codec(audio);
 		if (codec)

@@ -103,6 +103,12 @@ struct BasicOutputHandler {
 	// resolution/FPS/bitrate caps as WHIP.
 	bool CheckStreamLimits(std::string &error) const;
 
+	// Target resolution for the streaming encoders. Read from the Video config
+	// (OutputCX/OutputCY) instead of the live video context so a settings
+	// change immediately followed by Start Streaming cannot size the
+	// Simulcast/HEVC ladders from the previous resolution.
+	void GetStreamingOutputSize(uint32_t &width, uint32_t &height) const;
+
 	// P2P companion output (ppcenter_p2p_output): started alongside a non-WHIP
 	// (e.g. SRT) primary publish so that publish can still join the P2P mesh -
 	// a WHIP publish runs P2P inside its own whip_output and needs none of

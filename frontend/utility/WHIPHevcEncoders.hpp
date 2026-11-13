@@ -219,6 +219,12 @@ public:
 				videoSettings ? obs_data_create_from_json(obs_data_get_json(videoSettings)) : nullptr;
 			if (mainSettings && hevcMainBitrate > 0)
 				obs_data_set_int(mainSettings, "bitrate", hevcMainBitrate);
+			// See WHIPSimulcastEncoders::Create: this ladder is created
+			// outside the WHIP service, so it must opt in to repeated
+			// parameter sets itself or late-joining viewers get no
+			// VPS/SPS/PPS and cannot decode H265.
+			if (mainSettings)
+				obs_data_set_bool(mainSettings, "repeat_headers", true);
 			mainEncoder =
 				obs_video_encoder_create(hevcEncoderId.c_str(), "whip_hevc_main", mainSettings, nullptr);
 			if (!mainEncoder) {
@@ -274,6 +280,7 @@ public:
 			OBSDataAutoRelease layerSettings;
 			if (videoSettings) {
 				layerSettings = obs_data_create_from_json(obs_data_get_json(videoSettings));
+				obs_data_set_bool(layerSettings, "repeat_headers", true);
 
 				// The H264 layer at this slot is what the HEVC layer
 				// must be measured against: a custom H264 layer
