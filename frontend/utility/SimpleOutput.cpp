@@ -879,6 +879,13 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 		return false;
 	}
 
+	// HEVC-only WHIP publish (HEVC encoder with multitrack off) has no H264
+	// layer, so P2P (H264-only) cannot be offered.
+	const char *streamCodec = videoStreaming ? obs_encoder_get_codec(videoStreaming) : nullptr;
+	const bool hevcOnly = strcmp(obs_service_get_id(service), "whip_custom") == 0 && streamCodec &&
+			      strcmp(streamCodec, "hevc") == 0 &&
+			      !config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
+
 	OBSDataAutoRelease settings = obs_data_create();
 	obs_data_set_string(settings, "bind_ip", bindIP);
 	obs_data_set_string(settings, "ip_family", ipFamily);
@@ -891,7 +898,7 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 	// signaling inside the WHIP output, and the SRT/RTMP companion reads it
 	// via P2PStreamingEnabled() before starting. Must be forwarded here so a
 	// change in Settings > Advanced applies on the next stream start.
-	obs_data_set_bool(settings, "ppcdn_p2p_enabled", P2PStreamingEnabled());
+	obs_data_set_bool(settings, "ppcdn_p2p_enabled", P2PStreamingEnabled() && !hevcOnly);
 	obs_data_set_int(settings, "ppcdn_p2p_max_sessions", P2PStreamingMaxSessions());
 	// WHIPOutput::multitrackEnabled() reads this output-private setting
 	// (see whip-output.cpp), not Stream1.WHIPHevcH264Multitrack directly -

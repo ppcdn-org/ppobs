@@ -258,12 +258,15 @@ void OBSBasic::DrawQualityScoreLabel()
 		return;
 
 	const float score = qualityScoreValue.load();
-	if (fabsf(score - qualityScoreShown) >= 0.05f) {
+	if (fabsf(score - qualityScoreShown) >= 0.05f || qualityLayersText != qualityLayersShown) {
 		QString text = qualityScoreFormat.arg((double)score, 0, 'f', 1);
+		if (!qualityLayersText.isEmpty())
+			text += "\n" + qualityLayersText;
 		OBSDataAutoRelease settings = obs_source_get_settings(qualityScoreLabel);
 		obs_data_set_string(settings, "text", QT_TO_UTF8(text));
 		obs_source_update(qualityScoreLabel, settings);
 		qualityScoreShown = score;
+		qualityLayersShown = qualityLayersText;
 	}
 
 	const uint32_t labelCX = obs_source_get_width(qualityScoreLabel);

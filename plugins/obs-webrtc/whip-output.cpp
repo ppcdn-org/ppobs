@@ -596,17 +596,27 @@ ObsEncoderConfig buildEncoderConfig(obs_output_t *output, const std::vector<obs_
 	ObsEncoderConfig config;
 	config.protocol = "whip";
 	config.multitrack = multitrack;
-	config.video_codec = "h264";
-	config.video_codecs.push_back("h264");
-	if (multitrack && !hevc_layers.empty())
-		config.video_codecs.push_back("hevc");
 
-	if (!h264_layers.empty()) {
-		// The primary (highest) H264 layer is the source feed's own
-		// resolution/fps/bitrate; lower layers are its scaled ladder.
-		fillVideoFromEncoder(config, h264_layers[0]);
-		for (size_t i = 0; i < h264_layers.size(); ++i)
-			config.simulcast_layers.push_back(encoderToLayer(h264_layers[i], i));
+	if (h264_layers.empty() && !hevc_layers.empty()) {
+		// HEVC-only publish: the HEVC ladder is the primary feed.
+		config.video_codec = "hevc";
+		config.video_codecs.push_back("hevc");
+		fillVideoFromEncoder(config, hevc_layers[0]);
+		for (size_t i = 0; i < hevc_layers.size(); ++i)
+			config.simulcast_layers.push_back(encoderToLayer(hevc_layers[i], i));
+	} else {
+		config.video_codec = "h264";
+		config.video_codecs.push_back("h264");
+		if (multitrack && !hevc_layers.empty())
+			config.video_codecs.push_back("hevc");
+
+		if (!h264_layers.empty()) {
+			// The primary (highest) H264 layer is the source feed's own
+			// resolution/fps/bitrate; lower layers are its scaled ladder.
+			fillVideoFromEncoder(config, h264_layers[0]);
+			for (size_t i = 0; i < h264_layers.size(); ++i)
+				config.simulcast_layers.push_back(encoderToLayer(h264_layers[i], i));
+		}
 	}
 
 	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
@@ -683,6 +693,21 @@ bool WHIPOutput::Setup(uint64_t generation)
 	// up and connected below.
 	const bool wantMultitrack = multitrackEnabled(output);
 
+	// An HEVC-only publish is what the frontend builds when the user selects
+	// an HEVC video encoder and leaves HEVC/H264 multitrack off: the HEVC
+	// ladder is attached without an H264 base. Treat the HEVC ladder as the
+	// primary feed instead of failing the "No H264 video encoder" check.
+	auto h264Layers = collectVideoLayers(output, "h264");
+	auto hevcLayers = collectVideoLayers(output, "hevc");
+	obs_encoder_t *primaryEncoder = obs_output_get_video_encoder2(output, 0);
+	const char *primaryCodec = primaryEncoder ? obs_encoder_get_codec(primaryEncoder) : nullptr;
+	const bool hevcOnly = !wantMultitrack && primaryCodec && strcmp(primaryCodec, "hevc") == 0 &&
+			      !hevcLayers.empty();
+	if (hevcOnly) {
+		do_log(LOG_INFO, "HEVC-only WHIP publish (HEVC is the primary encoder); P2P disabled");
+		p2pEnabled = false;
+	}
+
 	std::string ppcenter_url;
 	PPCenterPublishRequest request;
 	std::string deviceId;
@@ -693,7 +718,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 		       "WHIP direct publish to configured endpoint (ppcenter resolution skipped): %s",
 		       configured_server.c_str());
 		resp.whip_tracks["h264"] = PPCenterWhipTrack{configured_server, configured_token};
-		if (wantMultitrack)
+		if (wantMultitrack || hevcOnly)
 			resp.whip_tracks["hevc"] =
 				PPCenterWhipTrack{deriveCodecWhipURL(configured_server, "hevc"), configured_token};
 	} else {
@@ -855,12 +880,77 @@ bool WHIPOutput::Setup(uint64_t generation)
 		return true;
 	}
 
-	auto h264Layers = collectVideoLayers(output, "h264");
-	if (h264Layers.empty()) {
+	if (!hevcOnly && h264Layers.empty()) {
 		do_log(LOG_ERROR, "No H264 video encoder assigned");
 		if (IsActiveGeneration(generation))
 			obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
 		return false;
+	}
+
+	if (hevcOnly) {
+		std::string limitError;
+		if (!checkStreamLimits(hevcLayers, limitError)) {
+			do_log(LOG_ERROR, "HEVC stream exceeds ppobs limits: %s", limitError.c_str());
+			if (IsActiveGeneration(generation))
+				obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
+			return false;
+		}
+
+#ifdef WHIP_DEGRADE_ACTIVE
+		int keep = WsDegradeClient::Instance().TargetLayers("hevc");
+		if (keep >= 1 && keep < (int)hevcLayers.size())
+			hevcLayers.erase(hevcLayers.begin(), hevcLayers.end() - keep);
+#endif
+
+		auto hevcTrack = resp.whip_tracks.find("hevc");
+		if (hevcTrack == resp.whip_tracks.end() || hevcTrack->second.url.empty() ||
+		    hevcTrack->second.bearer_token.empty()) {
+			do_log(LOG_ERROR, "HEVC-only publish but ppcenter did not return an hevc WHIP track");
+			if (IsActiveGeneration(generation))
+				obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
+			return false;
+		}
+
+		std::string hevcOnlyUrl = hevcTrack->second.url;
+		std::string hevcOnlyToken = hevcTrack->second.bearer_token;
+		degrade_url_hevc = hevcOnlyUrl;
+		degrade_token_hevc = hevcOnlyToken;
+
+		ObsEncoderConfig encoderConfig =
+			buildEncoderConfig(output, std::vector<obs_encoder_t *>{}, hevcLayers, true);
+		encoder_report_url = DeriveEncoderReportUrl(ppcenter_url);
+		encoder_report_body = BuildEncoderReportJson(request.app_id, request.app_secret,
+							     request.stream_name, deviceId, EncoderReportNowUtc(),
+							     encoderConfig);
+		encoder_report_pending = !encoder_report_url.empty() && !encoder_report_body.empty();
+
+		WHIPCodecSession::Config hevcCfg;
+		hevcCfg.endpoint_url = hevcOnlyUrl;
+		hevcCfg.bearer_token = hevcOnlyToken;
+		hevcCfg.has_audio = true;
+		hevcCfg.has_aac = dualAudioEnabled(output);
+		hevcCfg.enable_pacing = enable_pacing;
+		hevcCfg.disconnect_grace_sec = disconnect_grace_sec;
+		hevcCfg.reconnect_backoff_sec = reconnect_backoff_sec;
+		hevcCfg.watchdog_interval_sec = watchdog_interval_sec;
+		hevcCfg.watchdog_stall_sec = watchdog_stall_sec;
+		hevcCfg.max_reconnect_attempts = multitrack_max_reconnect_attempts;
+
+		hevcSession = std::make_unique<WHIPCodecSession>(output, "hevc");
+		hevcSession->SetVideoLayers(hevcLayers);
+		if (!hevcSession->Connect(hevcCfg)) {
+			do_log(LOG_ERROR, "HEVC WHIP connect failed");
+			hevcSession.reset();
+			if (IsActiveGeneration(generation)) {
+				obs_output_set_reconnect_delay(output, reconnect_backoff_sec * 1000);
+				obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+			}
+			return false;
+		}
+
+		do_log(LOG_INFO, "WHIP endpoints: h264=disabled hevc=%s P2P: disabled",
+		       hevcOnlyUrl.c_str());
+		return true;
 	}
 
 	{
@@ -903,10 +993,8 @@ bool WHIPOutput::Setup(uint64_t generation)
 	degrade_url_h264 = h264Url;
 	degrade_token_h264 = h264Token;
 
-	std::vector<obs_encoder_t *> hevcLayers;
 	std::string hevcUrl, hevcToken;
 	if (wantMultitrack) {
-		hevcLayers = collectVideoLayers(output, "hevc");
 		if (hevcLayers.empty()) {
 			do_log(LOG_ERROR,
 			       "HEVC/H264 multitrack is enabled but no HEVC video encoder is assigned");
@@ -1097,7 +1185,8 @@ void WHIPOutput::StartThread(uint64_t generation)
 		return;
 	}
 
-	do_log(LOG_INFO, "WHIPOutput: Started (%s)", hevcSession ? "H264+HEVC multitrack" : "H264 only");
+	do_log(LOG_INFO, "WHIPOutput: Started (%s)",
+	       (h264Session && hevcSession) ? "H264+HEVC multitrack" : hevcSession ? "HEVC only" : "H264 only");
 
 	if (encoder_report_pending) {
 		ReportEncoderConfigAsync(encoder_report_url, encoder_report_body);
@@ -1110,9 +1199,13 @@ void WHIPOutput::StartThread(uint64_t generation)
 	// feeds the P2P peers from Data() (that feed is already guarded by
 	// h264Session, which stays null here).
 	if (!p2p_only) {
-		WHIPCodecSession::Callbacks cb;
-		cb.onPermanentFailure = [this](const std::string &reason) { OnSessionPermanentFailure("h264", reason); };
-		h264Session->Supervise(cb);
+		if (h264Session) {
+			WHIPCodecSession::Callbacks cb;
+			cb.onPermanentFailure = [this](const std::string &reason) {
+				OnSessionPermanentFailure("h264", reason);
+			};
+			h264Session->Supervise(cb);
+		}
 		if (hevcSession) {
 			WHIPCodecSession::Callbacks hevcCb;
 			hevcCb.onPermanentFailure = [this](const std::string &reason) {

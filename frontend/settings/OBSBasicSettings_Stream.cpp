@@ -139,7 +139,13 @@ void OBSBasicSettings::UpdateWHIPSimulcastControls()
 	const bool simulcast = IsWHIPSimulcast();
 	ui->whipSimulcastGroupBox->setVisible(simulcast);
 	ui->whipSimulcastGroupBox->setEnabled(simulcast);
-	ui->whipSimulcastTotalLayers->setMaximum(4);
+
+	// Publishing both HEVC and H264 caps the shared ladder at 3 layers;
+	// a single-codec ladder (H264-only or HEVC-only) may use 4.
+	const int maxLayers = ui->whipHevcH264Multitrack->isChecked() ? 3 : 4;
+	ui->whipSimulcastTotalLayers->setMaximum(maxLayers);
+	if (ui->whipSimulcastTotalLayers->value() > maxLayers)
+		ui->whipSimulcastTotalLayers->setValue(maxLayers);
 }
 
 void OBSBasicSettings::InitStreamPage()
@@ -193,6 +199,7 @@ void OBSBasicSettings::InitStreamPage()
 	connect(ui->whipSimulcastTotalLayers, &QSpinBox::valueChanged, this,
 		&OBSBasicSettings::RebuildWHIPSimulcastLayerRows);
 	connect(ui->whipHevcH264Multitrack, &QCheckBox::toggled, this, [this](bool) {
+		UpdateWHIPSimulcastControls();
 		UpdateWHIPHevcBitrateControls();
 		RefreshWHIPHevcBitrateDefaults();
 	});
@@ -438,6 +445,7 @@ void OBSBasicSettings::LoadStream1Settings()
 	ui->globalEnhanceEnable->setChecked(config_get_bool(main->Config(), "Stream1", "GlobalEnhance"));
 	ui->whipSimulcastTotalLayers->setValue(whipSimulcastTotalLayers);
 	ui->whipHevcH264Multitrack->setChecked(whipHevcH264Multitrack);
+	UpdateWHIPSimulcastControls();
 	RebuildWHIPSimulcastLayerRows();
 	LoadWHIPHevcBitrateControls();
 

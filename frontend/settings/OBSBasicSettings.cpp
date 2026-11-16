@@ -32,6 +32,7 @@
 #include <utility/EncoderSettingsFile.hpp>
 #include <utility/FFmpegCodec.hpp>
 #include <utility/FFmpegFormat.hpp>
+#include <utility/PPCDNVideoBitrate.hpp>
 #include <utility/SettingsEventFilter.hpp>
 #ifdef YOUTUBE_ENABLED
 #include <utility/YoutubeApiWrappers.hpp>
@@ -66,24 +67,6 @@ static inline bool ResTooHigh(uint32_t cx, uint32_t cy)
 static inline bool ResTooLow(uint32_t cx, uint32_t cy)
 {
 	return cx < 32 || cy < 32;
-}
-
-// PPCDN's fixed video-bitrate ladder: the output resolution decides the
-// target bitrate, so users cannot accidentally pair 4K with a 1080p bitrate
-// (or exceed the 10 Mbps publish cap). Returns 0 for resolutions outside the
-// ladder, leaving the user's own value untouched.
-static int PPCDNVideoBitrateForResolution(uint32_t cx, uint32_t cy)
-{
-	const uint32_t shortSide = std::min(cx, cy);
-	if (shortSide >= 2160)
-		return 10000;
-	if (shortSide >= 1440)
-		return 5000;
-	if (shortSide >= 1080)
-		return 3000;
-	if (shortSide >= 720)
-		return 1000;
-	return 0;
 }
 
 /* parses "[width]x[height]", string, i.e. 1024x768 */
@@ -573,10 +556,8 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->cropY,                SCROLL_CHANGED, VIDEO_CHANGED);
 	HookWidget(ui->cropWidth,            SCROLL_CHANGED, VIDEO_CHANGED);
 	HookWidget(ui->cropHeight,           SCROLL_CHANGED, VIDEO_CHANGED);
-	HookWidget(ui->cropFps,              SCROLL_CHANGED, VIDEO_CHANGED);
 	connect(ui->cropOutputEnabled, &QCheckBox::toggled, this, [this](bool enabled) {
 		ui->cropAreaWidget->setEnabled(enabled);
-		ui->cropFps->setEnabled(enabled);
 	});
 	HookWidget(ui->colorsGroupBox,       GROUP_CHANGED,  A11Y_CHANGED);
 	HookWidget(ui->colorPreset,          COMBO_CHANGED,  A11Y_CHANGED);
@@ -1726,6 +1707,8 @@ void OBSBasicSettings::LoadResolutionLists()
 		QTStr("AspectRatio").arg(QString::number(std::get<0>(aspect)), QString::number(std::get<1>(aspect))));
 }
 
+static void WriteJsonData(OBSPropertiesView *view, const char *path, bool force = false);
+
 void OBSBasicSettings::ApplyLinkedVideoBitrate(bool force)
 {
 	if ((!force && loading) || updatingOutputResolution)
@@ -1739,17 +1722,54 @@ void OBSBasicSettings::ApplyLinkedVideoBitrate(bool force)
 	if (bitrate <= 0)
 		return;
 
-	if (ui->simpleOutputVBitrate->value() != bitrate)
+	bool bitrateChanged = false;
+
+	if (ui->simpleOutputVBitrate->value() != bitrate) {
 		ui->simpleOutputVBitrate->setValue(bitrate);
-	if (ui->advOutFFVBitrate->value() != bitrate)
+		bitrateChanged = true;
+	}
+	if (ui->advOutFFVBitrate->value() != bitrate) {
 		ui->advOutFFVBitrate->setValue(bitrate);
+		bitrateChanged = true;
+	}
 
 	if (streamEncoderProps) {
 		obs_data_t *settings = streamEncoderProps->GetSettings();
 		if (settings && obs_data_get_int(settings, "bitrate") != bitrate) {
 			obs_data_set_int(settings, "bitrate", bitrate);
-			streamEncoderProps->UpdateSettings();
+			streamEncoderProps->ReloadProperties();
+			bitrateChanged = true;
+
+			if (force) {
+				// Loading the dialog applies the resolution-linked
+				// bitrate to the encoder's settings object, but without
+				// persisting it the output (which reads this per-encoder
+				// file, not the in-memory view) keeps the stale value.
+				// The output resolution is already the saved one at this
+				// point, so writing here cannot save a pending,
+				// later-cancelled resolution change.
+				if (!curAdvStreamEncoder.isEmpty())
+					WriteJsonData(streamEncoderProps,
+						      EncoderJsonFileName("streamEncoder",
+									  QT_TO_UTF8(curAdvStreamEncoder))
+							      .c_str(),
+						      true);
+			} else {
+				// User-driven resolution change: let Apply persist it
+				// together with the rest of the output settings, so
+				// cancelling the dialog doesn't rewrite the encoder file.
+				streamEncoderProps->setProperty("changed", QVariant(true));
+			}
 		}
+	}
+
+	// Changing only the output resolution marks the Video page dirty, not
+	// the Output page. The linked values above live in Output widgets /
+	// encoder settings though, so mark Outputs dirty as well or Apply's
+	// SaveOutputSettings() (which persists them) never runs.
+	if (bitrateChanged && !force) {
+		outputsChanged = true;
+		EnableApplyButton(true);
 	}
 }
 
@@ -1825,18 +1845,13 @@ void OBSBasicSettings::LoadVideoSettings()
 		cropWidth = outCx;
 	if (cropHeight <= 0)
 		cropHeight = outCy;
-	int cropFps = (int)config_get_int(main->Config(), "Video", "CropFPS");
-	if (cropFps <= 0)
-		cropFps = 15;
 
 	ui->cropOutputEnabled->setChecked(cropEnabled);
 	ui->cropX->setValue((int)config_get_int(main->Config(), "Video", "CropX"));
 	ui->cropY->setValue((int)config_get_int(main->Config(), "Video", "CropY"));
 	ui->cropWidth->setValue(cropWidth);
 	ui->cropHeight->setValue(cropHeight);
-	ui->cropFps->setValue(cropFps);
 	ui->cropAreaWidget->setEnabled(cropEnabled);
-	ui->cropFps->setEnabled(cropEnabled);
 
 	// Apply the resolution-to-bitrate mapping without marking the dialog as
 	// changed just from opening it.
@@ -3373,7 +3388,6 @@ void OBSBasicSettings::SaveVideoSettings()
 	config_set_int(main->Config(), "Video", "CropY", ui->cropY->value());
 	config_set_int(main->Config(), "Video", "CropWidth", ui->cropWidth->value());
 	config_set_int(main->Config(), "Video", "CropHeight", ui->cropHeight->value());
-	config_set_int(main->Config(), "Video", "CropFPS", ui->cropFps->value());
 }
 
 void OBSBasicSettings::SaveAdvancedSettings()
@@ -3508,9 +3522,9 @@ static inline const char *SplitFileTypeFromIdx(int idx)
 		return "Time";
 }
 
-static void WriteJsonData(OBSPropertiesView *view, const char *path)
+static void WriteJsonData(OBSPropertiesView *view, const char *path, bool force)
 {
-	if (!view || !WidgetChanged(view))
+	if (!view || (!force && !WidgetChanged(view)))
 		return;
 
 	const OBSBasic *basic = OBSBasic::Get();

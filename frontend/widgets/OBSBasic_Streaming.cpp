@@ -19,6 +19,8 @@
 
 #include "OBSBasic.hpp"
 
+#include <obs-output.h>
+
 #include <components/UIValidation.hpp>
 #ifdef YOUTUBE_ENABLED
 #include <docks/YouTubeAppDock.hpp>
@@ -271,6 +273,50 @@ void OBSBasic::StreamingStart()
 	// publishing (SRT/RTMP/WHIP). The format string is cached on the UI
 	// thread before the scorer's decode thread can publish a sample.
 	qualityScoreFormat = QTStr("Basic.Main.QualityScore");
+
+	// List every video encoding tier under the quality score:
+	// "<codec> <width>x<height>@<bitrate>kbps". The encoders are attached
+	// to the publish output(s) by SetupOutputs before the start signal;
+	// a single-codec transport with HEVC/H264 multitrack keeps its HEVC
+	// half on a separate output, and the optional crop publish runs on its
+	// own output too, so scan those as well.
+	qualityLayersText.clear();
+	QStringList layerLines;
+	auto appendLayers = [&](obs_output_t *out) {
+		if (!out)
+			return;
+		for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++) {
+			obs_encoder_t *enc = obs_output_get_video_encoder2(out, i);
+			if (!enc)
+				continue;
+
+			const char *codec = obs_encoder_get_codec(enc);
+			uint32_t cx = obs_encoder_get_width(enc);
+			uint32_t cy = obs_encoder_get_height(enc);
+			if (!cx || !cy) {
+				cx = video_output_get_width(obs_get_video());
+				cy = video_output_get_height(obs_get_video());
+			}
+
+			OBSDataAutoRelease encSettings = obs_encoder_get_settings(enc);
+			const int bitrate = encSettings ? (int)obs_data_get_int(encSettings, "bitrate") : 0;
+
+			QString line = QString("%1 %2x%3")
+					       .arg(codec ? QString(codec).toUpper() : QStringLiteral("?"))
+					       .arg(cx)
+					       .arg(cy);
+			if (bitrate > 0)
+				line += QString("@%1kbps").arg(bitrate);
+			layerLines << line;
+		}
+	};
+	appendLayers(output);
+	if (outputHandler && outputHandler->hevcStreamOutput)
+		appendLayers(outputHandler->hevcStreamOutput);
+	if (outputHandler && outputHandler->cropOutput)
+		appendLayers(outputHandler->cropOutput);
+	qualityLayersText = layerLines.join('\n');
+
 	qualityScorer.SetSink(OnQualityScore, this);
 	qualityScorer.Start(output);
 
@@ -377,6 +423,8 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 
 	qualityScorer.Stop();
 	qualityScoreUpdateNs = 0;
+	qualityLayersText.clear();
+	qualityLayersShown.clear();
 
 	emit StreamingStopped();
 

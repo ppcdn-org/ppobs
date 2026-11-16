@@ -3,6 +3,7 @@
 #include <abs-ts.h>
 #include <utility/audio-encoders.hpp>
 #include <utility/EncoderSettingsFile.hpp>
+#include <utility/PPCDNVideoBitrate.hpp>
 #include <utility/PublishCodecCheck.hpp>
 #include <utility/StartMultiTrackVideoStreamingGuard.hpp>
 #include <widgets/OBSBasic.hpp>
@@ -71,16 +72,60 @@ static OBSData GetEncoderDataFromJsonFile(const char *base, const char *encoderI
 	const OBSBasic *basic = OBSBasic::Get();
 	const OBSProfile &currentProfile = basic->GetCurrentProfile();
 
+	OBSData data;
 	if (encoderId && *encoderId) {
 		const std::string perEncoder = EncoderJsonFileName(base, encoderId);
 		const std::filesystem::path perEncoderPath =
 			currentProfile.path / std::filesystem::u8path(perEncoder);
 
 		if (std::filesystem::exists(perEncoderPath))
-			return GetDataFromJsonFile(perEncoder.c_str());
+			data = GetDataFromJsonFile(perEncoder.c_str());
 	}
 
-	return GetDataFromJsonFile(LegacyEncoderJsonFileName(base).c_str());
+	if (!data)
+		data = GetDataFromJsonFile(LegacyEncoderJsonFileName(base).c_str());
+
+	// The video settings dialog derives the selected encoder's bitrate from
+	// the output resolution (see PPCDNVideoBitrateForResolution), but that
+	// value only ever lived in the dialog's in-memory encoder settings.
+	// Enforce it here as well so the publish follows the resolution even
+	// when the per-encoder JSON still holds an older bitrate - for both
+	// H264 and HEVC, since either can be the main Stream encoder. This also
+	// sizes the H264 Simulcast ladder and the HEVC auto bitrate (50% of
+	// the H264 main) from the same linked value.
+	if (data && encoderId && *encoderId && strcmp(base, "streamEncoder") == 0) {
+		const char *codec = obs_get_encoder_codec(encoderId);
+		if (codec && (strcmp(codec, "h264") == 0 || strcmp(codec, "hevc") == 0)) {
+			uint32_t cx = (uint32_t)config_get_uint(basic->Config(), "Video", "OutputCX");
+			uint32_t cy = (uint32_t)config_get_uint(basic->Config(), "Video", "OutputCY");
+			if (cx < 32 || cy < 32) {
+				cx = video_output_get_width(obs_get_video());
+				cy = video_output_get_height(obs_get_video());
+			}
+
+			const int linkedBitrate = PPCDNVideoBitrateForResolution(cx, cy);
+			const int savedBitrate = (int)obs_data_get_int(data, "bitrate");
+			if (linkedBitrate > 0 && savedBitrate != linkedBitrate) {
+				blog(LOG_INFO, "[PPCDN] linked %s bitrate %d kbps for %ux%u (saved %d)", codec,
+				     linkedBitrate, cx, cy, savedBitrate);
+				obs_data_set_int(data, "bitrate", linkedBitrate);
+			}
+
+			// A 1-second GOP bounds viewer startup latency even when a
+			// keyframe request is lost: the worst case is one GOP, not
+			// two seconds. The bitrate cost is negligible at these
+			// targets and this applies to the streaming ladder only
+			// (recordEncoder is unaffected).
+			const int savedKeyint = (int)obs_data_get_int(data, "keyint_sec");
+			if (savedKeyint != 1) {
+				blog(LOG_INFO, "[PPCDN] streaming keyframe interval %d -> 1s for fast startup",
+				     savedKeyint);
+				obs_data_set_int(data, "keyint_sec", 1);
+			}
+		}
+	}
+
+	return data;
 }
 
 static void ApplyEncoderDefaults(OBSData &settings, const obs_encoder_t *encoder)
@@ -213,10 +258,16 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	// HEVC it goes to the companion output instead, so without a base here
 	// the H264 connection publishes a ladder with no full-resolution layer
 	// - mmx logs "contains 2 h264 video tracks" for a 3-layer config.
-	const bool needsWhipH264Base = strcmp(obs_service_get_id(main->GetService()), "whip_custom") == 0 ||
-				       whipHevcEncoders != nullptr;
+	const bool isWhipService = strcmp(obs_service_get_id(main->GetService()), "whip_custom") == 0;
+	const char *streamCodec = obs_get_encoder_codec(streamEncoder);
+	// An HEVC main encoder with multitrack off publishes the HEVC ladder on
+	// its own /hevc path (WHIPOutput treats the HEVC layers as primary when
+	// no H264 layer is attached), so it must NOT get an H264 base track.
+	const bool hevcOnly = isWhipService && whipHevcEncoders == nullptr && streamCodec &&
+			      strcmp(streamCodec, "hevc") == 0 &&
+			      !config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
+	const bool needsWhipH264Base = (isWhipService && !hevcOnly) || whipHevcEncoders != nullptr;
 	if (needsWhipH264Base) {
-		const char *streamCodec = obs_get_encoder_codec(streamEncoder);
 		if (!streamCodec || strcmp(streamCodec, "h264") != 0) {
 			std::string h264EncoderId = ResolveWHIPH264EncoderId(streamEncoder);
 			// Load H264-specific settings instead of reusing the HEVC
@@ -1103,6 +1154,13 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 			is_whip = true;
 	}
 
+	// HEVC-only WHIP publish (HEVC encoder with multitrack off) has no H264
+	// layer, so P2P (H264-only) cannot be offered; keep the output from
+	// arming a probe/signaling session that would have no video to send.
+	const char *streamCodec = videoStreaming ? obs_encoder_get_codec(videoStreaming) : nullptr;
+	const bool hevcOnly = is_whip && streamCodec && strcmp(streamCodec, "hevc") == 0 &&
+			      !config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
+
 	OBSDataAutoRelease settings = obs_data_create();
 	obs_data_set_string(settings, "bind_ip", bindIP);
 	obs_data_set_string(settings, "ip_family", ipFamily);
@@ -1111,7 +1169,7 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	obs_data_set_bool(settings, "low_latency_mode_enabled", enableLowLatencyMode);
 #endif
 	obs_data_set_bool(settings, "dyn_bitrate", enableDynBitrate);
-	obs_data_set_bool(settings, "ppcdn_p2p_enabled", P2PStreamingEnabled());
+	obs_data_set_bool(settings, "ppcdn_p2p_enabled", P2PStreamingEnabled() && !hevcOnly);
 	obs_data_set_int(settings, "ppcdn_p2p_max_sessions", P2PStreamingMaxSessions());
 	obs_data_set_int(settings, "whip_disconnect_grace_sec", whipDisconnectGraceSec);
 	obs_data_set_int(settings, "whip_reconnect_backoff_sec", whipReconnectBackoffSec);

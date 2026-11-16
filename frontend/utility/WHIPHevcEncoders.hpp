@@ -11,18 +11,19 @@
 // HEVC/H264 multitrack simulcast feature - see
 // docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md §4.1.
 //
-// Builds an independent HEVC encoder ladder (main layer + up to 2 scaled-
-// down layers, i.e. at most 3 layers total - the design's confirmed HEVC
-// Simulcast cap) that mirrors WHIPSimulcastEncoders' H264 ladder: same
-// resolution step-down, and each HEVC level defaults to 50% of the H264
-// bitrate at that level (or its own manually edited value when "HEVC auto"
-// is unchecked in Settings > Stream). It is capped lower and always starts
-// from its own dedicated HEVC encoder rather than reusing the main Stream
-// encoder. The HEVC ladder's layer count follows
-// Stream1.WHIPSimulcastTotalLayers the same as H264 does, clamped to
-// WHIPHevcEncoders::kMaxLayers - so unchecking "Follow Main" per layer and
-// resolution steps still behave identically to the H264 side; only the
-// encoder identity, codec, and default bitrate ratio differ.
+// Builds the HEVC encoder ladder for the dual-codec (HEVC+H264 multitrack)
+// publish. It mirrors WHIPSimulcastEncoders' H264 ladder: same per-layer
+// resolution (including PPCDN's fixed 4K/2K ladder), and each HEVC level
+// defaults to 50% of the H264 bitrate at that level (or its own manually
+// edited value when "HEVC auto" is unchecked in Settings > Stream). It
+// always starts from its own dedicated HEVC encoder rather than reusing the
+// main Stream encoder. The ladder's layer count follows
+// Stream1.WHIPSimulcastTotalLayers, capped at WHIPHevcEncoders::kMaxLayers
+// (3 for the dual-codec publish) - so unchecking "Follow Main" per layer and
+// resolution steps behave identically to the H264 side; only the encoder
+// identity, codec, and default bitrate ratio differ. An HEVC-only publish
+// (multitrack off) does not use this struct; it builds its ladder through
+// WHIPSimulcastEncoders with the HEVC encoder and may use up to 4 layers.
 
 // Picks a HEVC encoder id to pair with the given H264 encoder id: prefers
 // the same hardware vendor's HEVC encoder when the user's H264 pick is
@@ -138,8 +139,9 @@ static inline bool WHIPHevcBitrateOverride(config_t *config, const char *autoKey
 
 struct WHIPHevcEncoders {
 public:
-	// HEVC Simulcast is capped at 3 layers total (design doc §11: "严格
-	// 小�? 4") - stricter than H264's cap in WHIPSimulcastEncoders.
+	// Dual-codec (HEVC+H264) publishes cap the ladder at 3 layers. A
+	// single-codec HEVC publish uses WHIPSimulcastEncoders (up to 4)
+	// instead of this struct.
 	static constexpr int kMaxLayers = 3;
 
 	static constexpr const char *kMainBitrateAutoKey = "WHIPHevcBitrateAuto";
@@ -270,7 +272,8 @@ public:
 				usingCustomLayer[i] = true;
 				width = custom.width;
 				height = custom.height;
-			} else {
+			} else if (!GetPPCDNSimulcastLayerSize(outputWidth, outputHeight, slot, totalLayers, width,
+							       height)) {
 				width = widthStep * i;
 				width -= width % 2;
 				height = heightStep * i;

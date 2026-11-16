@@ -829,6 +829,12 @@ private:
 	float qualityScoreShown = -1.0f; // graphics thread: value currently in the label text
 	QString qualityScoreFormat;      // set on the UI thread before the scorer starts
 
+	/* Per-layer "WxH@bitrate" lines shown under the quality score. Built
+	 * once on the UI thread at StreamingStart from the video encoders
+	 * attached to the publish output(s). */
+	QString qualityLayersText;
+	QString qualityLayersShown;
+
 	void DrawBackdrop(float cx, float cy);
 	void InitPrimitives();
 	void UpdatePreviewScalingMenu();
