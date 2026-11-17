@@ -4843,9 +4843,11 @@ static void DisableIncompatibleCodecs(QComboBox *cbox, const QString &format, co
 
 		const char *codec = obs_get_encoder_codec(encoderId.c_str());
 
-		bool is_compatible = ContainerSupportsCodec(format.toStdString(), codec);
+		// Saved encoder IDs can outlive the plugin or hardware that registered
+		// them. A missing encoder has no codec; do not construct a string from it.
+		bool is_compatible = codec && ContainerSupportsCodec(format.toStdString(), codec);
 		/* Fall back to FFmpeg check if codec not one of the built-in ones. */
-		if (!is_compatible && !IsBuiltinCodec(codec)) {
+		if (codec && !is_compatible && !IsBuiltinCodec(codec)) {
 			string ext = GetFormatExt(QT_TO_UTF8(format));
 			is_compatible = FFCodecAndFormatCompatible(codec, ext.c_str());
 		}
