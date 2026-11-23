@@ -159,6 +159,20 @@ static inline bool SetComboByValue(QComboBox *combo, const QString &name)
 	return false;
 }
 
+static inline int FirstEnabledComboIndex(QComboBox *combo)
+{
+	auto *model = dynamic_cast<QStandardItemModel *>(combo->model());
+	if (!model)
+		return combo->count() > 0 ? 0 : -1;
+
+	for (int idx = 0; idx < combo->count(); idx++) {
+		if (model->item(idx)->isEnabled())
+			return idx;
+	}
+
+	return -1;
+}
+
 static inline bool SetInvalidValue(QComboBox *combo, const QString &name, const QVariant &data)
 {
 	combo->insertItem(0, name, data);
@@ -1955,9 +1969,33 @@ void OBSBasicSettings::LoadSimpleOutputSettings()
 	ui->simpleOutStrAEncoder->setCurrentIndex(idx);
 
 	idx = ui->simpleOutRecEncoder->findData(QString(recEnc));
+	if (idx == -1) {
+		idx = ui->simpleOutRecEncoder->findData(QString(streamEnc));
+		if (idx == -1)
+			idx = ui->simpleOutRecEncoder->count() > 0 ? 0 : -1;
+		if (idx != -1) {
+			QString fallback = ui->simpleOutRecEncoder->itemData(idx).toString();
+			blog(LOG_WARNING,
+			     "[settings] simple recording encoder '%s' is unavailable; falling back to '%s'",
+			     recEnc ? recEnc : "", QT_TO_UTF8(fallback));
+			config_set_string(main->Config(), "SimpleOutput", "RecEncoder", QT_TO_UTF8(fallback));
+		}
+	}
 	ui->simpleOutRecEncoder->setCurrentIndex(idx);
 
 	idx = ui->simpleOutRecAEncoder->findData(QString(recAudioEnc));
+	if (idx == -1) {
+		idx = ui->simpleOutRecAEncoder->findData(QString(streamAudioEnc));
+		if (idx == -1)
+			idx = ui->simpleOutRecAEncoder->count() > 0 ? 0 : -1;
+		if (idx != -1) {
+			QString fallback = ui->simpleOutRecAEncoder->itemData(idx).toString();
+			blog(LOG_WARNING,
+			     "[settings] simple recording audio encoder '%s' is unavailable; falling back to '%s'",
+			     recAudioEnc ? recAudioEnc : "", QT_TO_UTF8(fallback));
+			config_set_string(main->Config(), "SimpleOutput", "RecAudioEncoder", QT_TO_UTF8(fallback));
+		}
+	}
 	ui->simpleOutRecAEncoder->setCurrentIndex(idx);
 
 	ui->simpleOutMuxCustom->setText(muxCustom);
@@ -2200,33 +2238,52 @@ void OBSBasicSettings::LoadAdvOutputRecordingSettings()
 void OBSBasicSettings::LoadAdvOutputRecordingEncoderProperties()
 {
 	const char *type = config_get_string(main->Config(), "AdvOut", "RecEncoder");
+	QString selectedType = QT_UTF8(type ? type : "");
 
 	delete recordEncoderProps;
 	recordEncoderProps = nullptr;
 
-	if (astrcmpi(type, "none") != 0) {
-		recordEncoderProps = CreateEncoderPropertyView(type, EncoderJsonFileName("recordEncoder", type).c_str(),
-							       "recordEncoder.json");
+	if (!SetComboByValue(ui->advOutRecEncoder, selectedType)) {
+		QByteArray encoderId = selectedType.toUtf8();
+		uint32_t caps = obs_get_encoder_caps(encoderId.constData());
+		if ((caps & ENCODER_HIDE_FLAGS) != 0) {
+			QString encName = QT_UTF8(obs_encoder_get_display_name(encoderId.constData()));
+			if (caps & OBS_ENCODER_CAP_DEPRECATED)
+				encName += " (" + QTStr("Deprecated") + ")";
+
+			ui->advOutRecEncoder->insertItem(1, encName, selectedType);
+			SetComboByValue(ui->advOutRecEncoder, selectedType);
+		} else if (SetComboByValue(ui->advOutRecEncoder, "none")) {
+			blog(LOG_WARNING,
+			     "[settings] recording encoder '%s' is unavailable; falling back to the stream encoder",
+			     QT_TO_UTF8(selectedType));
+			selectedType = "none";
+			config_set_string(main->Config(), "AdvOut", "RecEncoder", "none");
+		} else {
+			int fallback = FirstEnabledComboIndex(ui->advOutRecEncoder);
+			if (fallback >= 0) {
+				ui->advOutRecEncoder->setCurrentIndex(fallback);
+				selectedType = ui->advOutRecEncoder->itemData(fallback).toString();
+				blog(LOG_WARNING,
+				     "[settings] recording encoder '%s' is unavailable; falling back to '%s'",
+				     type ? type : "", QT_TO_UTF8(selectedType));
+				config_set_string(main->Config(), "AdvOut", "RecEncoder", QT_TO_UTF8(selectedType));
+			} else {
+				ui->advOutRecEncoder->setCurrentIndex(-1);
+			}
+		}
+	}
+
+	curAdvRecordEncoder = selectedType;
+
+	if (astrcmpi(QT_TO_UTF8(selectedType), "none") != 0) {
+		recordEncoderProps = CreateEncoderPropertyView(
+			QT_TO_UTF8(selectedType), EncoderJsonFileName("recordEncoder", QT_TO_UTF8(selectedType)).c_str(),
+			"recordEncoder.json");
 		recordEncoderProps->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
 		ui->advOutRecEncoderProps->layout()->addWidget(recordEncoderProps);
 		connect(recordEncoderProps, &OBSPropertiesView::Changed, this,
 			&OBSBasicSettings::AdvReplayBufferChanged);
-	}
-
-	curAdvRecordEncoder = type;
-
-	if (!SetComboByValue(ui->advOutRecEncoder, type)) {
-		uint32_t caps = obs_get_encoder_caps(type);
-		if ((caps & ENCODER_HIDE_FLAGS) != 0) {
-			QString encName = QT_UTF8(obs_encoder_get_display_name(type));
-			if (caps & OBS_ENCODER_CAP_DEPRECATED)
-				encName += " (" + QTStr("Deprecated") + ")";
-
-			ui->advOutRecEncoder->insertItem(1, encName, QT_UTF8(type));
-			SetComboByValue(ui->advOutRecEncoder, type);
-		} else {
-			ui->advOutRecEncoder->setCurrentIndex(-1);
-		}
 	}
 }
 
@@ -2373,14 +2430,32 @@ void OBSBasicSettings::LoadOutputSettings()
 	LoadAdvOutputStreamingEncoderProperties();
 
 	const char *type = config_get_string(main->Config(), "AdvOut", "AudioEncoder");
-	if (!SetComboByValue(ui->advOutAEncoder, type))
-		ui->advOutAEncoder->setCurrentIndex(-1);
+	if (!SetComboByValue(ui->advOutAEncoder, type)) {
+		int fallback = FirstEnabledComboIndex(ui->advOutAEncoder);
+		ui->advOutAEncoder->setCurrentIndex(fallback);
+	}
 
 	LoadAdvOutputRecordingSettings();
 	LoadAdvOutputRecordingEncoderProperties();
 	type = config_get_string(main->Config(), "AdvOut", "RecAudioEncoder");
-	if (!SetComboByValue(ui->advOutRecAEncoder, type))
-		ui->advOutRecAEncoder->setCurrentIndex(-1);
+	if (!SetComboByValue(ui->advOutRecAEncoder, type)) {
+		if (SetComboByValue(ui->advOutRecAEncoder, "none")) {
+			blog(LOG_WARNING,
+			     "[settings] recording audio encoder '%s' is unavailable; falling back to the stream encoder",
+			     type ? type : "");
+			config_set_string(main->Config(), "AdvOut", "RecAudioEncoder", "none");
+		} else {
+			int fallback = FirstEnabledComboIndex(ui->advOutRecAEncoder);
+			ui->advOutRecAEncoder->setCurrentIndex(fallback);
+			if (fallback >= 0) {
+				QString selected = ui->advOutRecAEncoder->itemData(fallback).toString();
+				blog(LOG_WARNING,
+				     "[settings] recording audio encoder '%s' is unavailable; falling back to '%s'",
+				     type ? type : "", QT_TO_UTF8(selected));
+				config_set_string(main->Config(), "AdvOut", "RecAudioEncoder", QT_TO_UTF8(selected));
+			}
+		}
+	}
 	LoadAdvOutputFFmpegSettings();
 	LoadAdvOutputAudioSettings();
 
@@ -4006,8 +4081,13 @@ bool OBSBasicSettings::QueryAllowedToClose()
 	bool invalidFormat = false;
 	bool invalidTracks = false;
 	if (simple) {
-		if (ui->simpleOutRecEncoder->currentIndex() == -1 || ui->simpleOutStrEncoder->currentIndex() == -1 ||
-		    ui->simpleOutRecAEncoder->currentIndex() == -1 || ui->simpleOutStrAEncoder->currentIndex() == -1)
+		if (ui->simpleOutStrEncoder->currentIndex() == -1 ||
+		    ui->simpleOutStrAEncoder->currentIndex() == -1)
+			invalidEncoder = true;
+		// Simple recording always has an encoder selection; it is only
+		// invalid when the user explicitly cleared/loader fallback failed.
+		if (ui->simpleOutRecEncoder->currentIndex() == -1 ||
+		    ui->simpleOutRecAEncoder->currentIndex() == -1)
 			invalidEncoder = true;
 
 		if (ui->simpleOutRecFormat->currentIndex() == -1)
@@ -4018,8 +4098,15 @@ bool OBSBasicSettings::QueryAllowedToClose()
 		if (SimpleOutGetSelectedAudioTracks() == 0 && qual != "Stream" && format != "flv")
 			invalidTracks = true;
 	} else {
-		if (ui->advOutRecEncoder->currentIndex() == -1 || ui->advOutEncoder->currentIndex() == -1 ||
-		    ui->advOutRecAEncoder->currentIndex() == -1 || ui->advOutAEncoder->currentIndex() == -1)
+		if (ui->advOutEncoder->currentIndex() == -1 || ui->advOutAEncoder->currentIndex() == -1)
+			invalidEncoder = true;
+
+		// Custom FFmpeg recording uses its own encoder pair, so the standard
+		// recording combos are not part of the active recording output.
+		const bool validateRecordingEncoders = ui->advOutRecType->currentIndex() == 0;
+		if (validateRecordingEncoders &&
+		    (ui->advOutRecEncoder->currentIndex() == -1 ||
+		     ui->advOutRecAEncoder->currentIndex() == -1))
 			invalidEncoder = true;
 
 		QString format = ui->advOutRecFormat->currentData().toString();
@@ -4869,9 +4956,17 @@ static void DisableIncompatibleCodecs(QComboBox *cbox, const QString &format, co
 		item->setText(encDisplayName);
 	}
 
-	// Set to invalid entry if encoder was incompatible
-	if (!currentCompatible)
-		cbox->setCurrentIndex(-1);
+	// Prefer "use stream encoder" when the saved recording encoder no longer
+	// works with the selected format, otherwise take the first compatible
+	// entry. Leaving the combo at -1 makes QueryAllowedToClose() block the
+	// dialog even though a valid fallback exists.
+	if (!currentCompatible) {
+		int fallback = cbox->findData("none");
+		auto *model = dynamic_cast<QStandardItemModel *>(cbox->model());
+		if (fallback < 0 || (model && !model->item(fallback)->isEnabled()))
+			fallback = FirstEnabledComboIndex(cbox);
+		cbox->setCurrentIndex(fallback);
+	}
 }
 
 void OBSBasicSettings::AdvOutRecCheckCodecs()
@@ -5484,7 +5579,7 @@ static void DisableIncompatibleSimpleCodecs(QComboBox *cbox, const QString &form
 	}
 
 	if (!currentCompatible)
-		cbox->setCurrentIndex(-1);
+		cbox->setCurrentIndex(FirstEnabledComboIndex(cbox));
 }
 
 static void DisableIncompatibleSimpleContainer(QComboBox *cbox, const QString &currentFormat, const QString &vEncoder,
