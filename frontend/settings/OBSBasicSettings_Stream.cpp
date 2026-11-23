@@ -139,7 +139,13 @@ void OBSBasicSettings::UpdateWHIPSimulcastControls()
 	const bool simulcast = IsWHIPSimulcast();
 	ui->whipSimulcastGroupBox->setVisible(simulcast);
 	ui->whipSimulcastGroupBox->setEnabled(simulcast);
-	ui->whipSimulcastTotalLayers->setMaximum(4);
+
+	// Publishing both HEVC and H264 caps the shared ladder at 3 layers;
+	// a single-codec ladder (H264-only or HEVC-only) may use 4.
+	const int maxLayers = ui->whipHevcH264Multitrack->isChecked() ? 3 : 4;
+	ui->whipSimulcastTotalLayers->setMaximum(maxLayers);
+	if (ui->whipSimulcastTotalLayers->value() > maxLayers)
+		ui->whipSimulcastTotalLayers->setValue(maxLayers);
 }
 
 void OBSBasicSettings::InitStreamPage()
@@ -193,6 +199,7 @@ void OBSBasicSettings::InitStreamPage()
 	connect(ui->whipSimulcastTotalLayers, &QSpinBox::valueChanged, this,
 		&OBSBasicSettings::RebuildWHIPSimulcastLayerRows);
 	connect(ui->whipHevcH264Multitrack, &QCheckBox::toggled, this, [this](bool) {
+		UpdateWHIPSimulcastControls();
 		UpdateWHIPHevcBitrateControls();
 		RefreshWHIPHevcBitrateDefaults();
 	});
@@ -438,6 +445,7 @@ void OBSBasicSettings::LoadStream1Settings()
 	ui->globalEnhanceEnable->setChecked(config_get_bool(main->Config(), "Stream1", "GlobalEnhance"));
 	ui->whipSimulcastTotalLayers->setValue(whipSimulcastTotalLayers);
 	ui->whipHevcH264Multitrack->setChecked(whipHevcH264Multitrack);
+	UpdateWHIPSimulcastControls();
 	RebuildWHIPSimulcastLayerRows();
 	LoadWHIPHevcBitrateControls();
 
@@ -2373,8 +2381,6 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 {
 	QString lastAdvVideoEnc = ui->advOutEncoder->currentData().toString();
 	QString lastVideoEnc = ui->simpleOutStrEncoder->currentData().toString();
-	QString lastAdvAudioEnc = ui->advOutAEncoder->currentData().toString();
-	QString lastAudioEnc = ui->simpleOutStrAEncoder->currentData().toString();
 	OBSService service = SpawnTempService();
 	const char **vcodecs = obs_service_get_supported_video_codecs(service);
 	const char **acodecs = obs_service_get_supported_audio_codecs(service);
@@ -2382,6 +2388,10 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 	BPtr<char *> output_vcodecs;
 	BPtr<char *> output_acodecs;
 	size_t idx = 0;
+	// Streaming audio is a single fixed choice: the ppobs dual-audio encoder
+	// (Opus primary + AAC published alongside). Captured here so both the
+	// simple and advanced pickers get one identical item.
+	QString ppcdnOpusType;
 
 	if (!vcodecs || IsRTMPCustomFamily()) {
 		const char *output;
@@ -2448,12 +2458,20 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 		}
 
 		if (obs_get_encoder_type(type) == OBS_ENCODER_AUDIO) {
-			if (service_supports_codec(streamAcodecs, codec))
-				ui->advOutAEncoder->addItem(qName, qType);
+			// Streaming audio is always the dual Opus+AAC encoder; remember
+			// the registered Opus type for the single picker entry. The
+			// recording pickers keep the full list.
+			if (ppcdnOpusType.isEmpty() && service_supports_codec(streamAcodecs, codec) &&
+			    codec && strcmp(codec, "opus") == 0)
+				ppcdnOpusType = qType;
 			if (!streamOnly)
 				ui->advOutRecAEncoder->addItem(qName, qType);
 		}
 	}
+
+	if (ppcdnOpusType.isEmpty())
+		ppcdnOpusType = "ffmpeg_opus";
+	ui->advOutAEncoder->addItem("ffmpeg opus + aac", ppcdnOpusType);
 
 	ui->advOutEncoder->model()->sort(0);
 	ui->advOutAEncoder->model()->sort(0);
@@ -2517,11 +2535,7 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 	}
 #endif
 #endif
-	if (service_supports_encoder(streamAcodecs, "CoreAudio_AAC") || service_supports_encoder(streamAcodecs, "libfdk_aac") ||
-	    service_supports_encoder(streamAcodecs, "ffmpeg_aac"))
-		ui->simpleOutStrAEncoder->addItem(QTStr("Basic.Settings.Output.Simple.Codec.AAC.Default"), "aac");
-	if (service_supports_encoder(streamAcodecs, "ffmpeg_opus"))
-		ui->simpleOutStrAEncoder->addItem(QTStr("Basic.Settings.Output.Simple.Codec.Opus"), "opus");
+	ui->simpleOutStrAEncoder->addItem("ffmpeg opus + aac", "opus");
 #undef ENCODER_STR
 
 	/* ------------------------------------------------- */
@@ -2540,17 +2554,10 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 		ui->advOutEncoder->setCurrentIndex(idx);
 	}
 
-	if (!lastAdvAudioEnc.isEmpty()) {
-		int idx = ui->advOutAEncoder->findData(lastAdvAudioEnc);
-		if (idx == -1) {
-			lastAdvAudioEnc = get_adv_audio_fallback(lastAdvAudioEnc);
-			ui->advOutAEncoder->setProperty("changed", QVariant(true));
-			OutputsChanged();
-		}
-
-		idx = ui->advOutAEncoder->findData(lastAdvAudioEnc);
+	// Streaming audio has exactly one choice (dual Opus+AAC).
+	if (ui->advOutAEncoder->count() > 0) {
 		s4.unblock();
-		ui->advOutAEncoder->setCurrentIndex(idx);
+		ui->advOutAEncoder->setCurrentIndex(0);
 	}
 
 	if (!lastVideoEnc.isEmpty()) {
@@ -2566,16 +2573,9 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 		ui->simpleOutStrEncoder->setCurrentIndex(idx);
 	}
 
-	if (!lastAudioEnc.isEmpty()) {
-		int idx = ui->simpleOutStrAEncoder->findData(lastAudioEnc);
-		if (idx == -1) {
-			lastAudioEnc = (lastAudioEnc == "opus") ? "aac" : "opus";
-			ui->simpleOutStrAEncoder->setProperty("changed", QVariant(true));
-			OutputsChanged();
-		}
-
-		idx = ui->simpleOutStrAEncoder->findData(lastAudioEnc);
+	// Streaming audio has exactly one choice (dual Opus+AAC).
+	if (ui->simpleOutStrAEncoder->count() > 0) {
 		s3.unblock();
-		ui->simpleOutStrAEncoder->setCurrentIndex(idx);
+		ui->simpleOutStrAEncoder->setCurrentIndex(0);
 	}
 }

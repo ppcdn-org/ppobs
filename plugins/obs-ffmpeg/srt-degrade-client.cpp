@@ -143,6 +143,20 @@ struct Channel {
 	std::atomic<bool> running{true};
 };
 
+// SRT has no in-band PLI/RTCP feedback path for a keyframe request, so mmx
+// relays a new viewer's request over this control channel. Request an IDR on
+// every encoder that feeds the output (an SRT publish is single-codec, but
+// the multitrack ladder still has several slots).
+static void RequestKeyFrames(Channel *ch)
+{
+	if (!ch || !ch->output)
+		return;
+	auto encoders = collectEncoders(ch->output);
+	for (auto *enc : encoders)
+		obs_encoder_request_keyframe(enc);
+	do_log(LOG_INFO, "Keyframe requested [%s] (%zu layer(s))", ch->codec.c_str(), encoders.size());
+}
+
 // Process-wide registry, keyed by the SRT output it belongs to - unlike
 // WHIP's WsDegradeClient (one fixed h264/hevc channel pair shared by every
 // output, because WHIP multitrack is two tracks on one output), an SRT
@@ -265,7 +279,9 @@ Channel *SrtDegradeRegistry::GetOrCreateLocked(obs_output_t *output, const std::
 			auto j = nlohmann::json::parse(payload);
 			if (!j.contains("type"))
 				return;
-			if (j["type"] == "LOSS_SAMPLE") {
+			if (j["type"] == "REQUEST_KEYFRAME") {
+				RequestKeyFrames(chp);
+			} else if (j["type"] == "LOSS_SAMPLE") {
 				HandleLossSample(chp, j.value("unrecoverable_delta", (uint64_t)0),
 						 j.value("expected_delta", (uint64_t)0));
 			} else if (j["type"] == "ALERT") {

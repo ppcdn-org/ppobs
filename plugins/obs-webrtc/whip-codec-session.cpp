@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <cstring>
 #include <curl/curl.h>
 
 namespace {
@@ -21,6 +22,10 @@ constexpr char signaling_media_id_valid_char[] = "0123456789"
 
 const char *audio_mid = "0";
 constexpr uint8_t audio_payload_type = 111;
+const char *aac_mid = "2";
+constexpr uint8_t aac_payload_type = 123;
+const char *aac_profile = "profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;"
+			  "indexdeltalength=3;config=1190";
 const char *video_mid = "1";
 constexpr uint8_t video_payload_type = 96;
 constexpr int video_nack_buffer_size = 4000;
@@ -269,14 +274,20 @@ void WHIPCodecSession::SendAudio(struct encoder_packet *packet)
 	std::shared_lock<std::shared_mutex> lk(tracks_mutex);
 	if (!sending_enabled.load())
 		return;
-	std::shared_ptr<rtc::Track> local_audio_track = audio_track;
-	std::shared_ptr<rtc::RtcpSrReporter> local_audio_sr_reporter = audio_sr_reporter;
+
+	const char *codec = packet->encoder ? obs_encoder_get_codec(packet->encoder) : nullptr;
+	const bool is_aac = codec && strcmp(codec, "aac") == 0;
+
+	std::shared_ptr<rtc::Track> local_audio_track = is_aac ? aac_track : audio_track;
+	std::shared_ptr<rtc::RtcpSrReporter> local_audio_sr_reporter =
+		is_aac ? aac_sr_reporter : audio_sr_reporter;
 	if (!local_audio_track)
 		return;
 
-	int64_t duration = packet->dts_usec - last_audio_timestamp;
-	Send(packet->data, packet->size, duration, local_audio_track, local_audio_sr_reporter);
-	last_audio_timestamp = packet->dts_usec;
+	int64_t &last_timestamp = is_aac ? last_aac_timestamp : last_audio_timestamp;
+	int64_t duration = packet->dts_usec - last_timestamp;
+	Send(packet->data, packet->size, duration, local_audio_track, local_audio_sr_reporter, is_aac);
+	last_timestamp = packet->dts_usec;
 }
 
 void WHIPCodecSession::SendVideo(struct encoder_packet *packet)
@@ -336,6 +347,40 @@ void WHIPCodecSession::ConfigureAudioTrack(const std::string &media_stream_id, c
 	std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 	audio_track = new_audio_track;
 	audio_sr_reporter = new_audio_sr_reporter;
+}
+
+void WHIPCodecSession::ConfigureAACTrack(const std::string &media_stream_id, const std::string &cname)
+{
+	if (!cfg.has_audio || !cfg.has_aac)
+		return;
+	// Simulcast video layers occupy base_ssrc+1 .. base_ssrc+N (see
+	// SetVideoLayers). The AAC track used to take base_ssrc+3, which for any
+	// ladder with >=3 layers collided with one video layer's SSRC: the
+	// receiver dropped that layer and the AAC track, and the sender logged
+	// SRTP protect errors (replay/old) from two sequence spaces sharing one
+	// SSRC. Put AAC far above the layer range instead.
+	constexpr uint32_t aac_ssrc_offset = 0x100;
+	uint32_t ssrc = base_ssrc + aac_ssrc_offset;
+	auto media_stream_track_id = media_stream_id + "-aac";
+	rtc::Description::Audio aac_description(aac_mid, rtc::Description::Direction::SendOnly);
+	// RFC 3640 MPEG4-GENERIC (what our AACRtpPacketizer emits and what mmx
+	// registers), NOT addAACCodec(): libdatachannel's addAACCodec advertises
+	// the codec as MP4A-LATM, which mmx/pion does not recognize, so the whole
+	// AAC m-line was silently dropped on ingest and only Opus was published.
+	aac_description.addAudioCodec(aac_payload_type, "MPEG4-GENERIC", aac_profile);
+	aac_description.addSSRC(ssrc, cname, media_stream_id, media_stream_track_id);
+	auto new_aac_track = peer_connection->addTrack(aac_description);
+	auto rtp_config = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, cname, aac_payload_type,
+									 rtc::AACRtpPacketizer::DefaultClockRate);
+	auto new_aac_sr_reporter = std::make_shared<rtc::RtcpSrReporter>(rtp_config);
+	auto packetizer = std::make_shared<rtc::AACRtpPacketizer>(rtp_config);
+	packetizer->addToChain(new_aac_sr_reporter);
+	packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
+	new_aac_track->setMediaHandler(packetizer);
+
+	std::unique_lock<std::shared_mutex> lk(tracks_mutex);
+	aac_track = new_aac_track;
+	aac_sr_reporter = new_aac_sr_reporter;
 }
 
 void WHIPCodecSession::ConfigureVideoTrack(const std::string &media_stream_id, const std::string &cname)
@@ -496,8 +541,10 @@ bool WHIPCodecSession::DoConnect(uint64_t generation, std::string &resourceURL)
 				std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 				peer_connection = nullptr;
 				audio_track = nullptr;
+				aac_track = nullptr;
 				video_track = nullptr;
 				audio_sr_reporter = nullptr;
+				aac_sr_reporter = nullptr;
 				video_sr_reporter = nullptr;
 			}
 			evt = PCEvent::Closed;
@@ -514,18 +561,20 @@ bool WHIPCodecSession::DoConnect(uint64_t generation, std::string &resourceURL)
 	});
 
 	ConfigureAudioTrack(media_stream_id, cname);
+	ConfigureAACTrack(media_stream_id, cname);
 	ConfigureVideoTrack(media_stream_id, cname);
 
 	if (!IsActiveGeneration(generation)) {
 		std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 		peer_connection = nullptr;
 		audio_track = nullptr;
+		aac_track = nullptr;
 		video_track = nullptr;
 		return false;
 	}
 	peer_connection->setLocalDescription();
 	rtc::Description localDescription(peer_connection->localDescription().value());
-	if (!video_track && !audio_track)
+	if (!video_track && !audio_track && !aac_track)
 		return false;
 
 	std::string sdp = localDescription.generateSdp();
@@ -675,6 +724,7 @@ bool WHIPCodecSession::DoConnect(uint64_t generation, std::string &resourceURL)
 			closing = peer_connection;
 			peer_connection = nullptr;
 			audio_track = nullptr;
+			aac_track = nullptr;
 			video_track = nullptr;
 		}
 		ClosePeerConnectionWithTimeout(closing);
@@ -701,13 +751,17 @@ void WHIPCodecSession::TeardownGeneration(uint64_t generation, const std::string
 		std::unique_lock<std::shared_mutex> lk(tracks_mutex);
 		if (audio_track && audio_track->isOpen())
 			audio_track->close();
+		if (aac_track && aac_track->isOpen())
+			aac_track->close();
 		if (video_track && video_track->isOpen())
 			video_track->close();
 		closing = peer_connection;
 		peer_connection = nullptr;
 		audio_track = nullptr;
+		aac_track = nullptr;
 		video_track = nullptr;
 		audio_sr_reporter = nullptr;
+		aac_sr_reporter = nullptr;
 		video_sr_reporter = nullptr;
 		video_loss_tracker = nullptr;
 	}
@@ -1023,11 +1077,35 @@ void WHIPCodecSession::ParseLinkHeader(std::string linkHeader, std::vector<rtc::
 }
 
 void WHIPCodecSession::Send(const void *data, uintptr_t size, uint64_t duration, std::shared_ptr<rtc::Track> track,
-			    std::shared_ptr<rtc::RtcpSrReporter> rtcp_sr_reporter)
+			    std::shared_ptr<rtc::RtcpSrReporter> rtcp_sr_reporter, bool add_aac_au_header)
 {
 	if (!track || !track->isOpen())
 		return;
-	std::vector<rtc::byte> sample{(const rtc::byte *)data, (const rtc::byte *)data + size};
+	std::vector<rtc::byte> sample;
+	if (add_aac_au_header) {
+		// RFC 3640 AAC-hbr framing. libdatachannel's AACRtpPacketizer
+		// (AudioRtpPacketizer) only adds an RTP header, so the AU header has
+		// to be built here; without it mmx reads the raw frame's first bytes
+		// as an AU header and drops every packet ("AU-index different than
+		// zero"). The fmtp advertises sizelength=13;indexlength=3, so one AU
+		// per packet carries a 19-bit AU header (13-bit size, 3-bit index=0)
+		// after a 16-bit AU-headers-length (in bits).
+		if (size > 0x1FFF) {
+			do_log(LOG_ERROR, "AAC frame too large for RFC 3640 13-bit AU size: %zu", (size_t)size);
+			return;
+		}
+		const uint16_t au_headers_bits = 16;
+		const uint16_t au_size = (uint16_t)size;
+		sample.reserve(size + 4);
+		sample.push_back((rtc::byte)(au_headers_bits >> 8));
+		sample.push_back((rtc::byte)(au_headers_bits & 0xFF));
+		sample.push_back((rtc::byte)((au_size >> 5) & 0xFF));
+		sample.push_back((rtc::byte)((au_size & 0x1F) << 3));
+		const rtc::byte *payload = (const rtc::byte *)data;
+		sample.insert(sample.end(), payload, payload + size);
+	} else {
+		sample.assign((const rtc::byte *)data, (const rtc::byte *)data + size);
+	}
 	auto rtp = rtcp_sr_reporter->rtpConfig;
 
 	auto elapsed_seconds = static_cast<double>(duration) / (1000.0 * 1000.0);

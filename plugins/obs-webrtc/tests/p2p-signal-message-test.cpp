@@ -35,6 +35,13 @@ int main()
 		Require(msg.type == "close", "close type mismatch");
 		Require(msg.reason == "viewer closed", "close reason mismatch");
 	}
+	{
+		auto msg = ParseP2PSignalMessage(R"({"v":1,"type":"select_layer","sessionId":"s4","layer":2})");
+		Require(msg.valid, "select_layer should be valid");
+		Require(msg.type == "select_layer", "select_layer type mismatch");
+		Require(msg.hasLayer, "select_layer should carry a layer");
+		Require(msg.layer == 2, "select_layer layer mismatch");
+	}
 	Require(!ParseP2PSignalMessage("{").valid, "invalid JSON should be rejected");
 	Require(!ParseP2PSignalMessage(R"({"v":1,"type":"offer"})").valid, "missing session should be rejected");
 	return 0;

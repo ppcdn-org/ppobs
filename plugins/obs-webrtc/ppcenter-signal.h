@@ -2,6 +2,8 @@
 
 #include <rtc/rtc.hpp>
 
+#include "ppcenter-signal-outgoing.h"
+
 #include <string>
 #include <functional>
 #include <memory>
@@ -44,8 +46,14 @@ struct P2PPeer {
 	// first RTP the peer receives starts a decodable access unit.
 	// (videoStarted also marks "lastVideoTimestamp is meaningful", so the
 	// first duration is 0 instead of the whole stream's elapsed time.)
-	bool videoStarted = false;
-	bool audioStarted = false;
+	std::atomic<bool> videoStarted{false};
+	std::atomic<bool> audioStarted{false};
+	// Selected H264 Simulcast layer index (0 = highest quality). Each peer can
+	// choose independently; Data() forwards only that layer's encoder packets.
+	std::atomic<int> layerIndex{0};
+	// Annex-B SPS/PPS cached for this peer's current layer, prepended to its
+	// first keyframe after joining or switching.
+	std::vector<uint8_t> videoParameterSets;
 };
 
 class P2PSignalImpl;
@@ -70,15 +78,15 @@ public:
 	void Stop();
 	void SetOnPeerUpdated(std::function<void()> callback);
 	// Called when a peer's RTCPeerConnection reaches Connected. The publisher
-	// uses it to force a keyframe so the newly-attached viewer can start
-	// decoding immediately instead of waiting for the encoder's next scheduled
-	// IDR (the viewer falls back to edge if no frame arrives in time).
-	void SetOnPeerConnected(std::function<void()> callback);
+	// uses it to force a keyframe and advertise the selectable layers so the
+	// newly-attached viewer can start decoding immediately.
+	void SetOnPeerConnected(std::function<void(const std::string &)> callback);
 	// Called when a peer's browser asks for a keyframe with RTCP PLI/FIR on
 	// the P2P video track (join, packet loss, decoder resync). The publisher
-	// forces an IDR so the peer can recover immediately instead of waiting
-	// out the encoder's scheduled GOP.
-	void SetOnKeyFrameRequest(std::function<void()> callback);
+	// forces an IDR on that peer's selected layer.
+	void SetOnKeyFrameRequest(std::function<void(const std::string &)> callback);
+	// Called when a viewer requests a different Simulcast layer.
+	void SetOnSelectLayer(std::function<void(const std::string &, int)> callback);
 	size_t PeerCount();
 	void ForEachPeer(std::function<void(P2PPeer &)> callback);
 	void SendAnswer(const std::string &sessionId, const std::string &sdp);
@@ -86,6 +94,11 @@ public:
 		     int sdpMLineIndex);
 	void SendConnected(const std::string &sessionId);
 	void SendClose(const std::string &sessionId, const std::string &reason);
+	void SendLayers(const std::string &sessionId, const std::vector<P2PLayerInfo> &layers);
+	void SendLayerSwitched(const std::string &sessionId, int layer);
+	// Updates a peer's selected layer and resets its keyframe gate. Returns
+	// false when the session is unknown or the index was rejected.
+	bool SetPeerLayer(const std::string &sessionId, int layer, int layerCount);
 
 private:
 	void OnMessage(const std::string &data);
@@ -108,8 +121,9 @@ private:
 	// number at allocation time; this is the publisher-side backstop.
 	int maxPeers = 3;
 	std::function<void()> onPeerUpdated;
-	std::function<void()> onPeerConnected;
-	std::function<void()> onKeyFrameRequest;
+	std::function<void(const std::string &)> onPeerConnected;
+	std::function<void(const std::string &)> onKeyFrameRequest;
+	std::function<void(const std::string &, int)> onSelectLayer;
 	std::mutex peersMutex;
 	std::map<std::string, std::shared_ptr<P2PPeer>> peers;
 	std::atomic<bool> running{false};

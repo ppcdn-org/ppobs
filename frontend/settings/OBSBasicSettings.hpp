@@ -22,6 +22,7 @@
 
 #include <utility/FFmpegShared.hpp>
 
+#include <QCheckBox>
 #include <QPointer>
 #include <QTimeEdit>
 

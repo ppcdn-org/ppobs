@@ -27,6 +27,13 @@ struct ffmpeg_cfg {
 	const char *audio_encoder;
 	int audio_encoder_id;
 	int audio_bitrates[MAX_AUDIO_MIXES]; // multi-track
+	// Per-slot audio codec for dual-audio (Opus + AAC) MPEG-TS publishes.
+	// Slots follow the output's audio encoder order, same as
+	// encoder_packet.track_idx. audio_encoder/audio_encoder_id above remain
+	// for callers that only use one audio track.
+	const char *audio_encoders[MAX_AUDIO_MIXES];
+	int audio_encoder_ids[MAX_AUDIO_MIXES];
+	int frame_sizes[MAX_AUDIO_MIXES];
 	const char *video_settings;
 	const char *audio_settings;
 	int audio_mix_count;

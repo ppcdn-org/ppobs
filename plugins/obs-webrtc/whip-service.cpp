@@ -1,6 +1,6 @@
 #include "whip-service.h"
 
-const char *audio_codecs[] = {"opus", nullptr};
+const char *audio_codecs[] = {"opus", "aac", nullptr};
 const char *video_codecs[] = {"h264", "hevc", "av1", nullptr};
 
 // The Server URL may spell the PPCenter App ID as a "{ppcenter_appid}"

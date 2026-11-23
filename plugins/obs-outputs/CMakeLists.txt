@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.28...3.30)
 
 set(CMAKE_FIND_PACKAGE_PREFER_CONFIG TRUE)
 find_package(MbedTLS REQUIRED)
+find_package(Websocketpp 0.8 REQUIRED)
+find_package(Asio 1.12.1 REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
 set(CMAKE_FIND_PACKAGE_PREFER_CONFIG FALSE)
 find_package(ZLIB REQUIRED)
 
@@ -56,13 +59,15 @@ target_sources(
     rtmp-av1.c
     rtmp-av1.h
     rtmp-helpers.h
+    rtmp-keyframe-client.cpp
+    rtmp-keyframe-client.h
     rtmp-stream.c
     rtmp-stream.h
     rtmp-windows.c
     utils.h
 )
 
-target_compile_definitions(obs-outputs PRIVATE USE_MBEDTLS CRYPTO)
+target_compile_definitions(obs-outputs PRIVATE USE_MBEDTLS CRYPTO _WEBSOCKETPP_CPP11_STL_)
 
 target_compile_options(
   obs-outputs
@@ -80,6 +85,9 @@ target_link_libraries(
     OBS::bpm
     MbedTLS::mbedtls
     ZLIB::ZLIB
+    Websocketpp::Websocketpp
+    OpenSSL::SSL
+    OpenSSL::Crypto
     $<$<PLATFORM_ID:Windows>:OBS::w32-pthreads>
     $<$<PLATFORM_ID:Windows>:crypt32>
     $<$<PLATFORM_ID:Windows>:iphlpapi>

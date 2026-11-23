@@ -38,6 +38,23 @@ bool multitrackEnabled(obs_output_t *output)
 	return enabled;
 }
 
+// dualAudioEnabled reports whether the output has an AAC audio encoder in
+// addition to the primary Opus one. The frontend creates both encoders when
+// the dual-audio publish option is on; WHIPOutput only needs to mirror that
+// state into the SDP.
+bool dualAudioEnabled(obs_output_t *output)
+{
+	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
+		obs_encoder_t *encoder = obs_output_get_audio_encoder(output, i);
+		if (!encoder)
+			continue;
+		const char *codec = obs_encoder_get_codec(encoder);
+		if (codec && strcmp(codec, "aac") == 0)
+			return true;
+	}
+	return false;
+}
+
 } // namespace
 
 WHIPOutput::WHIPOutput(obs_data_t *, obs_output_t *output_, bool p2pOnly) : output(output_), p2p_only(p2pOnly)
@@ -218,15 +235,20 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 	CheckNatProbeRefresh();
 
 	if (packet->type == OBS_ENCODER_AUDIO) {
-		// Shared Opus output: both codec sessions send the same
-		// encoded audio packet on their own independent RTP state -
-		// see the design doc's §4.1 "音频不复制编码结果".
+		// Shared audio output: both codec sessions send the same encoded
+		// packet on their own independent RTP state. SendAudio() routes
+		// Opus and AAC to their own tracks.
 		if (h264Session)
 			h264Session->SendAudio(packet);
 		if (hevcSession)
 			hevcSession->SendAudio(packet);
 
-		if (p2pSignal) {
+		// P2P only ever carries Opus (CreatePeerAudio announces one Opus
+		// m-line); feeding an AAC packet into that track would corrupt it.
+		const char *audio_codec = packet->encoder ? obs_encoder_get_codec(packet->encoder) : nullptr;
+		const bool audio_is_aac = audio_codec && strcmp(audio_codec, "aac") == 0;
+
+		if (p2pSignal && !audio_is_aac) {
 			p2pSignal->ForEachPeer([&](P2PPeer &peer) {
 				if (!peer.audioTrack || !peer.audioTrack->isOpen())
 					return;
@@ -256,82 +278,88 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 		else if (hevcSession && hevcSession->OwnsVideoEncoder(packet->encoder))
 			hevcSession->SendVideo(packet);
 
-		// P2P carries exactly one video layer (PLY-009; CreatePeerVideo
-		// announces a single H264 m-line), so only that layer's encoder
-		// may feed it. Forwarding every layer here interleaved three
-		// resolutions' NAL units into one SSRC/sequence-number stream,
-		// which no decoder can make sense of.
-		if (p2pSignal) {
-			if (packet->encoder == p2pVideoEncoder) {
-				const auto annexB = h264PacketToAnnexB((const uint8_t *)packet->data, packet->size);
-				const uint8_t *videoData = annexB.empty() ? (const uint8_t *)packet->data : annexB.data();
-				const size_t videoSize = annexB.empty() ? packet->size : annexB.size();
-				const auto parameterSets = extractH264ParameterSets(videoData, videoSize);
-				if (!parameterSets.annexB.empty())
-					p2pH264ParameterSets = parameterSets.annexB;
-				// The RTMP/ERTMP primary encoder's first packet has its
-				// SPS/PPS stripped into obs_encoder_get_extra_data()
-				// (libobs' obs_extract_avc_headers), and repeat_headers is
-				// false for non-WHIP services, so no packet ever carries
-				// them. A P2P viewer joining mid-stream then gets RTP but
-				// no decodable frame. Pull them from the encoder's own
-				// extra data once it is available (after the first packet).
-				if (p2pH264ParameterSets.empty() && packet->keyframe) {
-					uint8_t *extraData = nullptr;
-					size_t extraSize = 0;
-					if (obs_encoder_get_extra_data(p2pVideoEncoder, &extraData, &extraSize) &&
-					    extraData && extraSize) {
-						auto fromExtra = extractH264ParameterSetsAny(extraData, extraSize);
-						if (!fromExtra.empty()) {
-							p2pH264ParameterSets = std::move(fromExtra);
-							blog(LOG_INFO,
-							     "[obs-webrtc] [p2p] cached SPS/PPS from encoder extra data (%zu bytes)",
-							     p2pH264ParameterSets.size());
+		// P2P announces one H264 m-line per peer, but each peer may select
+		// any of the Simulcast layers independently. Only the selected
+		// layer's encoder may feed a peer: mixing layers into one
+		// SSRC/sequence-number stream produces an undecodable bitstream.
+		if (p2pSignal &&
+		    std::find(p2pVideoEncoders.begin(), p2pVideoEncoders.end(), packet->encoder) !=
+			    p2pVideoEncoders.end()) {
+			const auto annexB = h264PacketToAnnexB((const uint8_t *)packet->data, packet->size);
+			const uint8_t *videoData = annexB.empty() ? (const uint8_t *)packet->data : annexB.data();
+			const size_t videoSize = annexB.empty() ? packet->size : annexB.size();
+			const auto parameterSets = extractH264ParameterSets(videoData, videoSize);
+
+			p2pSignal->ForEachPeer([&](P2PPeer &peer) {
+				if (!peer.videoTrack || !peer.videoTrack->isOpen())
+					return;
+				const int layer = peer.layerIndex.load();
+				if (layer < 0 || layer >= (int)p2pVideoEncoders.size())
+					return;
+				obs_encoder_t *selected = p2pVideoEncoders[layer];
+				if (packet->encoder != selected)
+					return;
+
+				// Start this peer's feed (or the newly selected layer) on a
+				// keyframe - see P2PPeer::videoStarted.
+				const bool firstForLayer = !peer.videoStarted.load();
+				if (firstForLayer && !packet->keyframe)
+					return;
+
+				// Keep the selected layer's SPS/PPS ready. The RTMP/ERTMP
+				// encoder's first packet has them stripped into
+				// obs_encoder_get_extra_data(), and repeat_headers is false
+				// for non-WHIP services, so a keyframe may carry none. Pull
+				// them from the encoder's own extra data when needed.
+				if (packet->keyframe) {
+					if (!parameterSets.annexB.empty()) {
+						peer.videoParameterSets = parameterSets.annexB;
+					} else if (firstForLayer || peer.videoParameterSets.empty()) {
+						uint8_t *extraData = nullptr;
+						size_t extraSize = 0;
+						if (obs_encoder_get_extra_data(selected, &extraData, &extraSize) &&
+						    extraData && extraSize) {
+							auto fromExtra = extractH264ParameterSetsAny(extraData, extraSize);
+							if (!fromExtra.empty()) {
+								peer.videoParameterSets = std::move(fromExtra);
+								blog(LOG_INFO,
+								     "[obs-webrtc] [p2p] cached SPS/PPS for layer %d from encoder extra data (%zu bytes)",
+								     layer, peer.videoParameterSets.size());
+							}
 						}
 					}
 				}
-				p2pSignal->ForEachPeer([&](P2PPeer &peer) {
-					if (!peer.videoTrack || !peer.videoTrack->isOpen())
-						return;
-					// Start this peer's feed on a keyframe - see P2PPeer::videoStarted.
-					if (!peer.videoStarted && !packet->keyframe)
-						return;
-					int64_t dur = peer.videoStarted ? packet->dts_usec - peer.lastVideoTimestamp : 0;
-					peer.lastVideoTimestamp = packet->dts_usec;
-					peer.videoStarted = true;
-					std::vector<rtc::byte> sample;
-					// A forced NVENC IDR does not repeat SPS/PPS. The peer joins
-					// mid-stream, so without the cached parameter sets Chrome sees
-					// plenty of H264 RTP but cannot bind/initialize a decoder
-					// (codec=null, framesDecoded=0).
-					if (packet->keyframe && parameterSets.annexB.empty() &&
-					    !p2pH264ParameterSets.empty()) {
-						sample.reserve(p2pH264ParameterSets.size() + videoSize);
-						const auto *begin = reinterpret_cast<const rtc::byte *>(p2pH264ParameterSets.data());
-						sample.insert(sample.end(), begin, begin + p2pH264ParameterSets.size());
-					}
-					sample.insert(sample.end(), (rtc::byte *)videoData,
-						      (rtc::byte *)videoData + videoSize);
-					auto rtp = peer.videoSrReporter->rtpConfig;
-					rtp->sequenceNumber = peer.videoSequenceNumber;
-					rtp->ssrc = peer.videoSsrc;
-					// P2P carries one video layer and the generated answer does not
-					// advertise an RID RTP header extension. Setting rid here while
-					// ridId remains zero makes the media packetization disagree with
-					// the SDP (Chrome connects and receives the track but never
-					// assembles a decodable frame). WHIP simulcast sets both rid and
-					// ridId after negotiating the extmap; single-layer P2P needs
-					// neither.
-					rtp->rid.reset();
-					rtp->timestamp = advanceRtpTimestamp(rtp, peer.videoRtpTimestamp, dur);
-					try {
-						peer.videoTrack->send(sample);
-					} catch (...) {
-					}
-					peer.videoSequenceNumber = rtp->sequenceNumber;
-					peer.videoRtpTimestamp = rtp->timestamp;
-				});
-			}
+
+				int64_t dur = peer.videoStarted.load() ? packet->dts_usec - peer.lastVideoTimestamp : 0;
+				peer.lastVideoTimestamp = packet->dts_usec;
+				peer.videoStarted.store(true);
+
+				std::vector<rtc::byte> sample;
+				if (packet->keyframe && parameterSets.annexB.empty() &&
+				    !peer.videoParameterSets.empty()) {
+					sample.reserve(peer.videoParameterSets.size() + videoSize);
+					const auto *begin = reinterpret_cast<const rtc::byte *>(peer.videoParameterSets.data());
+					sample.insert(sample.end(), begin, begin + peer.videoParameterSets.size());
+				}
+				sample.insert(sample.end(), (rtc::byte *)videoData,
+					      (rtc::byte *)videoData + videoSize);
+				auto rtp = peer.videoSrReporter->rtpConfig;
+				rtp->sequenceNumber = peer.videoSequenceNumber;
+				rtp->ssrc = peer.videoSsrc;
+				// The generated answer does not advertise an RID RTP header
+				// extension. Setting rid while ridId remains zero makes the
+				// media packetization disagree with the SDP (Chrome connects
+				// and receives the track but never assembles a decodable
+				// frame). Single-layer P2P needs neither.
+				rtp->rid.reset();
+				rtp->timestamp = advanceRtpTimestamp(rtp, peer.videoRtpTimestamp, dur);
+				try {
+					peer.videoTrack->send(sample);
+				} catch (...) {
+				}
+				peer.videoSequenceNumber = rtp->sequenceNumber;
+				peer.videoRtpTimestamp = rtp->timestamp;
+			});
 		}
 	}
 }
@@ -433,7 +461,7 @@ static std::vector<obs_encoder_t *> collectVideoLayers(obs_output_t *output, con
 	for (uint32_t idx = 0; idx < MAX_OUTPUT_VIDEO_ENCODERS; idx++) {
 		auto encoder = obs_output_get_video_encoder2(output, idx);
 		if (!encoder)
-			break;
+			continue;
 		const char *codec = obs_encoder_get_codec(encoder);
 		if (codec && strcmp(codec, wantCodec) == 0)
 			layers.push_back(encoder);
@@ -568,27 +596,46 @@ ObsEncoderConfig buildEncoderConfig(obs_output_t *output, const std::vector<obs_
 	ObsEncoderConfig config;
 	config.protocol = "whip";
 	config.multitrack = multitrack;
-	config.video_codec = "h264";
-	config.video_codecs.push_back("h264");
-	if (multitrack && !hevc_layers.empty())
-		config.video_codecs.push_back("hevc");
 
-	if (!h264_layers.empty()) {
-		// The primary (highest) H264 layer is the source feed's own
-		// resolution/fps/bitrate; lower layers are its scaled ladder.
-		fillVideoFromEncoder(config, h264_layers[0]);
-		for (size_t i = 0; i < h264_layers.size(); ++i)
-			config.simulcast_layers.push_back(encoderToLayer(h264_layers[i], i));
+	if (h264_layers.empty() && !hevc_layers.empty()) {
+		// HEVC-only publish: the HEVC ladder is the primary feed.
+		config.video_codec = "hevc";
+		config.video_codecs.push_back("hevc");
+		fillVideoFromEncoder(config, hevc_layers[0]);
+		for (size_t i = 0; i < hevc_layers.size(); ++i)
+			config.simulcast_layers.push_back(encoderToLayer(hevc_layers[i], i));
+	} else {
+		config.video_codec = "h264";
+		config.video_codecs.push_back("h264");
+		if (multitrack && !hevc_layers.empty())
+			config.video_codecs.push_back("hevc");
+
+		if (!h264_layers.empty()) {
+			// The primary (highest) H264 layer is the source feed's own
+			// resolution/fps/bitrate; lower layers are its scaled ladder.
+			fillVideoFromEncoder(config, h264_layers[0]);
+			for (size_t i = 0; i < h264_layers.size(); ++i)
+				config.simulcast_layers.push_back(encoderToLayer(h264_layers[i], i));
+		}
 	}
 
-	if (obs_encoder_t *audio = obs_output_get_audio_encoder(output, 0)) {
+	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
+		obs_encoder_t *audio = obs_output_get_audio_encoder(output, i);
+		if (!audio)
+			continue;
+
 		const char *codec = obs_encoder_get_codec(audio);
-		config.audio_codec = codec ? codec : "";
-		obs_data_t *settings = obs_encoder_get_settings(audio);
-		config.audio_bitrate_kbps = encoderBitrateKbps(settings);
-		if (settings)
-			obs_data_release(settings);
-		config.audio_sample_rate = (int)obs_encoder_get_sample_rate(audio);
+		if (codec)
+			config.audio_codecs.push_back(codec);
+
+		if (i == 0) {
+			config.audio_codec = codec ? codec : "";
+			obs_data_t *settings = obs_encoder_get_settings(audio);
+			config.audio_bitrate_kbps = encoderBitrateKbps(settings);
+			if (settings)
+				obs_data_release(settings);
+			config.audio_sample_rate = (int)obs_encoder_get_sample_rate(audio);
+		}
 	}
 	return config;
 }
@@ -646,6 +693,21 @@ bool WHIPOutput::Setup(uint64_t generation)
 	// up and connected below.
 	const bool wantMultitrack = multitrackEnabled(output);
 
+	// An HEVC-only publish is what the frontend builds when the user selects
+	// an HEVC video encoder and leaves HEVC/H264 multitrack off: the HEVC
+	// ladder is attached without an H264 base. Treat the HEVC ladder as the
+	// primary feed instead of failing the "No H264 video encoder" check.
+	auto h264Layers = collectVideoLayers(output, "h264");
+	auto hevcLayers = collectVideoLayers(output, "hevc");
+	obs_encoder_t *primaryEncoder = obs_output_get_video_encoder2(output, 0);
+	const char *primaryCodec = primaryEncoder ? obs_encoder_get_codec(primaryEncoder) : nullptr;
+	const bool hevcOnly = !wantMultitrack && primaryCodec && strcmp(primaryCodec, "hevc") == 0 &&
+			      !hevcLayers.empty();
+	if (hevcOnly) {
+		do_log(LOG_INFO, "HEVC-only WHIP publish (HEVC is the primary encoder); P2P disabled");
+		p2pEnabled = false;
+	}
+
 	std::string ppcenter_url;
 	PPCenterPublishRequest request;
 	std::string deviceId;
@@ -656,7 +718,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 		       "WHIP direct publish to configured endpoint (ppcenter resolution skipped): %s",
 		       configured_server.c_str());
 		resp.whip_tracks["h264"] = PPCenterWhipTrack{configured_server, configured_token};
-		if (wantMultitrack)
+		if (wantMultitrack || hevcOnly)
 			resp.whip_tracks["hevc"] =
 				PPCenterWhipTrack{deriveCodecWhipURL(configured_server, "hevc"), configured_token};
 	} else {
@@ -775,10 +837,10 @@ bool WHIPOutput::Setup(uint64_t generation)
 
 	// Resolved before the p2p_only early return below: a P2P-only output
 	// never reaches the WHIP layer setup, but its Data() still has to know
-	// which single layer may feed the peers (see p2pVideoEncoder).
+	// which layers may feed the peers.
 	{
-		const auto p2pLayers = collectVideoLayers(output, "h264");
-		p2pVideoEncoder = p2pLayers.empty() ? nullptr : p2pLayers.front();
+		p2pVideoEncoders = collectVideoLayers(output, "h264");
+		p2pVideoEncoder = p2pVideoEncoders.empty() ? nullptr : p2pVideoEncoders.front();
 		if (!p2pVideoEncoder && !p2pSignalUrl.empty())
 			do_log(LOG_WARNING, "no H264 layer attached - P2P peers will get audio only");
 	}
@@ -818,12 +880,77 @@ bool WHIPOutput::Setup(uint64_t generation)
 		return true;
 	}
 
-	auto h264Layers = collectVideoLayers(output, "h264");
-	if (h264Layers.empty()) {
+	if (!hevcOnly && h264Layers.empty()) {
 		do_log(LOG_ERROR, "No H264 video encoder assigned");
 		if (IsActiveGeneration(generation))
 			obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
 		return false;
+	}
+
+	if (hevcOnly) {
+		std::string limitError;
+		if (!checkStreamLimits(hevcLayers, limitError)) {
+			do_log(LOG_ERROR, "HEVC stream exceeds ppobs limits: %s", limitError.c_str());
+			if (IsActiveGeneration(generation))
+				obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
+			return false;
+		}
+
+#ifdef WHIP_DEGRADE_ACTIVE
+		int keep = WsDegradeClient::Instance().TargetLayers("hevc");
+		if (keep >= 1 && keep < (int)hevcLayers.size())
+			hevcLayers.erase(hevcLayers.begin(), hevcLayers.end() - keep);
+#endif
+
+		auto hevcTrack = resp.whip_tracks.find("hevc");
+		if (hevcTrack == resp.whip_tracks.end() || hevcTrack->second.url.empty() ||
+		    hevcTrack->second.bearer_token.empty()) {
+			do_log(LOG_ERROR, "HEVC-only publish but ppcenter did not return an hevc WHIP track");
+			if (IsActiveGeneration(generation))
+				obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
+			return false;
+		}
+
+		std::string hevcOnlyUrl = hevcTrack->second.url;
+		std::string hevcOnlyToken = hevcTrack->second.bearer_token;
+		degrade_url_hevc = hevcOnlyUrl;
+		degrade_token_hevc = hevcOnlyToken;
+
+		ObsEncoderConfig encoderConfig =
+			buildEncoderConfig(output, std::vector<obs_encoder_t *>{}, hevcLayers, true);
+		encoder_report_url = DeriveEncoderReportUrl(ppcenter_url);
+		encoder_report_body = BuildEncoderReportJson(request.app_id, request.app_secret,
+							     request.stream_name, deviceId, EncoderReportNowUtc(),
+							     encoderConfig);
+		encoder_report_pending = !encoder_report_url.empty() && !encoder_report_body.empty();
+
+		WHIPCodecSession::Config hevcCfg;
+		hevcCfg.endpoint_url = hevcOnlyUrl;
+		hevcCfg.bearer_token = hevcOnlyToken;
+		hevcCfg.has_audio = true;
+		hevcCfg.has_aac = dualAudioEnabled(output);
+		hevcCfg.enable_pacing = enable_pacing;
+		hevcCfg.disconnect_grace_sec = disconnect_grace_sec;
+		hevcCfg.reconnect_backoff_sec = reconnect_backoff_sec;
+		hevcCfg.watchdog_interval_sec = watchdog_interval_sec;
+		hevcCfg.watchdog_stall_sec = watchdog_stall_sec;
+		hevcCfg.max_reconnect_attempts = multitrack_max_reconnect_attempts;
+
+		hevcSession = std::make_unique<WHIPCodecSession>(output, "hevc");
+		hevcSession->SetVideoLayers(hevcLayers);
+		if (!hevcSession->Connect(hevcCfg)) {
+			do_log(LOG_ERROR, "HEVC WHIP connect failed");
+			hevcSession.reset();
+			if (IsActiveGeneration(generation)) {
+				obs_output_set_reconnect_delay(output, reconnect_backoff_sec * 1000);
+				obs_output_signal_stop(output, OBS_OUTPUT_DISCONNECTED);
+			}
+			return false;
+		}
+
+		do_log(LOG_INFO, "WHIP endpoints: h264=disabled hevc=%s P2P: disabled",
+		       hevcOnlyUrl.c_str());
+		return true;
 	}
 
 	{
@@ -846,7 +973,8 @@ bool WHIPOutput::Setup(uint64_t generation)
 		if (keep >= 1 && keep < (int)h264Layers.size())
 			h264Layers.erase(h264Layers.begin(), h264Layers.end() - keep);
 	}
-	p2pVideoEncoder = h264Layers.empty() ? nullptr : h264Layers.front();
+	p2pVideoEncoders = h264Layers;
+	p2pVideoEncoder = p2pVideoEncoders.empty() ? nullptr : p2pVideoEncoders.front();
 #endif
 
 	// H264 always publishes on its codec-tagged track (".../h264/whip"),
@@ -865,10 +993,8 @@ bool WHIPOutput::Setup(uint64_t generation)
 	degrade_url_h264 = h264Url;
 	degrade_token_h264 = h264Token;
 
-	std::vector<obs_encoder_t *> hevcLayers;
 	std::string hevcUrl, hevcToken;
 	if (wantMultitrack) {
-		hevcLayers = collectVideoLayers(output, "hevc");
 		if (hevcLayers.empty()) {
 			do_log(LOG_ERROR,
 			       "HEVC/H264 multitrack is enabled but no HEVC video encoder is assigned");
@@ -931,6 +1057,7 @@ bool WHIPOutput::Setup(uint64_t generation)
 	h264Cfg.endpoint_url = h264Url;
 	h264Cfg.bearer_token = h264Token;
 	h264Cfg.has_audio = true;
+	h264Cfg.has_aac = dualAudioEnabled(output);
 	h264Cfg.enable_pacing = enable_pacing;
 	h264Cfg.disconnect_grace_sec = disconnect_grace_sec;
 	h264Cfg.reconnect_backoff_sec = reconnect_backoff_sec;
@@ -1058,7 +1185,8 @@ void WHIPOutput::StartThread(uint64_t generation)
 		return;
 	}
 
-	do_log(LOG_INFO, "WHIPOutput: Started (%s)", hevcSession ? "H264+HEVC multitrack" : "H264 only");
+	do_log(LOG_INFO, "WHIPOutput: Started (%s)",
+	       (h264Session && hevcSession) ? "H264+HEVC multitrack" : hevcSession ? "HEVC only" : "H264 only");
 
 	if (encoder_report_pending) {
 		ReportEncoderConfigAsync(encoder_report_url, encoder_report_body);
@@ -1071,9 +1199,13 @@ void WHIPOutput::StartThread(uint64_t generation)
 	// feeds the P2P peers from Data() (that feed is already guarded by
 	// h264Session, which stays null here).
 	if (!p2p_only) {
-		WHIPCodecSession::Callbacks cb;
-		cb.onPermanentFailure = [this](const std::string &reason) { OnSessionPermanentFailure("h264", reason); };
-		h264Session->Supervise(cb);
+		if (h264Session) {
+			WHIPCodecSession::Callbacks cb;
+			cb.onPermanentFailure = [this](const std::string &reason) {
+				OnSessionPermanentFailure("h264", reason);
+			};
+			h264Session->Supervise(cb);
+		}
 		if (hevcSession) {
 			WHIPCodecSession::Callbacks hevcCb;
 			hevcCb.onPermanentFailure = [this](const std::string &reason) {
@@ -1152,20 +1284,79 @@ bool WHIPOutput::StartP2PSignal()
 	// only starts on a keyframe (see P2PPeer::videoStarted), and a viewer that
 	// sees no frame within its grace window falls back to edge. Force one at
 	// connect time instead of waiting for the encoder's scheduled GOP.
-	p2pSignal->SetOnPeerConnected([this]() {
+	p2pSignal->SetOnPeerConnected([this](const std::string &sessionId) {
 		if (p2pVideoEncoder)
 			obs_encoder_request_keyframe(p2pVideoEncoder);
+		SendP2PLayers(sessionId);
 	});
 	// A P2P viewer's own PLI/FIR (join, loss beyond the NACK window, decoder
-	// reset) must reach the encoder just like an edge viewer's PLI does via
-	// the WHIP path's RtcpLossTracker. Otherwise it waits up to a full GOP.
-	p2pSignal->SetOnKeyFrameRequest([this]() {
-		if (p2pVideoEncoder)
-			obs_encoder_request_keyframe(p2pVideoEncoder);
+	// reset) must reach the selected layer's encoder just like an edge
+	// viewer's PLI does via the WHIP path's RtcpLossTracker.
+	p2pSignal->SetOnKeyFrameRequest([this](const std::string &sessionId) {
+		obs_encoder_t *encoder = p2pVideoEncoder;
+		if (p2pSignal) {
+			p2pSignal->ForEachPeer([&](P2PPeer &peer) {
+				if (peer.sessionId != sessionId)
+					return;
+				const int layer = peer.layerIndex.load();
+				if (layer >= 0 && layer < (int)p2pVideoEncoders.size())
+					encoder = p2pVideoEncoders[layer];
+			});
+		}
+		if (encoder)
+			obs_encoder_request_keyframe(encoder);
+	});
+	// The viewer's quality menu sends select_layer through the signaling
+	// channel; switch this peer to that Simulcast layer.
+	p2pSignal->SetOnSelectLayer([this](const std::string &sessionId, int layer) {
+		SelectP2PLayer(sessionId, layer);
 	});
 	p2pSignal->Start();
 	qosPolicy = std::make_unique<UplinkQosPolicy>(UplinkQosConfig{});
 	return true;
+}
+
+void WHIPOutput::SendP2PLayers(const std::string &sessionId)
+{
+	if (!p2pSignal)
+		return;
+
+	std::vector<P2PLayerInfo> layers;
+	layers.reserve(p2pVideoEncoders.size());
+	for (size_t i = 0; i < p2pVideoEncoders.size(); i++) {
+		obs_encoder_t *encoder = p2pVideoEncoders[i];
+		if (!encoder)
+			continue;
+
+		P2PLayerInfo info;
+		info.id = (int)i;
+		info.width = (int)obs_encoder_get_width(encoder);
+		info.height = (int)obs_encoder_get_height(encoder);
+		OBSDataAutoRelease settings = obs_encoder_get_settings(encoder);
+		int bitrateKbps = settings ? (int)obs_data_get_int(settings, "bitrate") : 0;
+		info.bitrate = bitrateKbps > 0 ? bitrateKbps * 1000 : 1;
+		info.label = info.height > 0 ? std::to_string(info.height) + "p" : "Layer " + std::to_string(i);
+		layers.push_back(std::move(info));
+	}
+
+	p2pSignal->SendLayers(sessionId, layers);
+}
+
+void WHIPOutput::SelectP2PLayer(const std::string &sessionId, int layer)
+{
+	if (!p2pSignal || layer < 0 || layer >= (int)p2pVideoEncoders.size())
+		return;
+	if (!p2pSignal->SetPeerLayer(sessionId, layer, (int)p2pVideoEncoders.size()))
+		return;
+
+	obs_encoder_t *encoder = p2pVideoEncoders[layer];
+	if (encoder)
+		obs_encoder_request_keyframe(encoder);
+	p2pSignal->SendLayerSwitched(sessionId, layer);
+
+	const int width = encoder ? (int)obs_encoder_get_width(encoder) : 0;
+	const int height = encoder ? (int)obs_encoder_get_height(encoder) : 0;
+	do_log(LOG_INFO, "P2P peer %s selected layer %d (%dx%d)", sessionId.c_str(), layer, width, height);
 }
 
 void WHIPOutput::CheckUplinkQos()
@@ -1343,7 +1534,7 @@ void register_whip_output()
 {
 	const uint32_t base_flags = OBS_OUTPUT_ENCODED | OBS_OUTPUT_SERVICE | OBS_OUTPUT_MULTI_TRACK_AV;
 
-	const char *audio_codecs = "opus";
+	const char *audio_codecs = "opus;aac";
 #ifdef ENABLE_HEVC
 	const char *video_codecs = "h264;hevc;av1";
 #else

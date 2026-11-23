@@ -79,15 +79,16 @@ struct BasicOutputHandler {
 	// Optional crop publish (Settings > Video > General): a second,
 	// H264-only single-stream publish of a cropped region of the program.
 	// It goes to the main stream name with "-h5" appended and reuses the
-	// main publish's audio encoder; encoding parameters follow the main
-	// stream except for the frame rate and the bitrate, which is scaled by
-	// both the crop/main pixel area ratio and the crop/main frame-rate ratio.
-	// Never carries HEVC or a Simulcast ladder.
+	// main publish's audio encoder; encoding parameters (including frame
+	// rate) follow the main stream, and the bitrate is scaled by the
+	// crop/main pixel area ratio. Never carries HEVC or a Simulcast ladder.
 	OBSOutputAutoRelease cropOutput;
 	OBSServiceAutoRelease cropService;
 	OBSEncoderAutoRelease cropVideoEncoder;
 	OBSCanvasAutoRelease cropCanvas;
 	OBSSceneAutoRelease cropScene;
+	OBSSignal cropStopStreaming;
+	bool cropStopping = false;
 
 	// Creates and starts the crop publish, if enabled in Settings > Video.
 	// Best-effort: a crop failure is logged but never blocks or stops the
@@ -100,6 +101,12 @@ struct BasicOutputHandler {
 	// obs_output_start for all transports, so SRT/ERTMP enforce the same
 	// resolution/FPS/bitrate caps as WHIP.
 	bool CheckStreamLimits(std::string &error) const;
+
+	// Target resolution for the streaming encoders. Read from the Video config
+	// (OutputCX/OutputCY) instead of the live video context so a settings
+	// change immediately followed by Start Streaming cannot size the
+	// Simulcast/HEVC ladders from the previous resolution.
+	void GetStreamingOutputSize(uint32_t &width, uint32_t &height) const;
 
 	// P2P companion output (ppcenter_p2p_output): started alongside a non-WHIP
 	// (e.g. SRT) primary publish so that publish can still join the P2P mesh -

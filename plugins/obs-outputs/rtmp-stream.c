@@ -18,6 +18,7 @@
 #include "rtmp-stream.h"
 #include "rtmp-av1.h"
 #include "rtmp-hevc.h"
+#include "rtmp-keyframe-client.h"
 
 #include <obs-avc.h>
 #include <obs-hevc.h>
@@ -102,6 +103,8 @@ static inline bool disconnected(struct rtmp_stream *stream)
 static void rtmp_stream_destroy(void *data)
 {
 	struct rtmp_stream *stream = data;
+
+	rtmp_keyframe_unregister(stream->output);
 
 	if (stopping(stream) && !connecting(stream)) {
 		pthread_join(stream->send_thread, NULL);
@@ -201,6 +204,8 @@ fail:
 static void rtmp_stream_stop(void *data, uint64_t ts)
 {
 	struct rtmp_stream *stream = data;
+
+	rtmp_keyframe_unregister(stream->output);
 
 	if (stopping(stream) && ts != 0)
 		return;
@@ -1295,6 +1300,21 @@ static bool init_connect(struct rtmp_stream *stream)
 			const char *codec = obs_encoder_get_codec(enc);
 			stream->video_codec[i] = to_video_type(codec);
 		}
+	}
+
+	/* RTMP has no in-band keyframe request; mmx relays a new viewer's
+	 * request over the out-of-band control WebSocket. The credentials were
+	 * written into the service settings by ResolvePPCDNPublishEndpoint. */
+	{
+		obs_data_t *service_settings = obs_service_get_settings(service);
+		const char *codec = venc ? obs_encoder_get_codec(venc) : NULL;
+		const bool hevc = codec && strcmp(codec, "hevc") == 0;
+		const char *degrade_ws_url = obs_data_get_string(
+			service_settings, hevc ? "ppcdn_degrade_ws_url_hevc" : "ppcdn_degrade_ws_url_h264");
+		const char *degrade_ws_token = obs_data_get_string(
+			service_settings, hevc ? "ppcdn_degrade_ws_token_hevc" : "ppcdn_degrade_ws_token_h264");
+		rtmp_keyframe_register(stream->output, degrade_ws_url, degrade_ws_token);
+		obs_data_release(service_settings);
 	}
 
 	deque_free(&stream->dbr_frames);

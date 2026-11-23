@@ -4,6 +4,9 @@
 
 struct SimpleOutput : BasicOutputHandler {
 	OBSEncoder audioStreaming;
+	// The AAC half of the fixed streaming dual-audio combination (Opus in
+	// audioStreaming + AAC here), published alongside it on every transport.
+	OBSEncoder audioStreamingAAC;
 	OBSEncoder videoStreaming;
 	OBSEncoder audioRecording;
 	OBSEncoder audioArchive;

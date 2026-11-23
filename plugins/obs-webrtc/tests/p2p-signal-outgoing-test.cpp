@@ -43,5 +43,21 @@ int main()
 		Require(parsed.type == "close", "close type mismatch");
 		Require(parsed.reason == "reason with \"quotes\" and newline\n", "close reason escaping mismatch");
 	}
+	{
+		auto parsed = ParseP2PSignalMessage(BuildP2PLayerSwitchedJSON("s5", 1));
+		Require(parsed.valid, "layer_switched JSON should parse");
+		Require(parsed.type == "layer_switched", "layer_switched type mismatch");
+		Require(parsed.hasLayer && parsed.layer == 1, "layer_switched layer mismatch");
+	}
+	{
+		std::vector<P2PLayerInfo> layers = {
+			{0, 1920, 1080, 4000000, "1080p"},
+			{1, 1280, 720, 2000000, "720p"},
+		};
+		auto json = BuildP2PLayersJSON("s6", layers);
+		Require(json.find("\"type\":\"layers\"") != std::string::npos, "layers type missing");
+		Require(json.find("\"1080p\"") != std::string::npos, "layers label missing");
+		Require(json.find("\"720p\"") != std::string::npos, "layers second label missing");
+	}
 	return 0;
 }

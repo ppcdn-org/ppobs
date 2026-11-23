@@ -4,6 +4,9 @@
 
 struct AdvancedOutput : BasicOutputHandler {
 	OBSEncoder streamAudioEnc;
+	// The AAC half of the fixed streaming dual-audio combination (Opus in
+	// streamAudioEnc + AAC here), published alongside it on every transport.
+	OBSEncoder streamAudioAACEnc;
 	OBSEncoder streamArchiveEnc;
 	OBSEncoder streamTrack[MAX_AUDIO_MIXES];
 	OBSEncoder recordTrack[MAX_AUDIO_MIXES];

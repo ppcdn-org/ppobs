@@ -255,6 +255,24 @@ static void OBSCompanionStopStreaming(void *data, calldata_t *params)
 		obs_output_stop(output->streamOutput);
 }
 
+// OBSCropStopStreaming fires when the optional crop publish stops on its own
+// (most commonly an SRT/RTMP connection failure). Clean it up on the main
+// thread; otherwise the failed output stays attached and StopCropOutput can
+// force-stop a half-started output, hanging the user's Stop action.
+static void OBSCropStopStreaming(void *data, calldata_t *params)
+{
+	BasicOutputHandler *output = static_cast<BasicOutputHandler *>(data);
+	if (output->cropStopping)
+		return;
+
+	const char *last_error = calldata_string(params, "last_error");
+	blog(LOG_WARNING, "[crop] crop publish stopped (%s); cleaning up",
+	     (last_error && *last_error) ? last_error : "no error given");
+
+	QMetaObject::invokeMethod(
+		output->main, [output]() { output->StopCropOutput(true); }, Qt::QueuedConnection);
+}
+
 // BuildCodecServiceSettings copies a service's settings and points the
 // publish URL at that codec's own path, which is the only thing that differs
 // between the two connections of a multitrack publish.
@@ -624,20 +642,36 @@ bool BasicOutputHandler::CheckStreamLimits(std::string &error) const
 	return true;
 }
 
+void BasicOutputHandler::GetStreamingOutputSize(uint32_t &width, uint32_t &height) const
+{
+	width = 0;
+	height = 0;
+	if (main) {
+		width = (uint32_t)config_get_uint(main->Config(), "Video", "OutputCX");
+		height = (uint32_t)config_get_uint(main->Config(), "Video", "OutputCY");
+		if (width < 32 || height < 32) {
+			width = (uint32_t)config_get_uint(main->Config(), "Video", "BaseCX");
+			height = (uint32_t)config_get_uint(main->Config(), "Video", "BaseCY");
+		}
+	}
+	if (width < 32 || height < 32) {
+		width = video_output_get_width(obs_get_video());
+		height = video_output_get_height(obs_get_video());
+	}
+}
+
 // Bitrate for the crop publish: the main stream's bitrate scaled by the crop
-// region's share of the main output's pixel area and by the crop stream's
-// frame rate relative to the main output's frame rate.
+// region's share of the main output's pixel area. The crop publishes at the
+// same frame rate as the main output, so no frame-rate ratio is needed.
 static int64_t CropOutputProportionalBitrate(int64_t mainBitrate, uint32_t mainWidth, uint32_t mainHeight,
-					     uint32_t cropWidth, uint32_t cropHeight, uint32_t cropFps,
-					     double mainFps)
+					     uint32_t cropWidth, uint32_t cropHeight)
 {
 	if (mainWidth == 0 || mainHeight == 0)
 		return mainBitrate > 0 ? mainBitrate : 1;
 
 	const double areaRatio =
 		(double)cropWidth * (double)cropHeight / ((double)mainWidth * (double)mainHeight);
-	const double fpsRatio = mainFps > 0.0 ? (double)cropFps / mainFps : 1.0;
-	const int64_t bitrate = (int64_t)std::llround((double)mainBitrate * areaRatio * fpsRatio);
+	const int64_t bitrate = (int64_t)std::llround((double)mainBitrate * areaRatio);
 	return bitrate > 0 ? bitrate : 1;
 }
 
@@ -669,10 +703,6 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 	int y = (int)config_get_int(main->Config(), "Video", "CropY");
 	int width = (int)config_get_int(main->Config(), "Video", "CropWidth");
 	int height = (int)config_get_int(main->Config(), "Video", "CropHeight");
-	int cropFps = (int)config_get_int(main->Config(), "Video", "CropFPS");
-	if (cropFps <= 0)
-		cropFps = 15;
-	cropFps = std::min(std::max(cropFps, 1), 120);
 
 	// Crop coordinates are in the main *output* (scaled) resolution, the
 	// same space the bitrate ratio is computed in.
@@ -723,8 +753,9 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 	cropOvi.base_height = baseHeight;
 	cropOvi.output_width = (uint32_t)width;
 	cropOvi.output_height = (uint32_t)height;
-	cropOvi.fps_num = (uint32_t)cropFps;
-	cropOvi.fps_den = 1;
+	// The crop publish always runs at the main output's exact frame rate.
+	cropOvi.fps_num = ovi.fps_num;
+	cropOvi.fps_den = ovi.fps_den;
 	if (cropOvi.scale_type == OBS_SCALE_DISABLE)
 		cropOvi.scale_type = OBS_SCALE_BICUBIC;
 
@@ -811,6 +842,29 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 		return;
 	}
 
+	// The crop stream is a separate PPCenter stream ("<name>-h5"), so it
+	// needs its own SRT publish token bound to that exact path. Copying the
+	// primary service's token makes the Origin reject the connection with
+	// "publish token authentication failure".
+	std::string endpointError;
+	if (!ResolvePPCDNPublishEndpoint(cropService, endpointError)) {
+		blog(LOG_WARNING, "[crop] failed to resolve the PPCenter publish endpoint: %s",
+		     endpointError.empty() ? "unknown error" : endpointError.c_str());
+		StopCropOutput(true);
+		return;
+	}
+
+	// Crop is always H264 and its URL ends in /h264, so it must use the
+	// h264-specific token rather than the codec-less one.
+	OBSDataAutoRelease cropResolved = obs_service_get_settings(cropService);
+	if (cropResolved) {
+		const char *h264Token = obs_data_get_string(cropResolved, "ppcdn_publish_token_h264");
+		if (h264Token && *h264Token) {
+			obs_data_set_string(cropResolved, "ppcdn_publish_token", h264Token);
+			obs_service_update(cropService, cropResolved);
+		}
+	}
+
 	const char *mainEncoderId = obs_encoder_get_id(videoEncoder);
 	const std::string h264EncoderId = ResolveWHIPH264EncoderId(mainEncoderId ? mainEncoderId : "");
 	OBSDataAutoRelease mainSettings = obs_encoder_get_settings(videoEncoder);
@@ -827,7 +881,7 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 
 	const int64_t mainBitrate = obs_data_get_int(cropSettings, "bitrate");
 	const int64_t cropBitrate = CropOutputProportionalBitrate(
-		mainBitrate, outWidth, outHeight, (uint32_t)width, (uint32_t)height, (uint32_t)cropFps, mainFps);
+		mainBitrate, outWidth, outHeight, (uint32_t)width, (uint32_t)height);
 	obs_data_set_int(cropSettings, "bitrate", cropBitrate);
 
 	const int64_t mainMaxBitrate = obs_data_get_int(cropSettings, "max_bitrate");
@@ -892,6 +946,8 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 		maxRetries = 0;
 	obs_output_set_reconnect_settings(cropOutput, maxRetries, retryDelay);
 
+	cropStopStreaming.Connect(obs_output_get_signal_handler(cropOutput), "stop", OBSCropStopStreaming, this);
+
 	if (!obs_output_start(cropOutput)) {
 		const char *error = obs_output_get_last_error(cropOutput);
 		blog(LOG_WARNING, "[crop] failed to start the crop publish (%s); main publish continues",
@@ -900,7 +956,7 @@ void BasicOutputHandler::StartCropOutput(obs_service_t *service, obs_encoder_t *
 		return;
 	}
 
-	blog(LOG_INFO, "[crop] publishing %dx%d at %d fps, %lld kbps to %s", width, height, cropFps,
+	blog(LOG_INFO, "[crop] publishing %dx%d at %g fps, %lld kbps to %s", width, height, mainFps,
 	     (long long)cropBitrate, cropUrl.c_str());
 }
 
@@ -910,6 +966,9 @@ void BasicOutputHandler::StopCropOutput(bool force)
 
 	if (!cropOutput && !cropCanvas && !cropVideoEncoder && !cropService)
 		return;
+
+	cropStopping = true;
+	cropStopStreaming.Disconnect();
 
 	// Always force-stop: the output is about to be released, and its stop
 	// path must have finished before the video/encoder it references goes
@@ -924,6 +983,8 @@ void BasicOutputHandler::StopCropOutput(bool force)
 		obs_canvas_set_channel(cropCanvas, 0, nullptr);
 	cropCanvas = nullptr;
 	cropScene = nullptr;
+
+	cropStopping = false;
 }
 
 BasicOutputHandler::~BasicOutputHandler()
@@ -966,8 +1027,6 @@ BasicOutputHandler::BasicOutputHandler(OBSBasic *main_) : main(main_)
 				    strcmp(obs_service_get_id(service), "rtmp_custom") == 0;
 	const bool ladder_transport = is_whip || is_srt_custom || is_rtmp_custom;
 	const int configured_layers = config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers");
-	if (ladder_transport && configured_layers > 1)
-		whipSimulcastEncoders = make_unique<WHIPSimulcastEncoders>(4);
 
 	// Same transport gate as the Simulcast encoders above. When both H264
 	// and HEVC are enabled the two ladders can't share one publish - the
@@ -976,6 +1035,11 @@ BasicOutputHandler::BasicOutputHandler(OBSBasic *main_) : main(main_)
 	// as for custom SRT. See BuildCodecServiceSettings/SetupCompanionStream.
 	const bool hevc_multitrack = ladder_transport &&
 				     config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
+
+	// Dual-codec publishes cap the shared ladder at 3 layers; a single-codec
+	// H264 or HEVC ladder may use 4.
+	if (ladder_transport && configured_layers > 1)
+		whipSimulcastEncoders = make_unique<WHIPSimulcastEncoders>(hevc_multitrack ? 3 : 4);
 	if (hevc_multitrack)
 		whipHevcEncoders = make_unique<WHIPHevcEncoders>();
 

@@ -208,6 +208,12 @@ public:
 
 			if (videoSettings) {
 				layerSettings = obs_data_create_from_json(obs_data_get_json(videoSettings));
+				// Repeat VPS/SPS/PPS (and H264 SPS/PPS) on every keyframe.
+				// The WHIP service only sets this on the main Stream encoder;
+				// these separately-created ladder encoders otherwise emit
+				// parameter sets only once, so viewers that join later (or
+				// switch layers) get undecodable keyframes.
+				obs_data_set_bool(layerSettings, "repeat_headers", true);
 				if (haveCustom && !custom.followMain) {
 					obs_data_set_int(layerSettings, "bitrate", custom.bitrateKbps);
 				} else {

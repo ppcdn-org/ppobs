@@ -318,8 +318,18 @@ P2PSignalClient::P2PSignalClient(const std::string &url, const std::string &toke
 P2PSignalClient::~P2PSignalClient() { Stop(); }
 
 void P2PSignalClient::SetOnPeerUpdated(std::function<void()> callback) { onPeerUpdated = std::move(callback); }
-void P2PSignalClient::SetOnPeerConnected(std::function<void()> callback) { onPeerConnected = std::move(callback); }
-void P2PSignalClient::SetOnKeyFrameRequest(std::function<void()> callback) { onKeyFrameRequest = std::move(callback); }
+void P2PSignalClient::SetOnPeerConnected(std::function<void(const std::string &)> callback)
+{
+	onPeerConnected = std::move(callback);
+}
+void P2PSignalClient::SetOnKeyFrameRequest(std::function<void(const std::string &)> callback)
+{
+	onKeyFrameRequest = std::move(callback);
+}
+void P2PSignalClient::SetOnSelectLayer(std::function<void(const std::string &, int)> callback)
+{
+	onSelectLayer = std::move(callback);
+}
 
 bool P2PSignalClient::Start()
 {
@@ -343,7 +353,10 @@ void P2PSignalClient::OnMessage(const std::string &data)
 	if (msg.type == "allocated") HandleAllocated(msg.sessionId);
 	else if (msg.type == "offer") HandleOffer(msg.sessionId, msg.sdp);
 	else if (msg.type == "ice") HandleIce(msg.sessionId, msg.candidate, msg.sdpMid);
-	else if (msg.type == "close" || msg.type == "error") HandleClose(msg.sessionId);
+	else if (msg.type == "select_layer" && msg.hasLayer) {
+		if (onSelectLayer)
+			onSelectLayer(msg.sessionId, msg.layer);
+	} else if (msg.type == "close" || msg.type == "error") HandleClose(msg.sessionId);
 }
 
 void P2PSignalClient::HandleAllocated(const std::string &sessionId)
@@ -420,7 +433,7 @@ void P2PSignalClient::HandleOffer(const std::string &sessionId, const std::strin
 			// P2PPeer::videoStarted - and a viewer that gets no frame in time
 			// falls back to edge).
 			if (onPeerConnected)
-				onPeerConnected();
+				onPeerConnected(sessionId);
 			SendConnected(sessionId);
 		} else if (state == rtc::PeerConnection::State::Failed || state == rtc::PeerConnection::State::Disconnected)
 			HandleClose(sessionId);
@@ -482,9 +495,9 @@ void P2PSignalClient::CreatePeerVideo(P2PPeer &peer)
 		// P2P track the request is dropped and the viewer waits for the next
 		// scheduled IDR (up to a full GOP) even though NACK could not help.
 		auto lossTracker = std::make_shared<RtcpLossTracker>();
-		lossTracker->on_key_frame_request = [this]() {
+		lossTracker->on_key_frame_request = [this, sessionId = peer.sessionId]() {
 			if (onKeyFrameRequest)
-				onKeyFrameRequest();
+				onKeyFrameRequest(sessionId);
 		};
 		pk->addToChain(lossTracker);
 		peer.videoTrack->setMediaHandler(pk);
@@ -530,6 +543,31 @@ void P2PSignalClient::SendConnected(const std::string &sessionId)
 void P2PSignalClient::SendClose(const std::string &sessionId, const std::string &reason)
 {
 	impl->wsSend(BuildP2PCloseJSON(sessionId, reason));
+}
+
+void P2PSignalClient::SendLayers(const std::string &sessionId, const std::vector<P2PLayerInfo> &layers)
+{
+	impl->wsSend(BuildP2PLayersJSON(sessionId, layers));
+}
+
+void P2PSignalClient::SendLayerSwitched(const std::string &sessionId, int layer)
+{
+	impl->wsSend(BuildP2PLayerSwitchedJSON(sessionId, layer));
+}
+
+bool P2PSignalClient::SetPeerLayer(const std::string &sessionId, int layer, int layerCount)
+{
+	if (layer < 0 || layer >= layerCount)
+		return false;
+	std::lock_guard<std::mutex> lock(peersMutex);
+	auto it = peers.find(sessionId);
+	if (it == peers.end())
+		return false;
+	it->second->layerIndex.store(layer);
+	// Hold the feed until this layer's next keyframe and force a fresh
+	// parameter-set cache (SPS/PPS differ per resolution).
+	it->second->videoStarted.store(false);
+	return true;
 }
 
 size_t P2PSignalClient::PeerCount() { std::lock_guard<std::mutex> lock(peersMutex); return peers.size(); }

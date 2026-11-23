@@ -3,6 +3,7 @@
 #include <abs-ts.h>
 #include <utility/audio-encoders.hpp>
 #include <utility/EncoderSettingsFile.hpp>
+#include <utility/PPCDNVideoBitrate.hpp>
 #include <utility/PublishCodecCheck.hpp>
 #include <utility/StartMultiTrackVideoStreamingGuard.hpp>
 #include <widgets/OBSBasic.hpp>
@@ -10,6 +11,27 @@
 #include <qt-wrappers.hpp>
 
 using namespace std;
+
+// SetStreamingAudioEncoders installs the single-audio Opus track or the
+// dual-audio Opus+AAC pair. Enhanced RTMP's legacy audio framing only fits
+// AAC in slot 0; WHIP and MPEG-TS keep Opus first.
+static void SetStreamingAudioEncoders(obs_output_t *output, OBSEncoder &opus, OBSEncoder &aac,
+				      const char *outputType)
+{
+	if (!aac) {
+		obs_output_set_audio_encoder(output, opus, 0);
+		return;
+	}
+
+	const bool aacFirst = outputType && strcmp(outputType, "rtmp_output") == 0;
+	if (aacFirst) {
+		obs_output_set_audio_encoder(output, aac, 0);
+		obs_output_set_audio_encoder(output, opus, 1);
+	} else {
+		obs_output_set_audio_encoder(output, opus, 0);
+		obs_output_set_audio_encoder(output, aac, 1);
+	}
+}
 
 static OBSData GetDataFromJsonFile(const char *jsonFile)
 {
@@ -50,16 +72,60 @@ static OBSData GetEncoderDataFromJsonFile(const char *base, const char *encoderI
 	const OBSBasic *basic = OBSBasic::Get();
 	const OBSProfile &currentProfile = basic->GetCurrentProfile();
 
+	OBSData data;
 	if (encoderId && *encoderId) {
 		const std::string perEncoder = EncoderJsonFileName(base, encoderId);
 		const std::filesystem::path perEncoderPath =
 			currentProfile.path / std::filesystem::u8path(perEncoder);
 
 		if (std::filesystem::exists(perEncoderPath))
-			return GetDataFromJsonFile(perEncoder.c_str());
+			data = GetDataFromJsonFile(perEncoder.c_str());
 	}
 
-	return GetDataFromJsonFile(LegacyEncoderJsonFileName(base).c_str());
+	if (!data)
+		data = GetDataFromJsonFile(LegacyEncoderJsonFileName(base).c_str());
+
+	// The video settings dialog derives the selected encoder's bitrate from
+	// the output resolution (see PPCDNVideoBitrateForResolution), but that
+	// value only ever lived in the dialog's in-memory encoder settings.
+	// Enforce it here as well so the publish follows the resolution even
+	// when the per-encoder JSON still holds an older bitrate - for both
+	// H264 and HEVC, since either can be the main Stream encoder. This also
+	// sizes the H264 Simulcast ladder and the HEVC auto bitrate (50% of
+	// the H264 main) from the same linked value.
+	if (data && encoderId && *encoderId && strcmp(base, "streamEncoder") == 0) {
+		const char *codec = obs_get_encoder_codec(encoderId);
+		if (codec && (strcmp(codec, "h264") == 0 || strcmp(codec, "hevc") == 0)) {
+			uint32_t cx = (uint32_t)config_get_uint(basic->Config(), "Video", "OutputCX");
+			uint32_t cy = (uint32_t)config_get_uint(basic->Config(), "Video", "OutputCY");
+			if (cx < 32 || cy < 32) {
+				cx = video_output_get_width(obs_get_video());
+				cy = video_output_get_height(obs_get_video());
+			}
+
+			const int linkedBitrate = PPCDNVideoBitrateForResolution(cx, cy);
+			const int savedBitrate = (int)obs_data_get_int(data, "bitrate");
+			if (linkedBitrate > 0 && savedBitrate != linkedBitrate) {
+				blog(LOG_INFO, "[PPCDN] linked %s bitrate %d kbps for %ux%u (saved %d)", codec,
+				     linkedBitrate, cx, cy, savedBitrate);
+				obs_data_set_int(data, "bitrate", linkedBitrate);
+			}
+
+			// A 1-second GOP bounds viewer startup latency even when a
+			// keyframe request is lost: the worst case is one GOP, not
+			// two seconds. The bitrate cost is negligible at these
+			// targets and this applies to the streaming ladder only
+			// (recordEncoder is unaffected).
+			const int savedKeyint = (int)obs_data_get_int(data, "keyint_sec");
+			if (savedKeyint != 1) {
+				blog(LOG_INFO, "[PPCDN] streaming keyframe interval %d -> 1s for fast startup",
+				     savedKeyint);
+				obs_data_set_int(data, "keyint_sec", 1);
+			}
+		}
+	}
+
+	return data;
 }
 
 static void ApplyEncoderDefaults(OBSData &settings, const obs_encoder_t *encoder)
@@ -90,6 +156,14 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	const char *recType = config_get_string(main->Config(), "AdvOut", "RecType");
 	const char *streamEncoder = config_get_string(main->Config(), "AdvOut", "Encoder");
 	const char *streamAudioEncoder = config_get_string(main->Config(), "AdvOut", "AudioEncoder");
+	// Streaming audio is fixed to the dual Opus+AAC combination; the settings
+	// picker has a single entry. Ignore a legacy AAC-only/other saved value so
+	// the transport always gets the Opus track it requires.
+	{
+		const char *codec = obs_get_encoder_codec(streamAudioEncoder);
+		if (!codec || strcmp(codec, "opus") != 0)
+			streamAudioEncoder = "ffmpeg_opus";
+	}
 	const char *recordEncoder = config_get_string(main->Config(), "AdvOut", "RecEncoder");
 	const char *recAudioEncoder = config_get_string(main->Config(), "AdvOut", "RecAudioEncoder");
 	const char *recFormat = config_get_string(main->Config(), "AdvOut", "RecFormat2");
@@ -184,10 +258,16 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	// HEVC it goes to the companion output instead, so without a base here
 	// the H264 connection publishes a ladder with no full-resolution layer
 	// - mmx logs "contains 2 h264 video tracks" for a 3-layer config.
-	const bool needsWhipH264Base = strcmp(obs_service_get_id(main->GetService()), "whip_custom") == 0 ||
-				       whipHevcEncoders != nullptr;
+	const bool isWhipService = strcmp(obs_service_get_id(main->GetService()), "whip_custom") == 0;
+	const char *streamCodec = obs_get_encoder_codec(streamEncoder);
+	// An HEVC main encoder with multitrack off publishes the HEVC ladder on
+	// its own /hevc path (WHIPOutput treats the HEVC layers as primary when
+	// no H264 layer is attached), so it must NOT get an H264 base track.
+	const bool hevcOnly = isWhipService && whipHevcEncoders == nullptr && streamCodec &&
+			      strcmp(streamCodec, "hevc") == 0 &&
+			      !config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
+	const bool needsWhipH264Base = (isWhipService && !hevcOnly) || whipHevcEncoders != nullptr;
 	if (needsWhipH264Base) {
-		const char *streamCodec = obs_get_encoder_codec(streamEncoder);
 		if (!streamCodec || strcmp(streamCodec, "h264") != 0) {
 			std::string h264EncoderId = ResolveWHIPH264EncoderId(streamEncoder);
 			// Load H264-specific settings instead of reusing the HEVC
@@ -217,6 +297,10 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		}
 	}
 
+	uint32_t streamingWidth = 0;
+	uint32_t streamingHeight = 0;
+	GetStreamingOutputSize(streamingWidth, streamingHeight);
+
 	if (whipSimulcastEncoders != nullptr) {
 		// The Simulcast ladder normally follows whatever codec the user
 		// picked as the stream encoder. With HEVC/H264 multitrack on,
@@ -238,8 +322,7 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		whipSimulcastEncoders->Create(simulcastEncoder.c_str(), simulcastSettings,
 					      config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 					      config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
-					      video_output_get_width(obs_get_video()),
-					      video_output_get_height(obs_get_video()), main->Config());
+					      streamingWidth, streamingHeight, main->Config());
 	}
 	if (whipHevcEncoders != nullptr) {
 		std::string hevcEncoderId = ResolveWHIPHevcEncoderId(streamEncoder);
@@ -300,8 +383,7 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 			whipHevcEncoders->Create(hevcEncoderId, hevcBaseSettings, h264MainBitrate,
 						 config_get_int(main->Config(), "AdvOut", "RescaleFilter"),
 						 config_get_int(main->Config(), "Stream1", "WHIPSimulcastTotalLayers"),
-						 video_output_get_width(obs_get_video()),
-						 video_output_get_height(obs_get_video()), main->Config(),
+						 streamingWidth, streamingHeight, main->Config(),
 						 useExistingMain ? videoStreaming : nullptr);
 		}
 	}
@@ -345,7 +427,30 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 	if (!streamAudioEnc)
 		throw "Failed to create streaming audio encoder "
 		      "(advanced output)";
+	const char *streamAudioCodec = obs_encoder_get_codec(streamAudioEnc);
 	obs_encoder_release(streamAudioEnc);
+
+	/* Streaming audio is always the ppobs dual-audio combination: Opus is the
+	 * primary track and AAC is published alongside it. The settings UI exposes
+	 * a single "ffmpeg opus + aac" entry, so the old DualAudioAACOpus toggle
+	 * is gone. Dual audio still replaces the multi-track audio layout and is
+	 * only valid for a single streaming audio mix. */
+	const int multiTrackAudioMixes = config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes");
+	const bool singleStreamAudioMix =
+		multiTrackAudioMixes != 0 && (multiTrackAudioMixes & (multiTrackAudioMixes - 1)) == 0;
+
+	if (streamAudioCodec && strcmp(streamAudioCodec, "opus") == 0 && singleStreamAudioMix) {
+		const char *aac_id = GetSimpleAACEncoderForBitrate(128);
+		if (aac_id) {
+			streamAudioAACEnc = obs_audio_encoder_create(aac_id, "adv_stream_audio_aac", nullptr,
+								    streamTrackIndex, nullptr);
+			if (streamAudioAACEnc)
+				obs_encoder_release(streamAudioAACEnc);
+		}
+		if (!streamAudioAACEnc)
+			blog(LOG_WARNING, "Dual audio is enabled but no AAC encoder is available; "
+					  "falling back to Opus only");
+	}
 
 	id = "";
 	int vodTrack = config_get_int(main->Config(), "AdvOut", "VodTrackIndex") - 1;
@@ -752,6 +857,8 @@ inline void AdvancedOutput::UpdateAudioSettings()
 
 			if (track == streamTrackIndex)
 				obs_encoder_update(streamAudioEnc, settings[i]);
+			if (streamAudioAACEnc && track == streamTrackIndex)
+				obs_encoder_update(streamAudioAACEnc, settings[i]);
 			if (track == vodTrackIndex)
 				obs_encoder_update(streamArchiveEnc, settings[i]);
 		} else {
@@ -776,6 +883,8 @@ void AdvancedOutput::SetupOutputs()
 		obs_encoder_set_audio(recordTrack[i], obs_get_audio());
 	}
 	obs_encoder_set_audio(streamAudioEnc, obs_get_audio());
+	if (streamAudioAACEnc)
+		obs_encoder_set_audio(streamAudioAACEnc, obs_get_audio());
 	obs_encoder_set_audio(streamArchiveEnc, obs_get_audio());
 
 	SetupStreaming();
@@ -819,6 +928,10 @@ inline std::optional<size_t> AdvancedOutput::VodTrackMixerIdx(obs_service_t *ser
 
 inline void AdvancedOutput::SetupVodTrack(obs_service_t *service)
 {
+	/* Slot 1 is the AAC track of a dual-audio publish. */
+	if (streamAudioAACEnc)
+		return;
+
 	if (VodTrackMixerIdx(service).has_value())
 		obs_output_set_audio_encoder(streamOutput, streamArchiveEnc, 1);
 	else
@@ -916,7 +1029,8 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 				// its own output/connection, starting at slot 0
 				// since it shares nothing with the H264 one.
 				whipHevcEncoders->SetStreamOutput(hevcStreamOutput, 0);
-				obs_output_set_audio_encoder(hevcStreamOutput, streamAudioEnc, 0);
+				SetStreamingAudioEncoders(hevcStreamOutput, streamAudioEnc,
+							  streamAudioAACEnc, type.c_str());
 			} else {
 				// HEVC's ladder starts right after H264's own slots (main +
 				// its Simulcast layers) - see collectVideoLayers() in
@@ -964,10 +1078,8 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 			else
 				blog(LOG_ERROR, "WHIP: no encoder slot left for the H264 base track");
 		}
-		obs_output_set_audio_encoder(streamOutput, streamAudioEnc, 0);
-
-		if (!is_multitrack_output) {
-			obs_output_set_audio_encoder(streamOutput, streamAudioEnc, 0);
+		if (!is_multitrack_output || streamAudioAACEnc) {
+			SetStreamingAudioEncoders(streamOutput, streamAudioEnc, streamAudioAACEnc, type.c_str());
 		} else {
 			int idx = 0;
 			for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
@@ -1042,6 +1154,13 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 			is_whip = true;
 	}
 
+	// HEVC-only WHIP publish (HEVC encoder with multitrack off) has no H264
+	// layer, so P2P (H264-only) cannot be offered; keep the output from
+	// arming a probe/signaling session that would have no video to send.
+	const char *streamCodec = videoStreaming ? obs_encoder_get_codec(videoStreaming) : nullptr;
+	const bool hevcOnly = is_whip && streamCodec && strcmp(streamCodec, "hevc") == 0 &&
+			      !config_get_bool(main->Config(), "Stream1", "WHIPHevcH264Multitrack");
+
 	OBSDataAutoRelease settings = obs_data_create();
 	obs_data_set_string(settings, "bind_ip", bindIP);
 	obs_data_set_string(settings, "ip_family", ipFamily);
@@ -1050,7 +1169,7 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	obs_data_set_bool(settings, "low_latency_mode_enabled", enableLowLatencyMode);
 #endif
 	obs_data_set_bool(settings, "dyn_bitrate", enableDynBitrate);
-	obs_data_set_bool(settings, "ppcdn_p2p_enabled", P2PStreamingEnabled());
+	obs_data_set_bool(settings, "ppcdn_p2p_enabled", P2PStreamingEnabled() && !hevcOnly);
 	obs_data_set_int(settings, "ppcdn_p2p_max_sessions", P2PStreamingMaxSessions());
 	obs_data_set_int(settings, "whip_disconnect_grace_sec", whipDisconnectGraceSec);
 	obs_data_set_int(settings, "whip_reconnect_backoff_sec", whipReconnectBackoffSec);
@@ -1099,7 +1218,7 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 		return false;
 	}
 
-	// Strong-consistency start (design §4.1): the HEVC publish goes up
+	// Strong-consistency start (design 禮4.1): the HEVC publish goes up
 	// first, so a failure there costs nothing visible. If the H264 half
 	// then fails, the HEVC half is torn back down rather than left
 	// publishing a stream no H264 player can use.
