@@ -481,5 +481,5 @@ const char* obs_module_description(void) {
 }
 
 const char* obs_module_author(void) {
-    return PLUGIN_AUTHOR;
+    return "";
 }

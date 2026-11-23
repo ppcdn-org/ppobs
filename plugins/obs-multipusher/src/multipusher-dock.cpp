@@ -65,7 +65,7 @@ void MultipusherDock::Register() {
             if (event != OBS_FRONTEND_EVENT_FINISHED_LOADING) return;
             QMainWindow* mw = static_cast<QMainWindow*>(obs_frontend_get_main_window());
             if (!mw) return;
-            auto* d = new QDockWidget(QString::fromUtf8("Multipusher v1.1.6 Amor@2026"), mw);
+            auto* d = new QDockWidget(QString::fromUtf8("Multipusher v1.1.6"), mw);
             d->setObjectName("obsMultipusherDock");
             d->setWidget(new MultipusherDock(d));
             mw->addDockWidget(Qt::BottomDockWidgetArea, d);
