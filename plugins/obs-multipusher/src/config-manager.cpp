@@ -104,6 +104,9 @@ bool ConfigManager::Load(const std::string& path) {
         return false;
     }
 
+    // enabled (opt-in; absent or false keeps the plugin idle)
+    cfg_.enabled = obs_data_get_bool(data, "enabled");
+
     // siteName
     cfg_.siteName = obs_data_get_string(data, "siteName");
 
@@ -219,6 +222,7 @@ bool ConfigManager::Load(const std::string& path) {
 bool ConfigManager::Save(const std::string& path) const {
     obs_data_t* data = obs_data_create();
 
+    obs_data_set_bool(data, "enabled", cfg_.enabled);
     obs_data_set_string(data, "siteName", cfg_.siteName.c_str());
     obs_data_set_string(data, "backendURL", cfg_.backendURL.c_str());
 

@@ -431,15 +431,25 @@ bool obs_module_load(void) {
     Utils::InitPluginLogger();
     MP_LOG(LOG_INFO, "[obs-multipusher] v%s loading...", PLUGIN_VERSION);
 
+    // Read the config first: the plugin is opt-in and stays completely idle
+    // (no output/encoder registration, no dock, no auto-publish) unless
+    // "enabled": true is set in pusher.local.json.
+    g_ctx = std::make_unique<MultipusherContext>();
+    g_ctx->LoadDefaultConfig();
+
+    if (!g_ctx->config.Get().enabled) {
+        MP_LOG(LOG_INFO,
+               "[obs-multipusher] disabled; set \"enabled\": true in pusher.local.json and "
+               "restart OBS to activate");
+        return true;
+    }
+
     // Register our custom SRT pusher output type BEFORE anything else
     RegisterSRTPusherOutput();
 
     // Built-in AAC encoder fallback so publishing keeps audio even when the
     // host's obs-ffmpeg plugin is unavailable.
     RegisterMultipusherAacEncoder();
-
-    g_ctx = std::make_unique<MultipusherContext>();
-    g_ctx->LoadDefaultConfig();
 
     // Log available output types with flags for diagnostics
     {

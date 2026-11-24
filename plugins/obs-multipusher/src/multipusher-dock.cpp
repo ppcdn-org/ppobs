@@ -125,6 +125,12 @@ void MultipusherDock::buildUI() {
 
     // Input / Site / Stream / bitrate+ / Start Pub row
     auto* row = new QHBoxLayout();
+
+    enableCheck_ = new QCheckBox("Enabled");
+    enableCheck_->setToolTip("Activate multipusher (persisted as \"enabled\" in pusher.local.json)");
+    row->addWidget(enableCheck_);
+
+    row->addSpacing(12);
     row->addWidget(new QLabel("Input:"));
     inputCombo_ = new QComboBox();
     inputCombo_->addItems({"4K", "1080P"});
@@ -189,6 +195,8 @@ void MultipusherDock::buildUI() {
             this, &MultipusherDock::onPubButtonClicked);
     connect(intervalButton_, &QPushButton::clicked,
             this, &MultipusherDock::onIntervalButtonClicked);
+    connect(enableCheck_, &QCheckBox::toggled,
+            this, &MultipusherDock::onEnableToggled);
 
     // Stream table
     buildStreamTable();
@@ -290,6 +298,12 @@ void MultipusherDock::applyConfigToUI() {
     int inputIdx = inputCombo_->findText(QSTRING(cfg.input.inputResolution));
     inputCombo_->setCurrentIndex(inputIdx >= 0 ? inputIdx : 0);
     inputCombo_->blockSignals(false);
+
+    if (enableCheck_) {
+        enableCheck_->blockSignals(true);
+        enableCheck_->setChecked(cfg.enabled);
+        enableCheck_->blockSignals(false);
+    }
 
     loadIntervalToUI();
 }
@@ -544,6 +558,25 @@ void MultipusherDock::onIntervalButtonClicked() {
     updateButtons();
 }
 
+void MultipusherDock::onEnableToggled(bool checked) {
+    if (!ctx()) return;
+    auto& cfg = ctx()->config.GetMutable();
+    if (cfg.enabled == checked) return;
+
+    cfg.enabled = checked;
+    ctx()->config.Save(ctx()->config.Path());
+    MP_LOG(LOG_INFO, "[obs-multipusher] enabled=%d (saved to config)", checked ? 1 : 0);
+
+    if (!checked) {
+        if (intervalMode_) intervalMode_ = false;
+        if (ctx()->publishing) ctx()->StopPublishing();
+        appendLog("Disabled; set \"enabled\": true in pusher.local.json to re-enable");
+    } else {
+        appendLog("Enabled");
+    }
+    updateButtons();
+}
+
 // Keep the two mutually-exclusive publish buttons and the interval editor in
 // sync with the current mode/publishing state.
 void MultipusherDock::updateButtons() {
@@ -568,13 +601,22 @@ void MultipusherDock::updateButtons() {
         "QPushButton:hover { background:#e55; }";
 
     bool pub = ctx()->publishing;
+    bool enabled = ctx()->config.Get().enabled;
 
-    // 0 = idle, 1 = manual publishing, 2 = interval mode.
-    int state = intervalMode_ ? 2 : (pub ? 1 : 0);
+    // 0 = idle, 1 = manual publishing, 2 = interval mode, 3 = disabled.
+    int state = !enabled ? 3 : (intervalMode_ ? 2 : (pub ? 1 : 0));
     if (state == lastButtonState_) return;
     lastButtonState_ = state;
 
-    if (intervalMode_) {
+    if (!enabled) {
+        if (pubButton_->text() != kStartPub) pubButton_->setText(kStartPub);
+        pubButton_->setStyleSheet(kGreenPub);
+        pubButton_->setEnabled(false);
+
+        if (intervalButton_->text() != kStartInterval) intervalButton_->setText(kStartInterval);
+        intervalButton_->setStyleSheet(kBlueInterval);
+        intervalButton_->setEnabled(false);
+    } else if (intervalMode_) {
         // Interval mode owns publishing: manual Start Pub disabled, keeps
         // its "Start Pub" label (it's not the thing that stops interval mode).
         if (pubButton_->text() != kStartPub) pubButton_->setText(kStartPub);
@@ -605,10 +647,10 @@ void MultipusherDock::updateButtons() {
     }
 
     // The interval editor is locked while interval mode is running.
-    bool editEnabled = !intervalMode_;
+    bool editEnabled = enabled && !intervalMode_;
     if (intervalStart_) intervalStart_->setEnabled(editEnabled);
     if (intervalEnd_) intervalEnd_->setEnabled(editEnabled);
     for (auto* c : intervalDays_)
         if (c) c->setEnabled(editEnabled);
-    if (qualitySpin_) qualitySpin_->setEnabled(!pub && !intervalMode_);
+    if (qualitySpin_) qualitySpin_->setEnabled(enabled && !pub && !intervalMode_);
 }

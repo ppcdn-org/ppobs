@@ -37,6 +37,7 @@ private slots:
     void onStreamNameChanged(int index);
     void onPubButtonClicked();
     void onIntervalButtonClicked();
+    void onEnableToggled(bool checked);
 
 private:
     void buildUI();
@@ -56,6 +57,7 @@ private:
     bool intervalsActiveNow() const;
     void updateIntervalControl();
 
+    QCheckBox*    enableCheck_       = nullptr;
     QComboBox*    inputCombo_        = nullptr;
     QComboBox*    siteNameCombo_     = nullptr;
     QComboBox*    streamNameCombo_   = nullptr;

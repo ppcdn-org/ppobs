@@ -58,6 +58,7 @@ struct IntervalSlot {
 
 /// Complete multipusher configuration.
 struct MultipusherConfig {
+    bool        enabled = false;  // opt-in: plugin stays idle unless true
     std::string siteName;         // "3drush-fwh"
     std::string backendURL;       // ABR player backend base URL (e.g. http://127.0.0.1:8080)
     TencentSrtConfig  tencentSrt;
