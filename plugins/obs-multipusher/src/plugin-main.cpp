@@ -1,5 +1,6 @@
 #include "plugin-main.hpp"
 #include "srt-pusher.hpp"
+#include "aac-encoder.hpp"
 
 #ifdef HAS_DOCK_UI
 #include "multipusher-dock.hpp"
@@ -432,6 +433,10 @@ bool obs_module_load(void) {
 
     // Register our custom SRT pusher output type BEFORE anything else
     RegisterSRTPusherOutput();
+
+    // Built-in AAC encoder fallback so publishing keeps audio even when the
+    // host's obs-ffmpeg plugin is unavailable.
+    RegisterMultipusherAacEncoder();
 
     g_ctx = std::make_unique<MultipusherContext>();
     g_ctx->LoadDefaultConfig();

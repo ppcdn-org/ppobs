@@ -385,8 +385,9 @@ obs_encoder_t* OutputManager::createVideoEncoder(const StreamConfig& sc) {
 obs_encoder_t* OutputManager::createAudioEncoder(const StreamConfig& sc) {
     const char* encoderId = nullptr;
 
-    // Prefer the cross-platform FFmpeg AAC encoder, then the platform ones.
-    static const char* preferredAac[] = {"ffmpeg_aac", "CoreAudio_AAC", "libfdk_aac", nullptr};
+    // Prefer the host's system AAC encoders, then our own built-in one (used
+    // when obs-ffmpeg could not be loaded on this machine).
+    static const char* preferredAac[] = {"ffmpeg_aac", "CoreAudio_AAC", "libfdk_aac", "mp_aac", nullptr};
     for (int i = 0; preferredAac[i]; ++i) {
         if (encoderTypeExists(preferredAac[i])) {
             encoderId = preferredAac[i];

@@ -16,6 +16,8 @@ add_library(OBS::multipusher ALIAS obs-multipusher)
 target_sources(
   obs-multipusher
   PRIVATE # cmake-format: sortable
+          src/aac-encoder.cpp
+          src/aac-encoder.hpp
           src/config-manager.cpp
           src/config-manager.hpp
           src/device-enumerator.cpp
