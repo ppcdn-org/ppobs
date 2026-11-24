@@ -425,6 +425,41 @@ function(_bundle_dependencies target)
     endif()
   endforeach()
 
+  # OpenSSL is frequently provided by a system package (e.g. PostgreSQL, vcpkg)
+  # whose imported targets only expose the .lib import libraries, so the generic
+  # dependency walk above misses the runtime DLLs. Without them obs-ffmpeg.dll,
+  # obs-outputs.dll and obs-webrtc.dll fail to load on machines that don't have
+  # OpenSSL on PATH (RTMP output ends up "protocol not registered"). Bundle the
+  # DLLs explicitly when we can locate them next to the import libraries.
+  if(target STREQUAL obs-studio AND TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto)
+    set(_obs_openssl_hints "${OPENSSL_ROOT_DIR}/bin" "${OPENSSL_ROOT_DIR}")
+    foreach(_ossl_target OpenSSL::SSL OpenSSL::Crypto)
+      get_target_property(_ossl_implib ${_ossl_target} IMPORTED_IMPLIB)
+      if(_ossl_implib)
+        get_filename_component(_ossl_libdir "${_ossl_implib}" DIRECTORY)
+        list(APPEND _obs_openssl_hints "${_ossl_libdir}/../bin" "${_ossl_libdir}")
+      endif()
+    endforeach()
+
+    find_file(OBS_OPENSSL_SSL_DLL
+              NAMES libssl-3-x64.dll libssl-3.dll ssl.dll
+              HINTS ${_obs_openssl_hints}
+              NO_DEFAULT_PATH)
+    find_file(OBS_OPENSSL_CRYPTO_DLL
+              NAMES libcrypto-3-x64.dll libcrypto-3.dll crypto.dll
+              HINTS ${_obs_openssl_hints}
+              NO_DEFAULT_PATH)
+
+    if(OBS_OPENSSL_SSL_DLL AND OBS_OPENSSL_CRYPTO_DLL)
+      message(STATUS "Bundling OpenSSL runtime: ${OBS_OPENSSL_SSL_DLL}, ${OBS_OPENSSL_CRYPTO_DLL}")
+      foreach(config IN ITEMS DEBUG RELWITHDEBINFO RELEASE MINSIZEREL)
+        list(APPEND library_paths_${config} ${OBS_OPENSSL_SSL_DLL} ${OBS_OPENSSL_CRYPTO_DLL})
+      endforeach()
+    else()
+      message(WARNING "OpenSSL runtime DLLs not found; obs-ffmpeg/obs-outputs/obs-webrtc may fail to load.")
+    endif()
+  endif()
+
   foreach(config IN ITEMS DEBUG RELWITHDEBINFO RELEASE MINSIZEREL)
     list(REMOVE_DUPLICATES library_paths_${config})
   endforeach()
