@@ -77,7 +77,8 @@ private:
     obs_encoder_t* createVideoEncoder(const StreamConfig& sc);
     obs_encoder_t* createAudioEncoder(const StreamConfig& sc);
     obs_output_t*  createSRTOutput(const std::string& name,
-                                    const std::string& srtURL);
+                                    const std::string& srtURL,
+                                    bool videoOnly);
 
     static void onOutputStart(void* data, calldata_t* cd);
     static void onOutputStop(void* data, calldata_t* cd);

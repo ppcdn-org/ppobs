@@ -88,16 +88,24 @@ bool OutputManager::Start() {
     // ── 3. Start all outputs ────────────────────────────────────
     bool anyStarted = false;
     for (auto& slot : slots_) {
-        if (!slot.output || !slot.videoEncoder || !slot.audioEncoder) {
-            MP_LOG(LOG_ERROR, "[obs-multipusher] slot %s missing output or encoder, skipping",
+        if (!slot.output || !slot.videoEncoder) {
+            MP_LOG(LOG_ERROR, "[obs-multipusher] slot %s missing output or video encoder, skipping",
                    slot.level.c_str());
             continue;
+        }
+        // A missing audio encoder (e.g. the obs-ffmpeg AAC encoder is not
+        // available on this machine) must not abort publishing entirely: the
+        // SRT push can carry video only. Degrade instead of failing the slot.
+        if (!slot.audioEncoder) {
+            MP_LOG(LOG_WARNING,
+                   "[obs-multipusher] slot %s has no audio encoder; publishing video only",
+                   slot.level.c_str());
         }
 
         // Try explicit encoder init before start
         {
             auto* venc = obs_output_get_video_encoder(slot.output);
-            auto* aenc = obs_output_get_audio_encoder(slot.output, 0);
+            auto* aenc = slot.audioEncoder ? obs_output_get_audio_encoder(slot.output, 0) : nullptr;
             MP_LOG(LOG_INFO, "[obs-multipusher] pre-start [%s]: venc=%s aenc=%s",
                    slot.level.c_str(),
                    venc ? "ok" : "null",
@@ -377,17 +385,46 @@ obs_encoder_t* OutputManager::createVideoEncoder(const StreamConfig& sc) {
 obs_encoder_t* OutputManager::createAudioEncoder(const StreamConfig& sc) {
     const char* encoderId = nullptr;
 
-    // Check available AAC encoders
-    if (encoderTypeExists("CoreAudio_AAC"))
-        encoderId = "CoreAudio_AAC";
-    else if (encoderTypeExists("ffmpeg_aac"))
-        encoderId = "ffmpeg_aac";
-    else
+    // Prefer the cross-platform FFmpeg AAC encoder, then the platform ones.
+    static const char* preferredAac[] = {"ffmpeg_aac", "CoreAudio_AAC", "libfdk_aac", nullptr};
+    for (int i = 0; preferredAac[i]; ++i) {
+        if (encoderTypeExists(preferredAac[i])) {
+            encoderId = preferredAac[i];
+            break;
+        }
+    }
+
+    // Fall back to enumerating for any registered AAC encoder so a build that
+    // exposes AAC under a different id still works.
+    if (!encoderId) {
+        size_t idx = 0;
+        const char* id = nullptr;
+        while (obs_enum_encoder_types(idx++, &id)) {
+            if (!id || obs_get_encoder_type(id) != OBS_ENCODER_AUDIO)
+                continue;
+            const char* codec = obs_get_encoder_codec(id);
+            if (codec && strcmp(codec, "aac") == 0) {
+                encoderId = id;
+                break;
+            }
+        }
+    }
+
+    if (!encoderId) {
+        MP_LOG(LOG_ERROR,
+               "[obs-multipusher] no AAC audio encoder is registered; audio will be omitted "
+               "(is the obs-ffmpeg plugin loaded?)");
         return nullptr;
+    }
 
     obs_encoder_t* encoder = obs_audio_encoder_create(encoderId,
         ("mp_aenc_" + sc.level).c_str(), nullptr, 0, nullptr);
-    if (!encoder) return nullptr;
+    if (!encoder) {
+        MP_LOG(LOG_ERROR,
+               "[obs-multipusher] obs_audio_encoder_create failed for '%s' (level %s)",
+               encoderId, sc.level.c_str());
+        return nullptr;
+    }
 
     obs_data_t* settings = obs_data_create();
     int audioBitrate = 128; // default
@@ -419,7 +456,9 @@ void OutputManager::createOutputs() {
         }
 
         std::string outputName = "mp_" + slot.level;
-        slot.output = createSRTOutput(outputName, slot.srtURL);
+        // Use the audio-less output type when no AAC encoder is available so
+        // libobs' audio_valid() check doesn't reject the start.
+        slot.output = createSRTOutput(outputName, slot.srtURL, slot.audioEncoder == nullptr);
         if (!slot.output) {
             MP_LOG(LOG_ERROR, "[obs-multipusher] failed to create SRT output for %s",
                    slot.level.c_str());
@@ -477,7 +516,8 @@ void OutputManager::createOutputs() {
 }
 
 obs_output_t* OutputManager::createSRTOutput(const std::string& name,
-                                              const std::string& srtURL) {
+                                              const std::string& srtURL,
+                                              bool videoOnly) {
     // ffmpeg_muxer reads "path", ffmpeg_mpegts_muxer reads "url"
     // Set both so either type works
     auto makeSettings = [&]() {
@@ -489,9 +529,12 @@ obs_output_t* OutputManager::createSRTOutput(const std::string& name,
         return s;
     };
 
-    // ffmpeg_muxer first: encoded+noservice, reads "path"
-    const char* outputTypes[] = {"mp_srt_pusher", "ffmpeg_muxer",
-                                  "ffmpeg_mpegts_muxer", nullptr};
+    // ffmpeg_muxer first: encoded+noservice, reads "path". The custom
+    // mp_srt_pusher variant without OBS_OUTPUT_AUDIO is used when we have no
+    // audio encoder, because OBS requires a valid audio encoder for outputs
+    // that declare the audio flag.
+    const char* outputTypes[] = {videoOnly ? "mp_srt_pusher_v" : "mp_srt_pusher",
+                                  "ffmpeg_muxer", "ffmpeg_mpegts_muxer", nullptr};
 
     for (int i = 0; outputTypes[i]; ++i) {
         obs_data_t* settings = makeSettings();

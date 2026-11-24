@@ -504,13 +504,10 @@ static void srt_pusher_encoded_packet(void* data, struct encoder_packet* packet)
 
 // ── Public registration ───────────────────────────────────────────
 
-void RegisterSRTPusherOutput() {
-    // Surface FFmpeg / libsrt diagnostics in the OBS log.
-    av_log_set_callback(srt_pusher_av_log);
-
+static void register_srt_pusher_output(const char* id, uint32_t flags) {
     obs_output_info info = {};
-    info.id             = "mp_srt_pusher";
-    info.flags          = OBS_OUTPUT_ENCODED | OBS_OUTPUT_VIDEO | OBS_OUTPUT_AUDIO;
+    info.id             = id;
+    info.flags          = flags;
     info.get_name       = srt_pusher_get_name;
     info.create         = srt_pusher_create;
     info.destroy        = srt_pusher_destroy;
@@ -519,5 +516,15 @@ void RegisterSRTPusherOutput() {
     info.encoded_packet = srt_pusher_encoded_packet;
 
     obs_register_output(&info);
-    MP_LOG(LOG_INFO, "[obs-multipusher] registered custom output type: mp_srt_pusher");
+    MP_LOG(LOG_INFO, "[obs-multipusher] registered custom output type: %s", id);
+}
+
+void RegisterSRTPusherOutput() {
+    // Surface FFmpeg / libsrt diagnostics in the OBS log.
+    av_log_set_callback(srt_pusher_av_log);
+
+    register_srt_pusher_output("mp_srt_pusher", OBS_OUTPUT_ENCODED | OBS_OUTPUT_VIDEO | OBS_OUTPUT_AUDIO);
+    // Video-only variant: used when no AAC encoder is available so that OBS'
+    // audio_valid() check doesn't reject the output start.
+    register_srt_pusher_output("mp_srt_pusher_v", OBS_OUTPUT_ENCODED | OBS_OUTPUT_VIDEO);
 }
