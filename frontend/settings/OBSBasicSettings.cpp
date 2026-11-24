@@ -2134,10 +2134,48 @@ OBSPropertiesView *OBSBasicSettings::CreateEncoderPropertyView(const char *encod
 void OBSBasicSettings::LoadAdvOutputStreamingEncoderProperties()
 {
 	const char *type = config_get_string(main->Config(), "AdvOut", "Encoder");
+	QString selectedType = QT_UTF8(type ? type : "");
 
 	delete streamEncoderProps;
-	streamEncoderProps = CreateEncoderPropertyView(type, EncoderJsonFileName("streamEncoder", type).c_str(),
-						       "streamEncoder.json");
+	streamEncoderProps = nullptr;
+
+	if (!SetComboByValue(ui->advOutEncoder, selectedType)) {
+		QByteArray encoderId = selectedType.toUtf8();
+		uint32_t caps = obs_get_encoder_caps(encoderId.constData());
+		if ((caps & ENCODER_HIDE_FLAGS) != 0) {
+			QString encName = QT_UTF8(obs_encoder_get_display_name(encoderId.constData()));
+			if (caps & OBS_ENCODER_CAP_DEPRECATED)
+				encName += " (" + QTStr("Deprecated") + ")";
+
+			ui->advOutEncoder->insertItem(0, encName, selectedType);
+			SetComboByValue(ui->advOutEncoder, selectedType);
+		} else {
+			// The saved encoder isn't offered for the current service/codec
+			// set (for example the config was moved from a machine that had
+			// a different hardware encoder). Prefer the software encoder,
+			// then any other enabled entry, instead of leaving the combo
+			// empty -- closing the settings would otherwise be blocked with
+			// "no encoder selected".
+			int fallback = ui->advOutEncoder->findData("obs_x264");
+			if (fallback < 0)
+				fallback = FirstEnabledComboIndex(ui->advOutEncoder);
+			ui->advOutEncoder->setCurrentIndex(fallback);
+			if (fallback >= 0) {
+				QString selected = ui->advOutEncoder->itemData(fallback).toString();
+				blog(LOG_WARNING,
+				     "[settings] streaming encoder '%s' is unavailable; falling back to '%s'",
+				     type ? type : "", QT_TO_UTF8(selected));
+				selectedType = selected;
+				config_set_string(main->Config(), "AdvOut", "Encoder", QT_TO_UTF8(selectedType));
+			}
+		}
+	}
+
+	curAdvStreamEncoder = selectedType;
+
+	streamEncoderProps = CreateEncoderPropertyView(
+		QT_TO_UTF8(selectedType), EncoderJsonFileName("streamEncoder", QT_TO_UTF8(selectedType)).c_str(),
+		"streamEncoder.json");
 	streamEncoderProps->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
 	ui->advOutEncoderLayout->addWidget(streamEncoderProps);
 
@@ -2145,20 +2183,6 @@ void OBSBasicSettings::LoadAdvOutputStreamingEncoderProperties()
 	connect(streamEncoderProps, &OBSPropertiesView::Changed, this, &OBSBasicSettings::AdvReplayBufferChanged);
 	connect(streamEncoderProps, &OBSPropertiesView::Changed, this,
 		[this]() { RefreshWHIPHevcBitrateDefaults(); });
-
-	curAdvStreamEncoder = type;
-
-	if (!SetComboByValue(ui->advOutEncoder, type)) {
-		uint32_t caps = obs_get_encoder_caps(type);
-		if ((caps & ENCODER_HIDE_FLAGS) != 0) {
-			QString encName = QT_UTF8(obs_encoder_get_display_name(type));
-			if (caps & OBS_ENCODER_CAP_DEPRECATED)
-				encName += " (" + QTStr("Deprecated") + ")";
-
-			ui->advOutEncoder->insertItem(0, encName, QT_UTF8(type));
-			SetComboByValue(ui->advOutEncoder, type);
-		}
-	}
 
 	UpdateStreamDelayEstimate();
 }
